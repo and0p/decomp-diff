@@ -1,0 +1,11 @@
+emucov-replay 1
+id: 2463f840-f0a7-43a6-8b32-f8c5c5cd976f
+parent: 6c8def1e-b392-451f-ad90-3c701be961ca
+title: Jump to Saturday (poked)
+frames: 1800
+start-frame: 820
+start-hash: blake3-9e3bcaeec25c47d872140e0eabc37691a525cb4c6564898ab83dc6eb1a73aa7c
+end-hash: blake3-d0976bedb71b727591e962267eeb84bb3788e72ded5c755626fa163e9c6998c7
+---
+0 [WRITE] RAM 0x3DD 06
+0 [EVENT] Poke gameDay to Saturday

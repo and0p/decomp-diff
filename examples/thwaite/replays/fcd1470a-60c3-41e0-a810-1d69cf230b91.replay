@@ -1,0 +1,13 @@
+emucov-replay 1
+id: fcd1470a-60c3-41e0-a810-1d69cf230b91
+parent: adde56a6-8f0c-4f29-8550-e0dac8f6fef3
+title: Practice: cancel back to the title
+frames: 120
+start-frame: 320
+start-hash: blake3-7c9eb1a4ad69feb25adfafbee2193bf9b7f212fa4d90cf7ea7f63e0440da7107
+end-hash: blake3-b6fffd4ceb32ebec951f9ebc7e3cbc1392b3d53f92a5e5583a788e35d0762dbd
+---
+5 P1 JOYPAD RIGHT 1
+17 P1 JOYPAD RIGHT 0
+45 P1 JOYPAD A 1
+49 P1 JOYPAD A 0

@@ -1,0 +1,225 @@
+diff --git a/Core/CPU.cpp b/Core/CPU.cpp
+index da52796..b484244 100644
+--- a/Core/CPU.cpp
++++ b/Core/CPU.cpp
+@@ -2,6 +2,9 @@
+ #include <random>
+ #include <assert.h>
+ #include "CPU.h"
++#ifdef EMUCOV
++#include "EmuCoverage.h"
++#endif
+ #include "PPU.h"
+ #include "APU.h"
+ #include "DeltaModulationChannel.h"
+@@ -239,6 +242,11 @@ uint8_t CPU::MemoryRead(uint16_t addr, MemoryOperationType operationType) {
+ 	ProcessPendingDma(addr);
+ 
+ 	StartCpuCycle(true);
++#ifdef EMUCOV
++	if(operationType == MemoryOperationType::ExecOpCode || operationType == MemoryOperationType::ExecOperand) {
++		EmuCoverage::OnExec(_console->GetMapper(), addr, operationType == MemoryOperationType::ExecOpCode);
++	}
++#endif
+ 	uint8_t value = _memoryManager->Read(addr, operationType);
+ 	EndCpuCycle(true);
+ 	return value;
+diff --git a/Core/EmuCoverage.cpp b/Core/EmuCoverage.cpp
+new file mode 100644
+index 0000000..6da552f
+--- /dev/null
++++ b/Core/EmuCoverage.cpp
+@@ -0,0 +1,105 @@
++#include "stdafx.h"
++#include <cstring>
++#include <vector>
++#include "EmuCoverage.h"
++#include "BaseMapper.h"
++#include "DebuggerTypes.h"
++
++namespace
++{
++	enum RegionIndex { RegRam = 0, RegPrg, RegWram, RegSram, RegCount };
++	const char* const RegionNames[RegCount] = { "RAM", "PRG", "WRAM", "SRAM" };
++
++	BaseMapper* _mapper = nullptr;
++	std::vector<uint8_t> _flags[RegCount];
++
++	int _tickRegion = -1;
++	int64_t _tickOffset = -1;
++	uint64_t _tickCount = 0;
++
++	void Attach(BaseMapper* mapper)
++	{
++		_mapper = mapper;
++		_flags[RegRam].assign(0x800, 0);
++		_flags[RegPrg].assign(mapper->GetMemorySize(DebugMemoryType::PrgRom), 0);
++		_flags[RegWram].assign(mapper->GetMemorySize(DebugMemoryType::WorkRam), 0);
++		_flags[RegSram].assign(mapper->GetMemorySize(DebugMemoryType::SaveRam), 0);
++	}
++
++	int ToRegion(AddressType type)
++	{
++		switch(type) {
++			case AddressType::InternalRam: return RegRam;
++			case AddressType::PrgRom: return RegPrg;
++			case AddressType::WorkRam: return RegWram;
++			case AddressType::SaveRam: return RegSram;
++			default: return -1;
++		}
++	}
++}
++
++void EmuCoverage::OnExec(BaseMapper* mapper, uint16_t addr, bool opcode)
++{
++	if(mapper != _mapper) {
++		Attach(mapper);
++	}
++	AddressTypeInfo info;
++	mapper->GetAbsoluteAddressAndType(addr, &info);
++	if(info.Address < 0) {
++		return;
++	}
++	int region = ToRegion(info.Type);
++	if(region < 0 || (size_t)info.Address >= _flags[region].size()) {
++		return;
++	}
++	_flags[region][info.Address] |= opcode ? EMUCOV_FLAG_OPCODE : EMUCOV_FLAG_OPERAND;
++	if(opcode && region == _tickRegion && info.Address == _tickOffset) {
++		_tickCount++;
++	}
++}
++
++extern "C" {
++	static unsigned emucov_api_version(void) { return 1; }
++	static size_t emucov_region_count(void) { return RegCount; }
++
++	static bool emucov_get_region(size_t index, struct emucov_region* out)
++	{
++		if(index >= RegCount || !out) {
++			return false;
++		}
++		out->name = RegionNames[index];
++		out->flags = _flags[index].empty() ? nullptr : _flags[index].data();
++		out->size = _flags[index].size();
++		return true;
++	}
++
++	static void emucov_clear(void)
++	{
++		for(auto& f : _flags) {
++			std::fill(f.begin(), f.end(), 0);
++		}
++		_tickCount = 0;
++	}
++
++	// region: index as in emucov_get_region, or -1 to disable tick counting.
++	static void emucov_set_tick_exec(int region, int64_t offset)
++	{
++		_tickRegion = region;
++		_tickOffset = offset;
++		_tickCount = 0;
++	}
++
++	static uint64_t emucov_get_tick_count(void) { return _tickCount; }
++}
++
++void* EmuCoverage::GetProcAddress(const char* sym)
++{
++	if(!sym) return nullptr;
++	if(!strcmp(sym, "emucov_api_version")) return (void*)&emucov_api_version;
++	if(!strcmp(sym, "emucov_region_count")) return (void*)&emucov_region_count;
++	if(!strcmp(sym, "emucov_get_region")) return (void*)&emucov_get_region;
++	if(!strcmp(sym, "emucov_clear")) return (void*)&emucov_clear;
++	if(!strcmp(sym, "emucov_set_tick_exec")) return (void*)&emucov_set_tick_exec;
++	if(!strcmp(sym, "emucov_get_tick_count")) return (void*)&emucov_get_tick_count;
++	return nullptr;
++}
+diff --git a/Core/EmuCoverage.h b/Core/EmuCoverage.h
+new file mode 100644
+index 0000000..6271d67
+--- /dev/null
++++ b/Core/EmuCoverage.h
+@@ -0,0 +1,27 @@
++// emu_coverage connector for Mesen (libretro core).
++// Records which bytes of each code region the CPU executed, keyed by offset
++// into the region (PRG ROM offset, not CPU address), and counts "logic ticks"
++// (executions of one chosen location). Exposed to frontends through
++// RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK as emucov_* functions.
++#pragma once
++#include <stdint.h>
++#include <stddef.h>
++
++class BaseMapper;
++
++// Flag bits stored per byte.
++#define EMUCOV_FLAG_OPCODE  0x01  // executed as the first byte of an instruction
++#define EMUCOV_FLAG_OPERAND 0x02  // executed as an operand byte
++
++struct emucov_region
++{
++	const char* name;     // "RAM", "PRG", "WRAM", "SRAM"
++	uint8_t* flags;       // one byte of EMUCOV_FLAG_* per byte of the region
++	size_t size;
++};
++
++namespace EmuCoverage
++{
++	void OnExec(BaseMapper* mapper, uint16_t addr, bool opcode);
++	void* GetProcAddress(const char* sym);
++}
+diff --git a/Libretro/Makefile b/Libretro/Makefile
+index 02db726..54fc77f 100644
+--- a/Libretro/Makefile
++++ b/Libretro/Makefile
+@@ -369,7 +369,7 @@ ifeq (,$(findstring windows_msvc2017,$(platform)))
+ endif
+ 
+ CFLAGS   += -D LIBRETRO $(fpic) $(LTO)
+-CXXFLAGS += -D LIBRETRO $(fpic) -std=c++11 $(LTO)
++CXXFLAGS += -D LIBRETRO -D EMUCOV $(fpic) -std=c++11 $(LTO)
+ LDFLAGS  += $(LTO)
+ 
+ all: $(TARGET)
+diff --git a/Libretro/Makefile.common b/Libretro/Makefile.common
+index a25e446..04ff8aa 100644
+--- a/Libretro/Makefile.common
++++ b/Libretro/Makefile.common
+@@ -31,6 +31,7 @@ SOURCES_CXX := $(LIBRETRO_DIR)/libretro.cpp \
+                $(CORE_DIR)/Console.cpp \
+                $(CORE_DIR)/ControlManager.cpp \
+                $(CORE_DIR)/CPU.cpp \
++               $(CORE_DIR)/EmuCoverage.cpp \
+                $(CORE_DIR)/CrossFeedFilter.cpp \
+                $(CORE_DIR)/DefaultVideoFilter.cpp \
+                $(CORE_DIR)/RawVideoFilter.cpp \
+diff --git a/Libretro/libretro.cpp b/Libretro/libretro.cpp
+index 48fa641..71b17ae 100644
+--- a/Libretro/libretro.cpp
++++ b/Libretro/libretro.cpp
+@@ -5,6 +5,9 @@
+ #include "LibretroKeyManager.h"
+ #include "LibretroMessageManager.h"
+ #include "libretro.h"
++#ifdef EMUCOV
++#include "../Core/EmuCoverage.h"
++#endif
+ #include "libretro_core_options.h"
+ #include "../Core/Console.h"
+ #include "../Core/VideoDecoder.h"
+@@ -148,6 +151,15 @@ extern "C" {
+ 		bool option_categories = false;
+ 		env_cb = env;
+ 
++#ifdef EMUCOV
++		{
++			static struct retro_get_proc_address_interface emucovProcs = {
++				[](const char* sym) -> retro_proc_address_t { return (retro_proc_address_t)EmuCoverage::GetProcAddress(sym); }
++			};
++			env_cb(RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK, &emucovProcs);
++		}
++#endif
++
+ 		libretro_set_core_options(env_cb, &option_categories);
+ 
+ 		static constexpr struct retro_controller_description pads1[] = {

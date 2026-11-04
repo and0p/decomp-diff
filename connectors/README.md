@@ -1,0 +1,31 @@
+# Coverage connectors
+
+libretro has no standard way for a core to report which code it ran, so each
+supported core gets a small patch (a "connector"). A connector exports these
+functions through `RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK`, the libretro
+mechanism for core-defined extensions:
+
+```c
+struct emucov_region { const char *name; uint8_t *flags; size_t size; };
+
+unsigned emucov_api_version(void);                         /* 1 */
+size_t   emucov_region_count(void);
+bool     emucov_get_region(size_t index, struct emucov_region *out);
+void     emucov_clear(void);                               /* zero all flags and the tick count */
+void     emucov_set_tick_exec(int region, int64_t offset); /* -1 disables */
+uint64_t emucov_get_tick_count(void);
+```
+
+- `flags` has one byte per byte of the region: `0x01` executed as an opcode
+  (first byte of an instruction), `0x02` executed as an operand. Higher bits
+  are reserved.
+- Offsets are positions **in the region** (for example PRG ROM), never CPU
+  addresses, so bank-switched code is counted correctly.
+- A core whose recompiler only sees whole blocks may set `0x01` on each block's
+  first byte and leave the rest to the player's disassembly. Its README must say so.
+- The player works without a connector. It still plays replays and checks hashes,
+  but records no coverage.
+
+| Connector | System | Upstream | Status |
+| --- | --- | --- | --- |
+| [mesen](mesen/) | NES / Famicom | libretro/Mesen | v1 |

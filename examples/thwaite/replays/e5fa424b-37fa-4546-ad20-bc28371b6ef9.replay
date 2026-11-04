@@ -1,0 +1,11 @@
+emucov-replay 1
+id: e5fa424b-37fa-4546-ad20-bc28371b6ef9
+parent: d0c14220-1332-4137-b40c-9a07aa53bde5
+title: 1 Player: start a game
+frames: 600
+start-frame: 120
+start-hash: blake3-ee01259ea967323fb4c7d111921c5276d35111f66bfdd8b49d79b2fb0ed034ce
+end-hash: blake3-09ca2f030778767c54dbb44d410ba2ba47260c33aad52d4e034905e7af178cf3
+---
+5 P1 JOYPAD START 1
+9 P1 JOYPAD START 0

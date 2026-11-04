@@ -1,0 +1,26 @@
+[package]
+name = "emucov"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Plays libretro input-replay trees, checks state hashes, and records ROM code coverage"
+
+[[bin]]
+name = "emucov"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+libloading = "0.8"
+png = "0.17"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+debug = 1

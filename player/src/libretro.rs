@@ -1,0 +1,718 @@
+//! A minimal headless libretro frontend: loads a core, feeds it input, reads memory,
+//! saves and loads states, captures video frames, and talks to an emu_coverage connector.
+//!
+//! libretro cores keep global state and call back into plain C functions, so only
+//! one `Core` may exist per process. The callbacks reach the frontend's state
+//! through a thread-local.
+
+use anyhow::{bail, Context, Result};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::format::{InputKey, DEVICE_JOYPAD};
+
+// ---- libretro ABI ----------------------------------------------------------
+
+const ENV_EXPERIMENTAL: u32 = 0x10000;
+const ENV_GET_CAN_DUPE: u32 = 3;
+const ENV_GET_SYSTEM_DIRECTORY: u32 = 9;
+const ENV_SET_PIXEL_FORMAT: u32 = 10;
+const ENV_SET_INPUT_DESCRIPTORS: u32 = 11;
+const ENV_GET_VARIABLE: u32 = 15;
+const ENV_SET_VARIABLES: u32 = 16;
+const ENV_GET_VARIABLE_UPDATE: u32 = 17;
+const ENV_SET_SUPPORT_NO_GAME: u32 = 18;
+const ENV_GET_SAVE_DIRECTORY: u32 = 31;
+const ENV_SET_SYSTEM_AV_INFO: u32 = 32;
+const ENV_SET_PROC_ADDRESS_CALLBACK: u32 = 33;
+const ENV_SET_CONTROLLER_INFO: u32 = 35;
+const ENV_SET_MEMORY_MAPS: u32 = 36 | ENV_EXPERIMENTAL;
+const ENV_SET_GEOMETRY: u32 = 37;
+const ENV_GET_LANGUAGE: u32 = 39;
+const ENV_SET_SERIALIZATION_QUIRKS: u32 = 44;
+const ENV_GET_AUDIO_VIDEO_ENABLE: u32 = 47 | ENV_EXPERIMENTAL;
+const ENV_GET_FASTFORWARDING: u32 = 49 | ENV_EXPERIMENTAL;
+const ENV_GET_CORE_OPTIONS_VERSION: u32 = 52;
+const ENV_SET_CORE_OPTIONS_DISPLAY: u32 = 55;
+const ENV_GET_INPUT_MAX_USERS: u32 = 61;
+
+pub const MEMORY_SAVE_RAM: u32 = 0;
+pub const MEMORY_RTC: u32 = 1;
+pub const MEMORY_SYSTEM_RAM: u32 = 2;
+pub const MEMORY_VIDEO_RAM: u32 = 3;
+
+const DEVICE_ID_JOYPAD_MASK: u32 = 256;
+
+#[repr(C)]
+struct GameInfo {
+    path: *const c_char,
+    data: *const c_void,
+    size: usize,
+    meta: *const c_char,
+}
+
+#[repr(C)]
+struct SystemInfo {
+    library_name: *const c_char,
+    library_version: *const c_char,
+    valid_extensions: *const c_char,
+    need_fullpath: bool,
+    block_extract: bool,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct GameGeometry {
+    base_width: u32,
+    base_height: u32,
+    max_width: u32,
+    max_height: u32,
+    aspect_ratio: f32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct SystemTiming {
+    fps: f64,
+    sample_rate: f64,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct SystemAvInfo {
+    geometry: GameGeometry,
+    timing: SystemTiming,
+}
+
+#[repr(C)]
+struct Variable {
+    key: *const c_char,
+    value: *const c_char,
+}
+
+type ProcAddress = Option<unsafe extern "C" fn()>;
+
+#[repr(C)]
+struct GetProcAddressInterface {
+    get_proc_address: Option<unsafe extern "C" fn(*const c_char) -> ProcAddress>,
+}
+
+#[repr(C)]
+struct MemoryDescriptor {
+    flags: u64,
+    ptr: *mut c_void,
+    offset: usize,
+    start: usize,
+    select: usize,
+    disconnect: usize,
+    len: usize,
+    addrspace: *const c_char,
+}
+
+#[repr(C)]
+struct MemoryMap {
+    descriptors: *const MemoryDescriptor,
+    num_descriptors: u32,
+}
+
+#[repr(C)]
+struct EmucovRegionC {
+    name: *const c_char,
+    flags: *mut u8,
+    size: usize,
+}
+
+type EnvFn = unsafe extern "C" fn(u32, *mut c_void) -> bool;
+type VideoFn = unsafe extern "C" fn(*const c_void, u32, u32, usize);
+type AudioFn = unsafe extern "C" fn(i16, i16);
+type AudioBatchFn = unsafe extern "C" fn(*const i16, usize) -> usize;
+type PollFn = unsafe extern "C" fn();
+type StateFn = unsafe extern "C" fn(u32, u32, u32, u32) -> i16;
+
+// ---- frontend state reached from callbacks ----------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelFormat {
+    Rgb1555,
+    Xrgb8888,
+    Rgb565,
+}
+
+#[derive(Clone)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    /// RGB, 3 bytes per pixel.
+    pub rgb: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BusRange {
+    pub start: usize,
+    pub select: usize,
+    pub disconnect: usize,
+    pub len: usize,
+    pub ptr: usize,
+    pub offset: usize,
+}
+
+struct Host {
+    system_dir: CString,
+    save_dir: CString,
+    pixel_format: PixelFormat,
+    /// Option key -> (default value, allowed values)
+    option_defs: BTreeMap<String, (String, Vec<String>)>,
+    option_overrides: BTreeMap<String, String>,
+    option_cstrings: HashMap<String, CString>,
+    options_dirty: bool,
+    inputs: HashMap<InputKey, i16>,
+    capture_next_frame: bool,
+    last_frame: Option<Frame>,
+    proc_iface: Option<unsafe extern "C" fn(*const c_char) -> ProcAddress>,
+    bus: Vec<BusRange>,
+    av_info: SystemAvInfo,
+}
+
+thread_local! {
+    static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
+}
+
+static CORE_LOADED: AtomicBool = AtomicBool::new(false);
+
+fn with_host<R>(f: impl FnOnce(&mut Host) -> R) -> Option<R> {
+    HOST.with(|h| h.borrow_mut().as_mut().map(f))
+}
+
+/// Parses a v0 core option string: "Description; default|other|other".
+fn parse_option_values(v: &str) -> (String, Vec<String>) {
+    let list = v.split_once("; ").map(|(_, l)| l).unwrap_or(v);
+    let values: Vec<String> = list.split('|').map(|s| s.to_string()).collect();
+    (values.first().cloned().unwrap_or_default(), values)
+}
+
+unsafe extern "C" fn env_cb(cmd: u32, data: *mut c_void) -> bool {
+    match cmd {
+        ENV_GET_CAN_DUPE => {
+            *(data as *mut bool) = true;
+            true
+        }
+        ENV_GET_SYSTEM_DIRECTORY | ENV_GET_SAVE_DIRECTORY => with_host(|h| {
+            let p = if cmd == ENV_GET_SYSTEM_DIRECTORY { h.system_dir.as_ptr() } else { h.save_dir.as_ptr() };
+            *(data as *mut *const c_char) = p;
+            true
+        })
+        .unwrap_or(false),
+        ENV_SET_PIXEL_FORMAT => {
+            let f = match *(data as *const u32) {
+                0 => PixelFormat::Rgb1555,
+                1 => PixelFormat::Xrgb8888,
+                2 => PixelFormat::Rgb565,
+                _ => return false,
+            };
+            with_host(|h| h.pixel_format = f);
+            true
+        }
+        ENV_SET_VARIABLES => {
+            let mut v = data as *const Variable;
+            with_host(|h| {
+                while !(*v).key.is_null() {
+                    let key = CStr::from_ptr((*v).key).to_string_lossy().into_owned();
+                    let val = CStr::from_ptr((*v).value).to_string_lossy().into_owned();
+                    h.option_defs.insert(key, parse_option_values(&val));
+                    v = v.add(1);
+                }
+            });
+            true
+        }
+        ENV_GET_VARIABLE => {
+            let var = &mut *(data as *mut Variable);
+            if var.key.is_null() {
+                return false;
+            }
+            let key = CStr::from_ptr(var.key).to_string_lossy().into_owned();
+            with_host(|h| {
+                let value = h.option_overrides.get(&key).cloned().or_else(|| h.option_defs.get(&key).map(|d| d.0.clone()));
+                match value {
+                    Some(v) => {
+                        let c = h.option_cstrings.entry(key).or_insert_with(|| CString::new(v.clone()).unwrap());
+                        if c.to_str().ok() != Some(v.as_str()) {
+                            *c = CString::new(v).unwrap();
+                        }
+                        var.value = c.as_ptr();
+                        true
+                    }
+                    None => {
+                        var.value = std::ptr::null();
+                        false
+                    }
+                }
+            })
+            .unwrap_or(false)
+        }
+        ENV_GET_VARIABLE_UPDATE => {
+            let dirty = with_host(|h| std::mem::replace(&mut h.options_dirty, false)).unwrap_or(false);
+            *(data as *mut bool) = dirty;
+            true
+        }
+        ENV_GET_CORE_OPTIONS_VERSION => {
+            // Version 0 makes cores fall back to SET_VARIABLES, which is all we need.
+            *(data as *mut u32) = 0;
+            true
+        }
+        ENV_SET_PROC_ADDRESS_CALLBACK => {
+            let iface = &*(data as *const GetProcAddressInterface);
+            with_host(|h| h.proc_iface = iface.get_proc_address);
+            true
+        }
+        ENV_SET_MEMORY_MAPS => {
+            let map = &*(data as *const MemoryMap);
+            let mut ranges = vec![];
+            for i in 0..map.num_descriptors as usize {
+                let d = &*map.descriptors.add(i);
+                ranges.push(BusRange {
+                    start: d.start,
+                    select: d.select,
+                    disconnect: d.disconnect,
+                    len: d.len,
+                    ptr: d.ptr as usize,
+                    offset: d.offset,
+                });
+            }
+            with_host(|h| h.bus = ranges);
+            true
+        }
+        ENV_SET_SYSTEM_AV_INFO => {
+            let av = *(data as *const SystemAvInfo);
+            with_host(|h| h.av_info = av);
+            true
+        }
+        ENV_SET_GEOMETRY => {
+            let g = *(data as *const GameGeometry);
+            with_host(|h| h.av_info.geometry = g);
+            true
+        }
+        ENV_GET_LANGUAGE => {
+            *(data as *mut u32) = 0;
+            true
+        }
+        ENV_GET_AUDIO_VIDEO_ENABLE => {
+            // bit 0: video, bit 1: audio. Keep video on so frames can be captured.
+            *(data as *mut i32) = 1;
+            true
+        }
+        ENV_GET_FASTFORWARDING => {
+            *(data as *mut bool) = false;
+            true
+        }
+        ENV_GET_INPUT_MAX_USERS => {
+            *(data as *mut u32) = 8;
+            true
+        }
+        ENV_SET_INPUT_DESCRIPTORS | ENV_SET_CONTROLLER_INFO | ENV_SET_SUPPORT_NO_GAME | ENV_SET_CORE_OPTIONS_DISPLAY
+        | ENV_SET_SERIALIZATION_QUIRKS => true,
+        _ => false,
+    }
+}
+
+unsafe extern "C" fn video_cb(data: *const c_void, width: u32, height: u32, pitch: usize) {
+    with_host(|h| {
+        if !h.capture_next_frame || data.is_null() {
+            return;
+        }
+        h.capture_next_frame = false;
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height as usize {
+            let row = (data as *const u8).add(y * pitch);
+            for x in 0..width as usize {
+                let (r, g, b) = match h.pixel_format {
+                    PixelFormat::Xrgb8888 => {
+                        let p = *(row.add(x * 4) as *const u32);
+                        ((p >> 16) as u8, (p >> 8) as u8, p as u8)
+                    }
+                    PixelFormat::Rgb565 => {
+                        let p = *(row.add(x * 2) as *const u16);
+                        (((p >> 11) & 0x1f) as u8 * 255 / 31, ((p >> 5) & 0x3f) as u8 * 255 / 63, (p & 0x1f) as u8 * 255 / 31)
+                    }
+                    PixelFormat::Rgb1555 => {
+                        let p = *(row.add(x * 2) as *const u16);
+                        (((p >> 10) & 0x1f) as u8 * 255 / 31, ((p >> 5) & 0x1f) as u8 * 255 / 31, (p & 0x1f) as u8 * 255 / 31)
+                    }
+                };
+                rgb.extend_from_slice(&[r, g, b]);
+            }
+        }
+        h.last_frame = Some(Frame { width, height, rgb });
+    });
+}
+
+unsafe extern "C" fn audio_cb(_l: i16, _r: i16) {}
+unsafe extern "C" fn audio_batch_cb(_data: *const i16, frames: usize) -> usize {
+    frames
+}
+unsafe extern "C" fn input_poll_cb() {}
+
+unsafe extern "C" fn input_state_cb(port: u32, device: u32, index: u32, id: u32) -> i16 {
+    let base = device & 0xff;
+    with_host(|h| {
+        if base == DEVICE_JOYPAD && id == DEVICE_ID_JOYPAD_MASK {
+            let mut mask = 0i16;
+            for b in 0..16u32 {
+                if h.inputs.get(&InputKey { port, device: base, index: 0, id: b }).copied().unwrap_or(0) != 0 {
+                    mask |= 1 << b;
+                }
+            }
+            return mask;
+        }
+        h.inputs.get(&InputKey { port, device: base, index, id }).copied().unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+
+// ---- the core --------------------------------------------------------------
+
+struct Api {
+    deinit: unsafe extern "C" fn(),
+    run: unsafe extern "C" fn(),
+    reset: unsafe extern "C" fn(),
+    serialize_size: unsafe extern "C" fn() -> usize,
+    serialize: unsafe extern "C" fn(*mut c_void, usize) -> bool,
+    unserialize: unsafe extern "C" fn(*const c_void, usize) -> bool,
+    load_game: unsafe extern "C" fn(*const GameInfo) -> bool,
+    unload_game: unsafe extern "C" fn(),
+    get_memory_data: unsafe extern "C" fn(u32) -> *mut c_void,
+    get_memory_size: unsafe extern "C" fn(u32) -> usize,
+    set_controller_port_device: unsafe extern "C" fn(u32, u32),
+}
+
+pub struct Connector {
+    region_count: unsafe extern "C" fn() -> usize,
+    get_region: unsafe extern "C" fn(usize, *mut EmucovRegionC) -> bool,
+    clear: unsafe extern "C" fn(),
+    set_tick_exec: unsafe extern "C" fn(i32, i64),
+    get_tick_count: unsafe extern "C" fn() -> u64,
+}
+
+pub struct CoverageRegion {
+    pub name: String,
+    pub flags: Vec<u8>,
+}
+
+pub struct Core {
+    _lib: libloading::Library,
+    api: Api,
+    pub library_name: String,
+    pub library_version: String,
+    connector: Option<Connector>,
+    game_loaded: bool,
+}
+
+impl Core {
+    pub fn load(core_path: &Path, work_dir: &Path, options: &BTreeMap<String, String>) -> Result<Core> {
+        if CORE_LOADED.swap(true, Ordering::SeqCst) {
+            bail!("only one libretro core can be loaded per process");
+        }
+        let system_dir = work_dir.join("system");
+        let save_dir = work_dir.join("saves");
+        std::fs::create_dir_all(&system_dir)?;
+        std::fs::create_dir_all(&save_dir)?;
+        HOST.with(|h| {
+            *h.borrow_mut() = Some(Host {
+                system_dir: CString::new(system_dir.to_string_lossy().as_bytes()).unwrap(),
+                save_dir: CString::new(save_dir.to_string_lossy().as_bytes()).unwrap(),
+                pixel_format: PixelFormat::Rgb1555,
+                option_defs: BTreeMap::new(),
+                option_overrides: options.clone(),
+                option_cstrings: HashMap::new(),
+                options_dirty: false,
+                inputs: HashMap::new(),
+                capture_next_frame: false,
+                last_frame: None,
+                proc_iface: None,
+                bus: vec![],
+                av_info: SystemAvInfo::default(),
+            })
+        });
+
+        unsafe {
+            let lib = libloading::Library::new(core_path).with_context(|| format!("loading core {}", core_path.display()))?;
+            macro_rules! sym {
+                ($name:literal) => {
+                    *lib.get(concat!($name, "\0").as_bytes()).with_context(|| format!("core is missing {}", $name))?
+                };
+            }
+            let set_environment: unsafe extern "C" fn(EnvFn) = sym!("retro_set_environment");
+            let set_video: unsafe extern "C" fn(VideoFn) = sym!("retro_set_video_refresh");
+            let set_audio: unsafe extern "C" fn(AudioFn) = sym!("retro_set_audio_sample");
+            let set_audio_batch: unsafe extern "C" fn(AudioBatchFn) = sym!("retro_set_audio_sample_batch");
+            let set_poll: unsafe extern "C" fn(PollFn) = sym!("retro_set_input_poll");
+            let set_state: unsafe extern "C" fn(StateFn) = sym!("retro_set_input_state");
+            let init: unsafe extern "C" fn() = sym!("retro_init");
+            let get_system_info: unsafe extern "C" fn(*mut SystemInfo) = sym!("retro_get_system_info");
+            let api = Api {
+                deinit: sym!("retro_deinit"),
+                run: sym!("retro_run"),
+                reset: sym!("retro_reset"),
+                serialize_size: sym!("retro_serialize_size"),
+                serialize: sym!("retro_serialize"),
+                unserialize: sym!("retro_unserialize"),
+                load_game: sym!("retro_load_game"),
+                unload_game: sym!("retro_unload_game"),
+                get_memory_data: sym!("retro_get_memory_data"),
+                get_memory_size: sym!("retro_get_memory_size"),
+                set_controller_port_device: sym!("retro_set_controller_port_device"),
+            };
+
+            let mut info: SystemInfo = std::mem::zeroed();
+            get_system_info(&mut info);
+            let cstr = |p: *const c_char| if p.is_null() { String::new() } else { CStr::from_ptr(p).to_string_lossy().into_owned() };
+            let library_name = cstr(info.library_name);
+            let library_version = cstr(info.library_version);
+
+            // Same order as RetroArch: some cores (Mesen) only build their state in retro_init.
+            set_environment(env_cb);
+            init();
+            set_video(video_cb);
+            set_audio(audio_cb);
+            set_audio_batch(audio_batch_cb);
+            set_poll(input_poll_cb);
+            set_state(input_state_cb);
+
+            let unknown: Vec<String> = with_host(|h| {
+                h.option_overrides.keys().filter(|k| !h.option_defs.contains_key(*k)).cloned().collect()
+            })
+            .unwrap_or_default();
+            if !unknown.is_empty() {
+                eprintln!("warning: core does not declare these options: {}", unknown.join(", "));
+            }
+
+            let connector = with_host(|h| h.proc_iface).flatten().and_then(|gpa| {
+                let get = |name: &str| -> ProcAddress {
+                    let c = CString::new(name).unwrap();
+                    gpa(c.as_ptr())
+                };
+                let version: unsafe extern "C" fn() -> u32 = std::mem::transmute(get("emucov_api_version")?);
+                if version() != 1 {
+                    eprintln!("warning: coverage connector API version {} is not supported", version());
+                    return None;
+                }
+                Some(Connector {
+                    region_count: std::mem::transmute(get("emucov_region_count")?),
+                    get_region: std::mem::transmute(get("emucov_get_region")?),
+                    clear: std::mem::transmute(get("emucov_clear")?),
+                    set_tick_exec: std::mem::transmute(get("emucov_set_tick_exec")?),
+                    get_tick_count: std::mem::transmute(get("emucov_get_tick_count")?),
+                })
+            });
+
+            Ok(Core { _lib: lib, api, library_name, library_version, connector, game_loaded: false })
+        }
+    }
+
+    /// Effective value of every option the core declared.
+    pub fn effective_options(&self) -> BTreeMap<String, String> {
+        with_host(|h| {
+            h.option_defs
+                .iter()
+                .map(|(k, (def, _))| (k.clone(), h.option_overrides.get(k).cloned().unwrap_or_else(|| def.clone())))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    pub fn load_game(&mut self, rom: &Path) -> Result<()> {
+        let data = std::fs::read(rom).with_context(|| format!("reading {}", rom.display()))?;
+        let path = CString::new(rom.to_string_lossy().as_bytes())?;
+        let info = GameInfo { path: path.as_ptr(), data: data.as_ptr() as *const c_void, size: data.len(), meta: std::ptr::null() };
+        let ok = unsafe { (self.api.load_game)(&info) };
+        if !ok {
+            bail!("core refused to load {}", rom.display());
+        }
+        self.game_loaded = true;
+        Ok(())
+    }
+
+    pub fn has_connector(&self) -> bool {
+        self.connector.is_some()
+    }
+
+    pub fn run_frame(&mut self, capture: bool) -> Option<Frame> {
+        with_host(|h| {
+            h.capture_next_frame = capture;
+            if capture {
+                h.last_frame = None;
+            }
+        });
+        unsafe { (self.api.run)() };
+        if capture {
+            with_host(|h| {
+                h.capture_next_frame = false;
+                h.last_frame.take()
+            })
+            .flatten()
+        } else {
+            None
+        }
+    }
+
+    pub fn reset(&mut self) {
+        unsafe { (self.api.reset)() }
+    }
+
+    pub fn set_input(&mut self, key: InputKey, value: i16) {
+        with_host(|h| {
+            if value == 0 {
+                h.inputs.remove(&key);
+            } else {
+                h.inputs.insert(key, value);
+            }
+        });
+    }
+
+    pub fn clear_inputs(&mut self) {
+        with_host(|h| h.inputs.clear());
+    }
+
+    pub fn set_port_device(&mut self, port: u32, device: u32) {
+        unsafe { (self.api.set_controller_port_device)(port, device) }
+    }
+
+    pub fn serialize(&mut self) -> Result<Vec<u8>> {
+        unsafe {
+            let size = (self.api.serialize_size)();
+            if size == 0 {
+                bail!("core does not support save states");
+            }
+            let mut buf = vec![0u8; size];
+            if !(self.api.serialize)(buf.as_mut_ptr() as *mut c_void, size) {
+                bail!("core failed to save state");
+            }
+            Ok(buf)
+        }
+    }
+
+    pub fn unserialize(&mut self, state: &[u8]) -> Result<()> {
+        let ok = unsafe { (self.api.unserialize)(state.as_ptr() as *const c_void, state.len()) };
+        if !ok {
+            bail!("core failed to load state");
+        }
+        Ok(())
+    }
+
+    pub fn memory(&mut self, id: u32) -> Option<&mut [u8]> {
+        unsafe {
+            let ptr = (self.api.get_memory_data)(id) as *mut u8;
+            let size = (self.api.get_memory_size)(id);
+            if ptr.is_null() || size == 0 {
+                None
+            } else {
+                Some(std::slice::from_raw_parts_mut(ptr, size))
+            }
+        }
+    }
+
+    /// Resolves an emulated bus address through the core's memory maps.
+    pub fn bus_byte(&mut self, addr: usize) -> Option<*mut u8> {
+        with_host(|h| {
+            for d in &h.bus {
+                if d.ptr == 0 {
+                    continue;
+                }
+                let hit = if d.select != 0 { (addr & d.select) == (d.start & d.select) } else { addr >= d.start && addr < d.start + d.len.max(1) };
+                if !hit {
+                    continue;
+                }
+                let mut a = (addr - d.start) & !d.disconnect;
+                if d.len > 0 {
+                    a %= d.len;
+                }
+                return Some((d.ptr + d.offset + a) as *mut u8);
+            }
+            None
+        })
+        .flatten()
+    }
+
+    pub fn coverage_clear(&mut self) {
+        if let Some(c) = &self.connector {
+            unsafe { (c.clear)() }
+        }
+    }
+
+    pub fn coverage_regions(&mut self) -> Vec<CoverageRegion> {
+        let Some(c) = &self.connector else { return vec![] };
+        let mut out = vec![];
+        unsafe {
+            for i in 0..(c.region_count)() {
+                let mut r = EmucovRegionC { name: std::ptr::null(), flags: std::ptr::null_mut(), size: 0 };
+                if !(c.get_region)(i, &mut r) {
+                    continue;
+                }
+                let name = if r.name.is_null() { format!("R{i}") } else { CStr::from_ptr(r.name).to_string_lossy().into_owned() };
+                let flags = if r.flags.is_null() { vec![] } else { std::slice::from_raw_parts(r.flags, r.size).to_vec() };
+                out.push(CoverageRegion { name, flags });
+            }
+        }
+        out
+    }
+
+    pub fn coverage_region_index(&mut self, name: &str) -> Option<usize> {
+        let Some(c) = &self.connector else { return None };
+        unsafe {
+            for i in 0..(c.region_count)() {
+                let mut r = EmucovRegionC { name: std::ptr::null(), flags: std::ptr::null_mut(), size: 0 };
+                if (c.get_region)(i, &mut r) && !r.name.is_null() && CStr::from_ptr(r.name).to_string_lossy() == name {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn set_tick_exec(&mut self, region: Option<usize>, offset: u64) {
+        if let Some(c) = &self.connector {
+            unsafe { (c.set_tick_exec)(region.map(|r| r as i32).unwrap_or(-1), offset as i64) }
+        }
+    }
+
+    pub fn tick_count(&mut self) -> Option<u64> {
+        self.connector.as_ref().map(|c| unsafe { (c.get_tick_count)() })
+    }
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
+        unsafe {
+            if self.game_loaded {
+                (self.api.unload_game)();
+            }
+            (self.api.deinit)();
+        }
+        HOST.with(|h| *h.borrow_mut() = None);
+        CORE_LOADED.store(false, Ordering::SeqCst);
+    }
+}
+
+pub fn write_png(frame: &Frame, path: &Path) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::File::create(path)?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), frame.width, frame.height);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(&frame.rgb)?;
+    Ok(())
+}
+
+pub fn region_memory_id(name: &str) -> Option<u32> {
+    Some(match name {
+        "RAM" => MEMORY_SYSTEM_RAM,
+        "SRAM" => MEMORY_SAVE_RAM,
+        "VRAM" => MEMORY_VIDEO_RAM,
+        "RTC" => MEMORY_RTC,
+        _ => return None,
+    })
+}

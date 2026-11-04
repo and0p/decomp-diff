@@ -1,0 +1,13 @@
+emucov-replay 1
+id: 6c8def1e-b392-451f-ad90-3c701be961ca
+parent: e5fa424b-37fa-4546-ad20-bc28371b6ef9
+title: Click through the opening cutscene
+frames: 100
+start-frame: 720
+start-hash: blake3-09ca2f030778767c54dbb44d410ba2ba47260c33aad52d4e034905e7af178cf3
+end-hash: blake3-9e3bcaeec25c47d872140e0eabc37691a525cb4c6564898ab83dc6eb1a73aa7c
+---
+10 P1 JOYPAD A 1
+14 P1 JOYPAD A 0
+50 P1 JOYPAD A 1
+54 P1 JOYPAD A 0
