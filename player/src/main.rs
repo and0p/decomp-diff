@@ -1,18 +1,13 @@
-mod analysis;
-mod collection;
-mod coverage;
-mod format;
-mod libretro;
-mod player;
+use emucov::{coverage, libretro};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use collection::{sha256_file, Collection, Config, CoreConfig, HashConfig, LocalConfig, PortConfig, RomConfig, Status, SymbolsConfig};
-use format::Replay;
-use player::{PlayOptions, ReplayResult, Session};
+use emucov::collection::{sha256_file, Collection, Config, CoreConfig, HashConfig, LocalConfig, PortConfig, RomConfig, Status, SymbolsConfig};
+use emucov::format::Replay;
+use emucov::player::{PlayOptions, ReplayResult, Session};
 
 #[derive(Parser)]
 #[command(name = "emucov", version, about = "Play libretro input-replay trees, check state hashes, and measure ROM code coverage")]
@@ -277,7 +272,7 @@ fn play(dir: &Path, id: &str, local: &Local, shots: Option<PathBuf>, extra: Vec<
     let results = {
         let mut s = Session::open(&col, &rom, &core)?;
         let opts = PlayOptions { end_screenshot: shots.is_some(), extra_shots: extra };
-        s.play_chain(&id, &opts, !no_cache)?
+        s.play_chain(&col, &id, &opts, !no_cache)?
     };
     let mut bad = false;
     for res in &results {
@@ -317,22 +312,22 @@ fn run(dir: &Path, local: &Local, from_scratch: bool, do_accept: bool, screensho
         }
         let run_id = store.begin_run(&s.setup_id, &col.config.core.build, from_scratch)?;
         let opts = PlayOptions { end_screenshot: screenshots, extra_shots: vec![] };
-        s.play_all(&opts, from_scratch, |s, res| {
-            let outcome = judge(s.col, res);
-            let depth = s.col.chain(&res.id)?.len() - 1;
+        s.play_all(&col, &opts, from_scratch, |_s, res| {
+            let outcome = judge(&col, res);
+            let depth = col.chain(&res.id)?.len() - 1;
             println!(
                 "{:<8} {}{} {}  {}f{}",
                 outcome,
                 "  ".repeat(depth),
                 &res.id[..8],
-                s.col.replays[&res.id].title(),
+                col.replays[&res.id].title(),
                 res.frames,
                 res.ticks.map(|t| format!(", {t} ticks")).unwrap_or_default()
             );
             if screenshots {
                 save_shots(res, &shot_dir)?;
             }
-            store.record(run_id, s.col, res, outcome)?;
+            store.record(run_id, &col, res, outcome)?;
             total_frames += res.frames;
             accepted.push((
                 ReplayResult {

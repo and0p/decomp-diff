@@ -1,0 +1,9 @@
+emucov-replay 1
+id: 149e259b-5d58-4705-b979-d04af47aebdd
+parent: fcf00fec-b91e-49e5-afe0-9f07cefe2a1f
+title: A idle 73: wait 8f
+frames: 8
+start-frame: 876
+start-hash: blake3-d7800701dae288ce1926348d8a51c094e45fad7961c0f9a2e81753e7b4767fcd
+end-hash: blake3-17045233e35f2f4fd108b1c016cf93ad36ab2f5f5dc85b8bd14212730afe1c00
+---

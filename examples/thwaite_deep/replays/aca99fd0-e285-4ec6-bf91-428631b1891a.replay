@@ -1,0 +1,9 @@
+emucov-replay 1
+id: aca99fd0-e285-4ec6-bf91-428631b1891a
+parent: 0e28b64f-4eb1-4fca-a64f-7613b4642ea4
+title: B idle 64: wait 4f
+frames: 4
+start-frame: 740
+start-hash: blake3-394011ee5f668eb0678f13989989cd2c7b27d7e793f8a05e106adc14cfac23de
+end-hash: blake3-b32cc23356d80370071af4cced16ce10889af4a87033558f983b8c44bae7a66b
+---

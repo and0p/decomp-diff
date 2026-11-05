@@ -30,17 +30,20 @@ pub struct PlayOptions {
     pub extra_shots: Vec<u64>,
 }
 
+/// A loaded core plus what it needs to play replays. It does not hold the
+/// collection, so a GUI can keep editing the collection while a session is open;
+/// every method takes the collection it should read.
 #[allow(dead_code)]
-pub struct Session<'c> {
-    pub col: &'c Collection,
+pub struct Session {
     pub core: Core,
     boot_state: Vec<u8>,
     pub setup_id: String,
     pub rom_path: PathBuf,
+    cache_root: PathBuf,
 }
 
-impl<'c> Session<'c> {
-    pub fn open(col: &'c Collection, rom: &Path, core_path: &Path) -> Result<Session<'c>> {
+impl Session {
+    pub fn open(col: &Collection, rom: &Path, core_path: &Path) -> Result<Session> {
         let rom_sha = sha256_file(rom)?;
         if !col.config.rom.sha256.is_empty() && rom_sha != col.config.rom.sha256 {
             bail!(
@@ -77,25 +80,25 @@ impl<'c> Session<'c> {
             h.update(v.as_bytes());
         }
         let setup_id = h.finalize().to_hex()[..16].to_string();
-        Ok(Session { col, core, boot_state, setup_id, rom_path: rom.to_path_buf() })
+        Ok(Session { core, boot_state, setup_id, rom_path: rom.to_path_buf(), cache_root: col.local_dir().join("states") })
     }
 
     pub fn state_cache_dir(&self) -> PathBuf {
-        self.col.local_dir().join("states").join(&self.setup_id)
+        self.cache_root.join(&self.setup_id)
     }
 
     /// Ports' devices in effect at the start of `id`: collection defaults plus ancestors' [DEVICE] lines.
-    fn devices_at_start(&self, id: &str) -> Result<BTreeMap<u32, u32>> {
+    pub fn devices_at_start(&self, col: &Collection, id: &str) -> Result<BTreeMap<u32, u32>> {
         let mut devs = BTreeMap::new();
-        for p in &self.col.config.ports {
+        for p in &col.config.ports {
             if p.port == 0 {
                 bail!("collection.toml ports start at 1");
             }
             devs.insert(p.port - 1, device_from_name(&p.device)?);
         }
-        let chain = self.col.chain(id)?;
+        let chain = col.chain(id)?;
         for anc in &chain[..chain.len() - 1] {
-            for l in &self.col.replays[*anc].lines {
+            for l in &col.replays[*anc].lines {
                 if let Command::Device { port, device } = l.command {
                     devs.insert(port, device);
                 }
@@ -104,9 +107,9 @@ impl<'c> Session<'c> {
         Ok(devs)
     }
 
-    pub fn state_hash(&mut self) -> Result<String> {
+    pub fn state_hash(&mut self, col: &Collection) -> Result<String> {
         let mut h = blake3::Hasher::new();
-        for region in self.col.config.hash.regions.clone() {
+        for region in col.config.hash.regions.clone() {
             let bytes: Vec<u8> = if let Some(mid) = region_memory_id(&region) {
                 self.core.memory(mid).map(|m| m.to_vec()).unwrap_or_default()
             } else if let Some(range) = region.strip_prefix("BUS:") {
@@ -125,15 +128,15 @@ impl<'c> Session<'c> {
     }
 
     /// Puts the core at the start of trunk `r`.
-    pub fn start_trunk(&mut self, r: &Replay) -> Result<()> {
+    pub fn start_trunk(&mut self, col: &Collection, r: &Replay) -> Result<()> {
         let boot = self.boot_state.clone();
         self.core.unserialize(&boot)?;
         if let Some(save) = r.get("save") {
-            let data = self.col.read_blob(save)?;
+            let data = col.read_blob(save)?;
             self.core.unserialize(&data).with_context(|| format!("loading save blob {save}"))?;
         }
         if let Some(sram) = r.get("sram") {
-            let data = self.col.read_blob(sram)?;
+            let data = col.read_blob(sram)?;
             let mem = self.core.memory(crate::libretro::MEMORY_SAVE_RAM).ok_or_else(|| anyhow!("core exposes no save RAM"))?;
             if data.len() != mem.len() {
                 eprintln!("warning: SRAM blob is {} bytes but the core's save RAM is {}", data.len(), mem.len());
@@ -149,16 +152,16 @@ impl<'c> Session<'c> {
     }
 
     /// Plays one replay from the core's current state.
-    pub fn play(&mut self, id: &str, start_frame: u64, opts: &PlayOptions) -> Result<ReplayResult> {
-        let r = &self.col.replays[id];
+    pub fn play(&mut self, col: &Collection, id: &str, start_frame: u64, opts: &PlayOptions) -> Result<ReplayResult> {
+        let r = &col.replays[id];
         let frames = r.frames()?;
-        for (port, dev) in self.devices_at_start(id)? {
+        for (port, dev) in self.devices_at_start(col, id)? {
             self.core.set_port_device(port, dev);
         }
         self.core.clear_inputs();
         self.core.coverage_clear();
 
-        let start_hash = self.state_hash()?;
+        let start_hash = self.state_hash(col)?;
         let wanted_checkpoints: Vec<u64> = r.checkpoints()?.into_iter().map(|(f, _)| f).collect();
         let mut checkpoints = vec![];
         let mut shots_wanted: Vec<u64> = opts.extra_shots.clone();
@@ -175,7 +178,7 @@ impl<'c> Session<'c> {
         let mut impulses: Vec<InputKey> = vec![];
         for f in 0..frames {
             if wanted_checkpoints.contains(&f) {
-                checkpoints.push((f, self.state_hash()?));
+                checkpoints.push((f, self.state_hash(col)?));
             }
             while li < r.lines.len() && r.lines[li].frame == f {
                 let line = &r.lines[li];
@@ -202,8 +205,8 @@ impl<'c> Session<'c> {
                 self.core.set_input(k, 0);
             }
         }
-        let end_hash = self.state_hash()?;
-        let ticks = if self.col.config.tick.is_some() { self.core.tick_count() } else { None };
+        let end_hash = self.state_hash(col)?;
+        let ticks = if col.config.tick.is_some() { self.core.tick_count() } else { None };
         let coverage = self.core.coverage_regions();
         let end_state = self.core.serialize()?;
         Ok(ReplayResult {
@@ -241,25 +244,25 @@ impl<'c> Session<'c> {
 
     /// Plays every replay in tree order. `from_scratch` replays each chain from its
     /// trunk instead of reusing parents' end states (a determinism check).
-    pub fn play_all(&mut self, opts: &PlayOptions, from_scratch: bool, mut each: impl FnMut(&mut Self, &ReplayResult) -> Result<()>) -> Result<()> {
-        let order: Vec<String> = self.col.tree_order().into_iter().map(|(id, _)| id.to_string()).collect();
+    pub fn play_all(&mut self, col: &Collection, opts: &PlayOptions, from_scratch: bool, mut each: impl FnMut(&mut Self, &ReplayResult) -> Result<()>) -> Result<()> {
+        let order: Vec<String> = col.tree_order().into_iter().map(|(id, _)| id.to_string()).collect();
         let mut end_states: HashMap<String, (Vec<u8>, u64)> = HashMap::new();
         for id in &order {
-            let chain: Vec<String> = self.col.chain(id)?.into_iter().map(String::from).collect();
+            let chain: Vec<String> = col.chain(id)?.into_iter().map(String::from).collect();
             let result = if from_scratch {
                 let mut start_frame = 0;
                 let quiet = PlayOptions::default();
-                self.start_trunk(&self.col.replays[&chain[0]])?;
+                self.start_trunk(col, &col.replays[&chain[0]])?;
                 for anc in &chain[..chain.len() - 1] {
-                    let res = self.play(anc, start_frame, &quiet)?;
+                    let res = self.play(col, anc, start_frame, &quiet)?;
                     start_frame += res.frames;
                 }
-                self.play(id, start_frame, opts)?
+                self.play(col, id, start_frame, opts)?
             } else {
-                let start_frame = match self.col.replays[id].parent() {
+                let start_frame = match col.replays[id].parent() {
                     None => {
-                        self.start_trunk(&self.col.replays[id])?;
-                        trunk_start_frame(&self.col.replays[id])
+                        self.start_trunk(col, &col.replays[id])?;
+                        trunk_start_frame(&col.replays[id])
                     }
                     Some(p) => {
                         let (state, sf) = end_states.get(p).ok_or_else(|| anyhow!("internal: no end state for parent {p}"))?.clone();
@@ -267,9 +270,9 @@ impl<'c> Session<'c> {
                         sf
                     }
                 };
-                self.play(id, start_frame, opts)?
+                self.play(col, id, start_frame, opts)?
             };
-            if !self.col.children(Some(id)).is_empty() {
+            if !col.children(Some(id)).is_empty() {
                 end_states.insert(id.clone(), (result.end_state.clone(), result.start_frame + result.frames));
             }
             self.save_cached_state(&result)?;
@@ -279,34 +282,114 @@ impl<'c> Session<'c> {
     }
 
     /// Plays the chain down to `id`, starting from the deepest cached ancestor state when allowed.
-    pub fn play_chain(&mut self, id: &str, opts: &PlayOptions, use_cache: bool) -> Result<Vec<ReplayResult>> {
-        let chain: Vec<String> = self.col.chain(id)?.into_iter().map(String::from).collect();
+    pub fn play_chain(&mut self, col: &Collection, id: &str, opts: &PlayOptions, use_cache: bool) -> Result<Vec<ReplayResult>> {
+        let chain: Vec<String> = col.chain(id)?.into_iter().map(String::from).collect();
         let mut start_at = 0;
-        let mut start_frame = trunk_start_frame(&self.col.replays[&chain[0]]);
+        let mut start_frame = trunk_start_frame(&col.replays[&chain[0]]);
         let mut loaded = false;
         if use_cache {
             for i in (0..chain.len() - 1).rev() {
-                if let Some(state) = self.load_cached_state(&chain[i])? {
+                if let Some(state) = self.load_cached_state(col, &chain[i])? {
                     self.load_state(&state)?;
                     start_at = i + 1;
-                    start_frame = chain[..=i].iter().map(|c| self.col.replays[c].frames().unwrap_or(0)).sum::<u64>() + trunk_start_frame(&self.col.replays[&chain[0]]);
+                    start_frame = chain[..=i].iter().map(|c| col.replays[c].frames().unwrap_or(0)).sum::<u64>() + trunk_start_frame(&col.replays[&chain[0]]);
                     loaded = true;
                     break;
                 }
             }
         }
         if !loaded {
-            self.start_trunk(&self.col.replays[&chain[0]])?;
+            self.start_trunk(col, &col.replays[&chain[0]])?;
         }
         let mut results = vec![];
         for (i, c) in chain.iter().enumerate().skip(start_at) {
             let o = if i == chain.len() - 1 { opts.clone() } else { PlayOptions::default() };
-            let res = self.play(c, start_frame, &o)?;
+            let res = self.play(col, c, start_frame, &o)?;
             start_frame += res.frames;
             self.save_cached_state(&res)?;
             results.push(res);
         }
         Ok(results)
+    }
+
+    // ---- frame-by-frame playback, for interactive tools ----
+
+    /// Puts the core at frame 0 of `id`: plays (or loads the cached end state of)
+    /// its ancestors, then sets devices and releases inputs. Returns the replay's
+    /// start frame counted from power-on.
+    pub fn enter_replay(&mut self, col: &Collection, id: &str) -> Result<u64> {
+        let chain: Vec<String> = col.chain(id)?.into_iter().map(String::from).collect();
+        let quiet = PlayOptions::default();
+        let mut start_frame = trunk_start_frame(&col.replays[&chain[0]]);
+        if chain.len() == 1 {
+            self.start_trunk(col, &col.replays[&chain[0]])?;
+        } else {
+            let parent = &chain[chain.len() - 2];
+            let ancestors_frames: u64 = chain[..chain.len() - 1].iter().map(|c| col.replays[c].frames().unwrap_or(0)).sum();
+            if let Some(state) = self.load_cached_state(col, parent)? {
+                self.load_state(&state)?;
+                start_frame += ancestors_frames;
+            } else {
+                let res = self.play_chain(col, parent, &quiet, true)?;
+                let last = res.last().ok_or_else(|| anyhow!("internal: empty chain"))?;
+                start_frame = last.start_frame + last.frames;
+            }
+        }
+        self.core.coverage_clear();
+        self.restore_inputs(col, id, 0)?;
+        Ok(start_frame)
+    }
+
+    /// Sets port devices and held inputs to what they are at the start of
+    /// frame `frame` of `id` (before that frame's lines apply). Needed after
+    /// loading a mid-replay snapshot, because input state is not part of a save state.
+    pub fn restore_inputs(&mut self, col: &Collection, id: &str, frame: u64) -> Result<()> {
+        let mut devs = self.devices_at_start(col, id)?;
+        self.core.clear_inputs();
+        for l in col.replays[id].lines.iter().take_while(|l| l.frame < frame) {
+            match &l.command {
+                Command::Input { key, value, impulse: false } => self.core.set_input(*key, *value),
+                Command::Device { port, device } => {
+                    devs.insert(*port, *device);
+                }
+                _ => {}
+            }
+        }
+        for (port, dev) in devs {
+            self.core.set_port_device(port, dev);
+        }
+        Ok(())
+    }
+
+    /// Applies frame `frame`'s lines of `id` and runs that frame.
+    pub fn step(&mut self, col: &Collection, id: &str, frame: u64, capture: bool) -> Result<Option<Frame>> {
+        let r = &col.replays[id];
+        let mut impulses = vec![];
+        let first = r.lines.partition_point(|l| l.frame < frame);
+        for line in r.lines[first..].iter().take_while(|l| l.frame == frame) {
+            match &line.command {
+                Command::Input { key, value, impulse } => {
+                    self.core.set_input(*key, *value);
+                    if *impulse {
+                        impulses.push(*key);
+                    }
+                }
+                Command::Device { port, device } => self.core.set_port_device(*port, *device),
+                Command::Write { region, address, bytes } => self.write(region, *address, bytes)?,
+                Command::Event { .. } | Command::Screenshot => {}
+                Command::Reset => self.core.reset(),
+                Command::Rng { .. } => bail!("[RNG] is not supported yet"),
+            }
+        }
+        let out = self.core.run_frame(capture);
+        for k in impulses {
+            self.core.set_input(k, 0);
+        }
+        Ok(out)
+    }
+
+    pub fn snapshot(&mut self) -> Result<Vec<u8>> {
+        self.core.serialize()
     }
 
     fn save_cached_state(&self, res: &ReplayResult) -> Result<()> {
@@ -318,14 +401,18 @@ impl<'c> Session<'c> {
     }
 
     /// A cached end state is used only if it matches the replay's recorded end-hash.
-    fn load_cached_state(&self, id: &str) -> Result<Option<Vec<u8>>> {
+    pub fn load_cached_state(&self, col: &Collection, id: &str) -> Result<Option<Vec<u8>>> {
         let dir = self.state_cache_dir();
         let (sp, hp) = (dir.join(format!("{id}.state")), dir.join(format!("{id}.hash")));
         if !sp.exists() || !hp.exists() {
             return Ok(None);
         }
+        // A branch above may have been edited (in memory, or on disk since the cache was made).
+        if col.tree_status(id) != crate::collection::Status::Clean {
+            return Ok(None);
+        }
         let cached_hash = std::fs::read_to_string(hp)?;
-        match self.col.replays[id].get("end-hash") {
+        match col.replays[id].get("end-hash") {
             Some(h) if h == cached_hash.trim() => Ok(Some(std::fs::read(sp)?)),
             _ => Ok(None),
         }

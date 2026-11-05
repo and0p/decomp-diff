@@ -1,0 +1,11 @@
+emucov-replay 1
+id: a3ec4d32-2907-4b86-a421-9307d31615e5
+parent: 145103c7-ff5e-4d1f-9cfb-0a06bb93c8eb
+title: B fork 80.1: tap UP
+frames: 12
+start-frame: 900
+start-hash: blake3-6c315fe8e9d33e331afc96e62c19d316b3f2f49d783eb09f1d14f5b14731c5a9
+end-hash: blake3-c3a48745a7bf34f11e3776bc31dcfaf5df9d71ee9b1f790fb4f17bb2ea75ce6c
+---
+2 P1 JOYPAD UP 1
+5 P1 JOYPAD UP 0

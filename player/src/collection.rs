@@ -237,6 +237,19 @@ impl Collection {
         }
     }
 
+    /// Like `status`, but a replay below a dirty one is dirty too: its start
+    /// state can no longer be trusted until the branch above is re-verified.
+    pub fn tree_status(&self, id: &str) -> Status {
+        let s = self.status(id);
+        if s == Status::Dirty {
+            return s;
+        }
+        match self.replays[id].parent() {
+            Some(p) if self.tree_status(p) == Status::Dirty => Status::Dirty,
+            _ => s,
+        }
+    }
+
     pub fn save_replay(&mut self, id: &str) -> Result<()> {
         let path = self.paths.get(id).cloned().unwrap_or_else(|| self.root.join("replays").join(format!("{id}.replay")));
         std::fs::create_dir_all(path.parent().unwrap())?;

@@ -1,0 +1,9 @@
+emucov-replay 1
+id: 8614f504-e8ee-45a1-a3a9-a9da816b2332
+parent: b3783a7c-bbdd-4b9b-ade2-fb1fa098d691
+title: A40 idle 24: wait 20f
+frames: 20
+start-frame: 812
+start-hash: blake3-7b813974b0b18f1b22846ae51e5b00497327e362acdda803c264504ae14de98a
+end-hash: blake3-865df44b51221d6f7f7a35eadcc75fde7a3b41ef772ae2fb5dd53d0b6a3f673b
+---

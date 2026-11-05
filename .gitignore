@@ -1,5 +1,7 @@
+# Rust output: each crate builds into its own target/ (player/target, gui/target)
+target/
+# Cores and other build products
 build/
-player/target/
 .emucov/
-
+.DS_Store
 scratchpad.md

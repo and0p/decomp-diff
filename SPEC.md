@@ -6,9 +6,13 @@ saved starting point) into every situation a game can reach. A collection is
 what people share. Everything else (save states, coverage databases,
 screenshots) is derived locally by playing it.
 
-Status: draft v1. The headless player in this repository implements everything here except
-items marked **(reserved)**, which files may carry but the player does not
-act on yet.
+Status: draft v1. The headless player (`emucov`) and the desktop editor
+(`emucov-gui`) in this repository implement everything here except items
+marked **(reserved)**, which files may carry but the tools do not act on yet.
+
+Terms: a **replay** file is one **node** of the tree (the GUI says "node").
+A **trunk** has no parent. A **branch** is any node with children, and a
+**leaf** has none.
 
 ## 1. Collection layout
 
@@ -75,7 +79,8 @@ different collection (or a re-validation of this one, see section 8).
 
 A replay is UTF-8 text with Unix or Windows line endings. It has a header,
 a line containing only `---`, and a body. Lines starting with `#` are
-comments everywhere. Blank lines are ignored.
+comments everywhere. Blank lines are ignored. Tools that rewrite a file keep
+every comment, but may move comments in the body to the top of the body.
 
 ```
 emucov-replay 1
@@ -108,7 +113,7 @@ end-hash: blake3-71ee…
 | `sram` | trunks only | Blob id of battery-backed save RAM to load before frame 0. Use it with or without `save`; when both are given, `sram` is applied after the state loads (for cores whose states leave SRAM out). |
 | `start-hash` | no | State hash at frame 0, before any input (section 6). |
 | `end-hash` | no | State hash after the last frame. |
-| `checkpoint` | no | Repeatable: `checkpoint: <frame> <hash>`. The state hash at the start of frame `<frame>`, before that frame's lines apply (so `checkpoint: 0` would equal `start-hash`). Narrows down where a run diverged. |
+| `checkpoint` | no | Repeatable: `checkpoint: <frame> <hash>`. The state hash at the start of frame `<frame>`, before that frame's lines apply (so `checkpoint: 0` would equal `start-hash`). Narrows down where a run diverged. Editors check checkpoints while playing and keep the ones before an edit. |
 | `tags` | no | Space-separated free tags (`boss`, `rng-forced`, …). |
 
 A trunk with neither `save` nor `sram` is a cold boot with no save data.
@@ -186,8 +191,16 @@ line saying so helps the next reader.
 <frame> [WRITE] <region> <address> <byte> [<byte>...]
 ```
 
-Writes bytes before the frame runs. Addresses and bytes are hex with or
-without `0x`. Regions:
+Writes bytes before the frame runs, starting at `<address>` and going up one
+address per byte. Addresses and bytes are hex with or without `0x`. A
+contiguous block is one line, however long:
+
+```
+0 [WRITE] RAM 0x0300 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10
+```
+
+Several writes on one frame apply top to bottom, so a later line wins where
+two overlap. Regions:
 
 | Region | libretro source |
 | --- | --- |
@@ -210,7 +223,9 @@ collection can always say how much coverage comes from play alone.
 
 Annotations for humans and agents. The optional `@x,y` is a pixel position
 in the core's video output for that frame. Events change nothing in the
-emulation.
+emulation, so adding, editing or removing one never changes a hash. A frame
+may carry any number of events. Editors show the event text on the timeline
+and group lines that share a frame.
 
 ### 3.7 Reserved commands
 
@@ -243,8 +258,15 @@ To play replay `R`:
    `end-hash` if present.
 
 Players may skip step 4 for ancestors by loading a cached local state taken
-at an ancestor's end, as long as that state was produced by this same setup
-and its hash matches the ancestor's `end-hash`.
+at an ancestor's end. They may do so only if that state was produced by this
+same setup, its hash matches the ancestor's `end-hash`, and the ancestor is
+clean (section 8), so nothing above it has changed since. Otherwise they play
+the chain from the trunk.
+
+A player that has just finished a node may go straight on into one of its
+children without reloading anything. The core is already in the child's start
+state; the player only releases all inputs and sets port devices for the child
+(section 3.2).
 
 ## 6. State hashes
 
@@ -299,10 +321,19 @@ A replay is:
 - **dirty** if its `start-hash` differs from its parent's current `end-hash`.
   This happens when a parent is edited and re-recorded.
 
+A replay below a dirty replay is also dirty, even when its own hashes agree
+with its parent's: its start state rests on something that has changed.
+
 Dirty is never stored. Tools work it out from the hashes. Re-validating a
 dirty replay means playing it from its parent's new end state and, if it still
 does what it should, writing the new `start-hash` and `end-hash`. Its children
 then become dirty in turn, and so on down the tree.
+
+When a replay is edited, tools remove its `end-hash` and every `checkpoint`
+after the first edited frame, because those states are no longer known. The
+replay becomes unverified and everything below it dirty, until it is played
+and the new hashes are accepted. Editing only `[EVENT]` lines changes no
+state, so it keeps every hash.
 
 ## 9. Coverage (local, derived)
 
@@ -332,3 +363,40 @@ instruction ran. Data placed inside a function's range can confuse the sweep.
 
 Coverage can be exported as a gap list (functions and blocks no replay
 reaches) to show collaborators where help is needed.
+
+## 10. Editing the tree
+
+These are the tree edits the GUI offers. They are defined here so that any
+tool doing the same edit produces the same files.
+
+**New child.** A new replay with `parent` set to the node, a fresh id, no
+hashes, and a length chosen by the author. It starts where the node ends.
+
+**Split at frame `f`** (`0 < f < frames`). One node becomes two:
+
+- The **second part** keeps the node's id, title, tags, children and
+  `end-hash`. Its body is the node's lines from frame `f` on, renumbered from 0,
+  and its `frames` is the old length minus `f`. Its `parent` becomes the first
+  part. Checkpoints after `f` move to it, renumbered. It loses `save` and
+  `sram`, because only a trunk may name blobs.
+- The **first part** gets a new id and takes the node's old place under its
+  parent. It keeps frames `0..f`, the earlier checkpoints, and any `save` or
+  `sram`. By default its title is the old title plus "(first f frames)".
+- The state hash at the cut (at the start of frame `f`, after the first part
+  has run) becomes the first part's `end-hash` and the second part's
+  `start-hash`. Because the same frames still run with the same inputs, the
+  second part and everything below it stay clean.
+- Every replay starts with all inputs released (section 3.2). So for each
+  input held across the cut, the second part gets a line at frame 0 that sets
+  it again.
+
+Keeping the id on the second part means children and outside references to the
+node stay valid. Coverage recorded for the old node (section 9) covered both
+parts; tools must mark it stale or re-record it after a split.
+
+**Branch at frame `f`.** A split at `f`, plus a new empty child of the first
+part, so that a second path starts at the cut.
+
+**Properties.** Changing `title` changes no state. Changing `frames` drops the
+`end-hash` and any checkpoints past the new end. A replay cannot be shortened
+past its last body line.

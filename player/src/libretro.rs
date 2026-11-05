@@ -534,6 +534,11 @@ impl Core {
         Ok(())
     }
 
+    /// Frames per second the core reports, and its preferred display aspect ratio (0 if unset).
+    pub fn timing(&self) -> (f64, f32) {
+        with_host(|h| (h.av_info.timing.fps, h.av_info.geometry.aspect_ratio)).unwrap_or((0.0, 0.0))
+    }
+
     pub fn has_connector(&self) -> bool {
         self.connector.is_some()
     }

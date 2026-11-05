@@ -1,6 +1,7 @@
 //! Parser and writer for `.replay` files (SPEC.md section 3).
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -223,6 +224,225 @@ impl Replay {
     }
 
     /// Appends body lines (already formatted, frame first).
+    /// Replaces every input line for `key` with the given held spans
+    /// (`start..end`, end exclusive), keeping all other lines. Used by editors.
+    pub fn set_binary_spans(&mut self, key: InputKey, spans: &[(u64, u64)]) -> Result<()> {
+        let frames = self.frames()?;
+        let mut kept: Vec<(u64, String)> = vec![];
+        let mut comments: Vec<String> = vec![];
+        for b in &self.body_text {
+            let t = b.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t.starts_with('#') {
+                comments.push(b.clone());
+                continue;
+            }
+            let (f, cmd) = parse_body_line(t)?;
+            if let Command::Input { key: k, .. } = cmd {
+                if k == key {
+                    continue;
+                }
+            }
+            kept.push((f, b.clone()));
+        }
+        let mut merged: Vec<(u64, u64)> = vec![];
+        let mut sorted: Vec<(u64, u64)> = spans.iter().copied().filter(|(a, b)| b > a && *a < frames).collect();
+        sorted.sort();
+        for (a, b) in sorted {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        for (a, b) in merged {
+            kept.push((a, format!("{a} {}", input_text(key, 1))));
+            if b < frames {
+                kept.push((b, format!("{b} {}", input_text(key, 0))));
+            }
+        }
+        kept.sort_by_key(|(f, _)| *f);
+        let mut body = comments;
+        body.extend(kept.into_iter().map(|(_, t)| t));
+        let mut text = String::new();
+        // Re-parse the whole file so line numbers and parsed commands stay in step.
+        self.body_text = body;
+        text.push_str(&self.to_text());
+        *self = Replay::parse(&text)?;
+        Ok(())
+    }
+
+    /// Held spans (`start..end`) of a binary input, worked out from the lines.
+    pub fn binary_spans(&self, key: InputKey) -> Vec<(u64, u64)> {
+        let frames = self.frames().unwrap_or(0);
+        let mut out = vec![];
+        let mut open: Option<u64> = None;
+        for l in &self.lines {
+            if let Command::Input { key: k, value, .. } = l.command {
+                if k != key {
+                    continue;
+                }
+                match (open, value != 0) {
+                    (None, true) => open = Some(l.frame),
+                    (Some(a), false) => {
+                        if l.frame > a {
+                            out.push((a, l.frame));
+                        }
+                        open = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(a) = open {
+            out.push((a, frames));
+        }
+        out
+    }
+
+    fn reparse(&mut self) -> Result<()> {
+        *self = Replay::parse(&self.to_text())?;
+        Ok(())
+    }
+
+    /// Index into `body_text` of a parsed line's file line number.
+    fn body_index(&self, line_no: usize) -> Option<usize> {
+        let i = line_no.checked_sub(self.header.len() + 3)?;
+        (i < self.body_text.len()).then_some(i)
+    }
+
+    /// The command part of a body line (everything after the frame number).
+    pub fn line_command_text(&self, line_no: usize) -> Option<String> {
+        let t = self.body_text[self.body_index(line_no)?].trim();
+        t.split_once(char::is_whitespace).map(|(_, rest)| rest.trim().to_string())
+    }
+
+    /// Adds `<frame> <command>` after any lines already on that frame.
+    pub fn insert_line(&mut self, frame: u64, command: &str) -> Result<()> {
+        let text = format!("{frame} {}", command.trim());
+        parse_body_line(&text)?;
+        let mut at = None;
+        for (i, b) in self.body_text.iter().enumerate() {
+            let t = b.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            let f = parse_body_line(t)?.0;
+            if f <= frame {
+                at = Some(i + 1);
+            } else if at.is_none() {
+                at = Some(i);
+                break;
+            } else {
+                break;
+            }
+        }
+        let at = at.unwrap_or(self.body_text.len());
+        let old = self.clone();
+        self.body_text.insert(at, text);
+        if let Err(e) = self.reparse() {
+            *self = old;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Replaces a body line's command (keeping its frame), or removes the line when `command` is None.
+    pub fn replace_line(&mut self, line_no: usize, command: Option<&str>) -> Result<()> {
+        let i = self.body_index(line_no).ok_or_else(|| anyhow!("no body line {line_no}"))?;
+        let old = self.clone();
+        match command {
+            None => {
+                self.body_text.remove(i);
+            }
+            Some(c) => {
+                let frame = parse_body_line(self.body_text[i].trim())?.0;
+                let text = format!("{frame} {}", c.trim());
+                parse_body_line(&text)?;
+                self.body_text[i] = text;
+            }
+        }
+        if let Err(e) = self.reparse() {
+            *self = old;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Splits this replay at `frame`. The downstream part (the rest, renumbered from 0)
+    /// keeps this id, title and children; the upstream part (frames `0..frame`) gets
+    /// `upstream_id`, takes this replay's place under its parent, and becomes the
+    /// downstream part's parent. Inputs held across the split are pressed again at frame 0
+    /// of the downstream part, since every replay starts with all inputs released.
+    /// Hashes: the downstream part keeps the old end-hash and the later checkpoints; the
+    /// upstream part keeps the earlier ones. The caller records the hash at the split
+    /// as the upstream end-hash and the downstream start-hash.
+    pub fn split_at(&self, frame: u64, upstream_id: &str) -> Result<(Replay, Replay)> {
+        let frames = self.frames()?;
+        if frame == 0 || frame >= frames {
+            bail!("can only split inside the replay (1..{frames})");
+        }
+        let mut held: BTreeMap<InputKey, i16> = BTreeMap::new();
+        for l in self.lines.iter().take_while(|l| l.frame < frame) {
+            if let Command::Input { key, value, impulse: false } = l.command {
+                if value == 0 {
+                    held.remove(&key);
+                } else {
+                    held.insert(key, value);
+                }
+            }
+        }
+        let (mut up_body, mut down_body) = (vec![], vec![]);
+        for (k, v) in &held {
+            down_body.push(format!("0 {}", input_text(*k, *v)));
+        }
+        for b in &self.body_text {
+            let t = b.trim();
+            if t.is_empty() || t.starts_with('#') {
+                up_body.push(b.clone());
+                continue;
+            }
+            let (f, _) = parse_body_line(t)?;
+            if f < frame {
+                up_body.push(b.clone());
+            } else {
+                let rest = t.split_once(char::is_whitespace).map(|(_, r)| r.trim()).unwrap_or("");
+                down_body.push(format!("{} {rest}", f - frame));
+            }
+        }
+        let cps = self.checkpoints()?;
+        let mut up = self.clone();
+        up.body_text = up_body;
+        up.set("id", upstream_id);
+        up.set("title", &format!("{} (first {frame} frames)", self.title()));
+        up.set("frames", &frame.to_string());
+        up.remove_all("end-hash");
+        up.remove_all("checkpoint");
+        for (f, h) in cps.iter().filter(|(f, _)| *f < frame) {
+            up.add("checkpoint", &format!("{f} {h}"));
+        }
+        let mut down = self.clone();
+        down.body_text = down_body;
+        down.set("parent", upstream_id);
+        down.set("frames", &(frames - frame).to_string());
+        // Only a trunk starts from blobs; those stay with the upstream part.
+        down.remove_all("save");
+        down.remove_all("sram");
+        down.remove_all("start-hash");
+        match self.get("start-frame").and_then(|s| s.parse::<u64>().ok()) {
+            Some(sf) => down.set("start-frame", &(sf + frame).to_string()),
+            None => down.remove_all("start-frame"),
+        }
+        down.remove_all("checkpoint");
+        for (f, h) in cps.iter().filter(|(f, _)| *f > frame) {
+            down.add("checkpoint", &format!("{} {h}", f - frame));
+        }
+        up.reparse()?;
+        down.reparse()?;
+        Ok((up, down))
+    }
+
     #[allow(dead_code)]
     pub fn push_body(&mut self, text: &str) -> Result<()> {
         let (frame, command) = parse_body_line(text.trim())?;
@@ -329,7 +549,48 @@ pub fn device_from_name(s: &str) -> Result<u32> {
     })
 }
 
-const JOYPAD: [&str; 16] = ["B", "Y", "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT", "A", "X", "L", "R", "L2", "R2", "L3", "R3"];
+pub const JOYPAD: [&str; 16] = ["B", "Y", "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT", "A", "X", "L", "R", "L2", "R2", "L3", "R3"];
+
+/// Formats an input line (without the frame number), the inverse of the parser.
+pub fn input_text(key: InputKey, value: i16) -> String {
+    let p = key.port + 1;
+    match key.device {
+        DEVICE_JOYPAD if (key.id as usize) < JOYPAD.len() && key.index == 0 => format!("P{p} JOYPAD {} {value}", JOYPAD[key.id as usize]),
+        DEVICE_MOUSE => match mouse_name(key.id) {
+            Some(n) => format!("P{p} MOUSE {n} {value}"),
+            None => format!("P{p} RAW {} {} {} {value}", key.device, key.index, key.id),
+        },
+        _ => format!("P{p} RAW {} {} {} {value}", key.device, key.index, key.id),
+    }
+}
+
+pub fn mouse_name(id: u32) -> Option<&'static str> {
+    Some(match id {
+        0 => "X",
+        1 => "Y",
+        2 => "LEFT",
+        3 => "RIGHT",
+        4 => "WHEELUP",
+        5 => "WHEELDOWN",
+        6 => "MIDDLE",
+        7 => "HORIZ_WHEELUP",
+        8 => "HORIZ_WHEELDOWN",
+        9 => "BUTTON_4",
+        10 => "BUTTON_5",
+        _ => return None,
+    })
+}
+
+/// True for inputs that are on/off (buttons and keys), as opposed to axes and positions.
+pub fn is_binary(key: InputKey) -> bool {
+    match key.device {
+        DEVICE_JOYPAD => key.id < 16,
+        DEVICE_MOUSE => matches!(key.id, 2 | 3 | 6 | 9 | 10),
+        DEVICE_KEYBOARD => true,
+        DEVICE_LIGHTGUN => matches!(key.id, 2..=12 | 16),
+        _ => false,
+    }
+}
 
 fn joypad_id(s: &str) -> Option<u32> {
     JOYPAD.iter().position(|b| *b == s).map(|i| i as u32)
@@ -535,6 +796,55 @@ frames: 100
         assert_eq!(r.lines[4].command, Command::Write { region: "RAM".into(), address: 0x12, bytes: vec![0x13, 0xff] });
         assert_eq!(r.lines[5].command, Command::Event { text: "Title visible".into(), pos: Some((10, 20)) });
         assert_eq!(Replay::parse(&r.to_text()).unwrap().to_text(), r.to_text());
+    }
+
+    #[test]
+    fn splits_and_edits_lines() {
+        let text = "emucov-replay 1\nid: a\nparent: none\nframes: 100\nend-hash: blake3-x\ncheckpoint: 20 blake3-c20\ncheckpoint: 80 blake3-c80\n---\n# note\n0 P1 JOYPAD A 1\n10 P1 JOYPAD RIGHT 1\n30 [EVENT] middle\n60 P1 JOYPAD RIGHT 0\n70 [WRITE] RAM 0x10 01 02\n";
+        let r = Replay::parse(text).unwrap();
+        let (up, down) = r.split_at(50, "b").unwrap();
+        assert_eq!(up.id().unwrap(), "b");
+        assert_eq!(up.parent(), None);
+        assert_eq!(down.id().unwrap(), "a");
+        assert_eq!(up.frames().unwrap(), 50);
+        assert_eq!(up.get("end-hash"), None);
+        assert_eq!(up.checkpoints().unwrap(), vec![(20, "blake3-c20".to_string())]);
+        assert_eq!(up.lines.len(), 3);
+        assert_eq!(down.parent(), Some("b"));
+        assert_eq!(down.frames().unwrap(), 50);
+        assert_eq!(down.get("end-hash"), Some("blake3-x"));
+        assert_eq!(down.checkpoints().unwrap(), vec![(30, "blake3-c80".to_string())]);
+        // A and RIGHT were held across the split, so they are pressed again at 0.
+        let k = |id| InputKey { port: 0, device: DEVICE_JOYPAD, index: 0, id };
+        assert_eq!(down.binary_spans(k(8)), vec![(0, 50)]);
+        assert_eq!(down.binary_spans(k(7)), vec![(0, 10)]);
+        assert!(matches!(down.lines.last().unwrap().command, Command::Write { .. }));
+        assert_eq!(down.lines.last().unwrap().frame, 20);
+
+        let mut r = r;
+        r.insert_line(30, "[EVENT] second").unwrap();
+        let evs: Vec<_> = r.lines.iter().filter(|l| l.frame == 30).collect();
+        assert_eq!(evs.len(), 2);
+        let ln = evs[1].line_no;
+        assert_eq!(r.line_command_text(ln).as_deref(), Some("[EVENT] second"));
+        r.replace_line(ln, Some("[EVENT] renamed")).unwrap();
+        assert!(r.insert_line(5, "[BOGUS]").is_err());
+        let ln = r.lines.iter().find(|l| matches!(&l.command, Command::Event { text, .. } if text == "renamed")).unwrap().line_no;
+        r.replace_line(ln, None).unwrap();
+        assert_eq!(r.lines.iter().filter(|l| l.frame == 30).count(), 1);
+    }
+
+    #[test]
+    fn edits_binary_spans() {
+        let mut r = Replay::parse(SAMPLE).unwrap();
+        let start = InputKey { port: 0, device: DEVICE_JOYPAD, index: 0, id: 3 };
+        assert_eq!(r.binary_spans(start), vec![(0, 4)]);
+        r.set_binary_spans(start, &[(2, 6), (5, 9), (90, 120)]).unwrap();
+        assert_eq!(r.binary_spans(start), vec![(2, 9), (90, 100)]);
+        // Other lines survive.
+        assert_eq!(r.lines.iter().filter(|l| matches!(l.command, Command::Write { .. })).count(), 1);
+        assert!(r.to_text().contains("2 P1 JOYPAD START 1\n"));
+        assert!(!r.to_text().contains("100 P1 JOYPAD START 0"));
     }
 
     #[test]

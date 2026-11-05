@@ -1,0 +1,9 @@
+emucov-replay 1
+id: 1e563408-c465-4cde-b762-00b5774510ca
+parent: 491961a1-843b-4ee9-b578-909c4a7591f2
+title: A100 idle 16: wait 10f
+frames: 10
+start-frame: 1366
+start-hash: blake3-27ea9bfbf66d454e4a340368193ade46c21de3a58da58d670227f04386603b25
+end-hash: blake3-3e457bb7e9bbbd9586d68a9ad66e463a4bbbf2fdce840f0846e4142f95a4a465
+---

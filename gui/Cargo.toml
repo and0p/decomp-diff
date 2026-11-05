@@ -1,0 +1,18 @@
+[package]
+name = "emucov-gui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Desktop viewer and editor for emucov replay collections"
+
+[[bin]]
+name = "emucov-gui"
+path = "src/main.rs"
+
+[dependencies]
+emucov = { path = "../player" }
+anyhow = "1"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "clipboard", "wayland", "x11"] }
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+rfd = "0.17"
+uuid = { version = "1", features = ["v4"] }
