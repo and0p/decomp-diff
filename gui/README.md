@@ -76,6 +76,34 @@ halves. The recorded coverage for both parts needs to be marked stale and gather
 or the old record needs to be cut at the split frame. The cut is only possible if coverage
 is stored per frame range, so this decision belongs with the coverage tracker design.
 
+## Undo and redo
+
+Every edit records the affected nodes' full text before the change as one undo step
+(`remember` in `src/main.rs`): note edits, cut and paste, frame lines, renames, node
+properties, accepting an end hash, new nodes, splits and branches. Undo puts those nodes
+back (removing nodes the step created) and records the reverse step for redo. The history
+holds 200 steps and is cleared when a collection is opened or reloaded.
+
+After an undo on the node being shown, playback drops its save states from the first
+changed frame on and redraws where you are. If the step changed the node's length or
+parent, another node, or one of its ancestors, the node is loaded again instead. A node
+removed by undo has its file deleted on the next Save.
+
+Cut, copy and paste work on selected notes in the piano roll. The copy is kept inside the
+app, and the notes also go on the system clipboard as replay lines with frames relative
+to the first note. Paste puts the leftmost copied note at the play cursor.
+
+## Deleting nodes
+
+Node > Delete… and Delete… in the tree's right-click menu open the same confirmation.
+It names the node, warns how many nodes below it go too, and gives the total frames.
+Deleting removes the whole branch (`delete_nodes` in `src/main.rs`) as one undo step.
+The files are removed on Save. If the node being shown was deleted, its parent is shown.
+
+Later: merge a node into its children (its inputs go at the start of each child, so no
+hash changes; with one child, this is the inverse of Split). Another option is moving
+the children up to the grandparent, which turns everything below dirty. Neither is planned yet.
+
 ## Other known gaps
 
 - Only button inputs get rows. Analog, lightgun and pointer inputs show as ticks
@@ -84,6 +112,6 @@ is stored per frame range, so this decision belongs with the coverage tracker de
 - Only one core runs at a time. Showing two cores side by side will need a second
   process, because a libretro core has global state.
 - There is no warning before you lose unsaved edits (on Open, Reload or Quit).
-- Nodes can't be deleted, moved or merged from the GUI yet.
+- Nodes can't be moved or merged from the GUI yet.
 - A long load cannot be cancelled except by selecting another node. MAX speed still runs on the UI thread.
 - Tested on Linux and macOS (build only); Windows has not been tried.

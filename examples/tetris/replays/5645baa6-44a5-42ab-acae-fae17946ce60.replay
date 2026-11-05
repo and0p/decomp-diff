@@ -1,0 +1,10 @@
+emucov-replay 1
+id: 5645baa6-44a5-42ab-acae-fae17946ce60
+parent: none
+title: Boot game, wait for legal screen
+frames: 580
+start-frame: 0
+start-hash: blake3-ca66ab9fe2af9439a6e36932460d42c671ec25d6379f038ad33b92330b574039
+end-hash: blake3-9b80a65703df446a6f1eef2d6297f4b572732bb833d965f56560bad1aa36d20f
+---
+560 [EVENT] Legal screen ends, title screen

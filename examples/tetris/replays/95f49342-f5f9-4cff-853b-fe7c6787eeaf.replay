@@ -1,0 +1,9 @@
+emucov-replay 1
+id: 95f49342-f5f9-4cff-853b-fe7c6787eeaf
+parent: 0477f758-7eae-4cd9-a170-22a363c81435
+title: A-Type Menu
+frames: 60
+start-frame: 700
+start-hash: blake3-38007d413a6904f2aa828337d139cdf278a7277c2837dfbbf5feda0df5adbb17
+---
+0 [EVENT] Level select: START (level 0), the game begins

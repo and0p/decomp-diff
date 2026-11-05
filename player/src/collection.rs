@@ -258,6 +258,17 @@ impl Collection {
         Ok(())
     }
 
+    /// Deletes the file of a replay that is no longer in the collection (after an undo of
+    /// a split or of a new node). Does nothing if the replay was never saved.
+    pub fn delete_replay_file(&mut self, id: &str) -> Result<()> {
+        if let Some(path) = self.paths.remove(id) {
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn blob_path(&self, blob: &str) -> PathBuf {
         self.root.join("blobs").join(blob)
     }

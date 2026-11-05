@@ -92,6 +92,15 @@ struct App {
     route: Vec<String>,
     route_target: Option<String>,
     node_dialog: Option<NodeDialog>,
+    /// Inline rename in the tree: node id, text, and whether focus is still to be given.
+    renaming: Option<(String, String, bool)>,
+    /// The node waiting for delete confirmation.
+    delete_dialog: Option<String>,
+    undo: Vec<UndoStep>,
+    redo: Vec<UndoStep>,
+    clip: Option<Clip>,
+    /// Text to put on the system clipboard at the end of this frame.
+    ctx_copy: Option<String>,
     frame_dialog: Option<FrameDialog>,
 }
 
@@ -105,6 +114,22 @@ enum Job {
 
 /// Time spent on a job per screen refresh.
 const JOB_SLICE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// One step of undo history: the affected nodes as they were before the change
+/// (None: the node did not exist), and where the user was.
+struct UndoStep {
+    label: String,
+    nodes: Vec<(String, Option<emucov::format::Replay>)>,
+    selected: Option<String>,
+    frame: Option<u64>,
+}
+
+const UNDO_LIMIT: usize = 200;
+
+/// Copied notes: button, start relative to the leftmost copied note, and length.
+struct Clip {
+    notes: Vec<(InputKey, u64, u64)>,
+}
 
 struct NodeDialog {
     id: String,
@@ -146,6 +171,12 @@ impl Default for App {
             route: vec![],
             route_target: None,
             node_dialog: None,
+            renaming: None,
+            delete_dialog: None,
+            undo: vec![],
+            redo: vec![],
+            clip: None,
+            ctx_copy: None,
             frame_dialog: None,
         }
     }
@@ -194,6 +225,33 @@ fn fold_button(ui: &mut egui::Ui, collapse: bool) -> egui::Response {
     resp
 }
 
+/// `id` and every node below it.
+fn subtree(col: &Collection, id: &str) -> Vec<String> {
+    let mut out = vec![id.to_string()];
+    let mut i = 0;
+    while i < out.len() {
+        let kids: Vec<String> = col.children(Some(&out[i])).into_iter().map(String::from).collect();
+        out.extend(kids);
+        i += 1;
+    }
+    out
+}
+
+/// The first frame where two versions of a node's lines differ, if they do.
+fn first_change(a: &emucov::format::Replay, b: &emucov::format::Replay) -> Option<u64> {
+    let n = a.lines.len().min(b.lines.len());
+    for i in 0..n {
+        let (x, y) = (&a.lines[i], &b.lines[i]);
+        if x.frame != y.frame || x.command != y.command {
+            return Some(x.frame.min(y.frame));
+        }
+    }
+    match (a.lines.get(n), b.lines.get(n)) {
+        (Some(l), _) | (_, Some(l)) => Some(l.frame),
+        _ => None,
+    }
+}
+
 fn abs_path(root: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
         p.to_path_buf()
@@ -224,6 +282,8 @@ impl App {
                 self.edited.clear();
                 self.selected = None;
                 self.hoist = None;
+                self.undo.clear();
+                self.redo.clear();
                 self.roll.forget();
                 let first = col.tree_order().first().map(|(id, _)| id.to_string());
                 let n = col.replays.len();
@@ -289,7 +349,9 @@ impl App {
         let Some(col) = &mut self.col else { return };
         let ids: Vec<String> = self.edited.iter().cloned().collect();
         for id in &ids {
-            if let Err(e) = col.save_replay(id) {
+            // A node removed by undo (a split or a new node) loses its file.
+            let res = if col.replays.contains_key(id) { col.save_replay(id) } else { col.delete_replay_file(id) };
+            if let Err(e) = res {
                 self.message = Some((format!("Saving {id}: {e:#}"), true));
                 return;
             }
@@ -688,12 +750,16 @@ impl App {
 
     // ---- editing ----
 
-    fn apply_edit(&mut self, key: InputKey, spans: Vec<(u64, u64)>, from: u64) {
-        let (Some(col), Some(id)) = (&mut self.col, self.selected.clone()) else { return };
+    fn apply_edit(&mut self, label: &str, edits: Vec<(InputKey, Vec<(u64, u64)>)>, from: u64) {
+        let Some(id) = self.selected.clone() else { return };
+        self.remember(label, &[&id]);
+        let Some(col) = &mut self.col else { return };
         let r = col.replays.get_mut(&id).unwrap();
-        if let Err(e) = r.set_binary_spans(key, &spans) {
-            self.error(e);
-            return;
+        for (key, spans) in edits {
+            if let Err(e) = r.set_binary_spans(key, &spans) {
+                self.error(e);
+                return;
+            }
         }
         self.invalidate_from(&id, from);
     }
@@ -730,6 +796,9 @@ impl App {
 
     /// Records the state hash playback reached at the end as the replay's end-hash.
     fn accept_end_hash(&mut self) {
+        if let Some(id) = self.pb.as_ref().filter(|p| p.end_hash.is_some()).map(|p| p.id.clone()) {
+            self.remember("Accept end hash", &[&id]);
+        }
         let (Some(col), Some(pb)) = (&mut self.col, &self.pb) else { return };
         let Some(h) = pb.end_hash.clone() else { return };
         let r = col.replays.get_mut(&pb.id).unwrap();
@@ -742,7 +811,215 @@ impl App {
         self.info("Accepted the new end hash. Save to keep it; child replays will check against it.");
     }
 
+    // ---- undo, redo and clipboard ----
+
+    /// Records the nodes `ids` as they are now, before a change, as one undo step.
+    fn remember(&mut self, label: &str, ids: &[&str]) {
+        let Some(col) = &self.col else { return };
+        let nodes = ids.iter().map(|id| (id.to_string(), col.replays.get(*id).cloned())).collect();
+        let frame = self.pb.as_ref().and_then(|p| p.shown());
+        self.undo.push(UndoStep { label: label.to_string(), nodes, selected: self.selected.clone(), frame });
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    fn undo(&mut self) {
+        if let Some(step) = self.undo.pop() {
+            let label = step.label.clone();
+            let back = self.restore(step);
+            self.redo.push(back);
+            self.info(format!("Undid: {label}"));
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(step) = self.redo.pop() {
+            let label = step.label.clone();
+            let back = self.restore(step);
+            self.undo.push(back);
+            self.info(format!("Redid: {label}"));
+        }
+    }
+
+    /// Puts the nodes of `step` back and returns the step that reverses it.
+    fn restore(&mut self, step: UndoStep) -> UndoStep {
+        self.renaming = None;
+        self.playing = false;
+        let here = self.pb.as_ref().and_then(|p| p.shown());
+        let cur = self.selected.clone();
+        let Some(col) = &mut self.col else { return step };
+        let chain: Vec<String> = cur.as_deref().and_then(|c| col.chain(c).ok()).unwrap_or_default().into_iter().map(String::from).collect();
+        // A change to the current node alone, keeping its length and parent, only needs the
+        // frames from the first difference on to be run again. Anything else reloads the node.
+        let mut first_diff: Option<u64> = None;
+        let mut reload = false;
+        let mut back = vec![];
+        for (id, before) in step.nodes {
+            let now = col.replays.get(&id).cloned();
+            if cur.as_deref() == Some(id.as_str()) {
+                match (&now, &before) {
+                    (Some(a), Some(b)) if a.frames().ok() == b.frames().ok() && a.parent() == b.parent() => {
+                        if let Some(f) = first_change(a, b) {
+                            first_diff = Some(first_diff.map_or(f, |d| d.min(f)));
+                        }
+                    }
+                    _ => reload = true,
+                }
+            } else if chain.contains(&id) {
+                reload = true;
+            }
+            match before {
+                Some(r) => {
+                    col.replays.insert(id.clone(), r);
+                }
+                None => {
+                    col.replays.remove(&id);
+                }
+            }
+            self.edited.insert(id.clone());
+            back.push((id, now));
+        }
+        let reverse = UndoStep { label: step.label, nodes: back, selected: cur.clone(), frame: here };
+        self.roll.invalidate();
+        let target = step.selected.filter(|s| col.replays.contains_key(s));
+        if self.hoist.as_ref().is_some_and(|h| !col.replays.contains_key(h)) {
+            self.hoist = None;
+        }
+        if target != cur || reload {
+            match &target {
+                Some(t) => {
+                    self.select(t);
+                    let f = step.frame.unwrap_or(0);
+                    self.seek(f);
+                    self.roll.follow_to(f);
+                }
+                None => {
+                    self.selected = None;
+                    self.pb = None;
+                    self.texture = None;
+                }
+            }
+        } else if let (Some(from), Some(id)) = (first_diff, &cur) {
+            // Same node: drop what playback knew past the first change and redraw here.
+            let checkpoints: BTreeMap<u64, String> = col.replays[id].checkpoints().unwrap_or_default().into_iter().collect();
+            if let Some(pb) = &mut self.pb {
+                pb.snapshots.retain(|k, _| *k <= from);
+                pb.checkpoints = checkpoints;
+                pb.checkpoint_miss = None;
+                pb.end_hash = None;
+                pb.ran = 0;
+                let f = here.unwrap_or(0);
+                self.seek(f);
+            }
+        }
+        self.refresh_frame_dialog();
+        reverse
+    }
+
+    fn copy(&mut self) -> bool {
+        let notes = self.roll.selected_notes();
+        let Some(base) = notes.iter().map(|(_, sp)| sp.0).min() else { return false };
+        let n = notes.len();
+        // Also put the notes on the system clipboard as replay lines (frames relative to the
+        // first note). Some platforms only report Ctrl/Cmd+V when the clipboard holds text.
+        let mut lines: Vec<(u64, String)> = vec![];
+        for (k, sp) in &notes {
+            lines.push((sp.0 - base, emucov::format::input_text(*k, 1)));
+            lines.push((sp.1 - base, emucov::format::input_text(*k, 0)));
+        }
+        lines.sort();
+        let text: Vec<String> = lines.into_iter().map(|(f, t)| format!("{f} {t}")).collect();
+        self.ctx_copy = Some(text.join("\n") + "\n");
+        self.clip = Some(Clip { notes: notes.into_iter().map(|(k, sp)| (k, sp.0 - base, sp.1 - sp.0)).collect() });
+        self.info(format!("Copied {n} note{}", if n == 1 { "" } else { "s" }));
+        true
+    }
+
+    fn cut(&mut self) {
+        let notes = self.roll.selected_notes();
+        if notes.is_empty() || !self.copy() {
+            return;
+        }
+        let (Some(col), Some(id)) = (&self.col, &self.selected) else { return };
+        let r = &col.replays[id];
+        let keys: BTreeSet<InputKey> = notes.iter().map(|(k, _)| *k).collect();
+        let edits = keys.into_iter().map(|k| (k, r.binary_spans(k).into_iter().filter(|sp| !notes.contains(&(k, *sp))).collect())).collect();
+        let from = notes.iter().map(|(_, sp)| sp.0).min().unwrap_or(0);
+        self.roll.set_selection([]);
+        self.apply_edit("Cut", edits, from);
+    }
+
+    /// Pastes the copied notes so the leftmost one starts at the play cursor. The pasted
+    /// notes become the selection; notes past the node's end are cut off.
+    fn paste(&mut self) {
+        let (Some(clip), Some(col), Some(id), Some(pb)) = (&self.clip, &self.col, &self.selected, &self.pb) else { return };
+        let at = pb.shown().unwrap_or(0);
+        let r = &col.replays[id];
+        let frames = r.frames().unwrap_or(0);
+        let keys: BTreeSet<InputKey> = clip.notes.iter().map(|(k, _, _)| *k).collect();
+        let mut edits = vec![];
+        let mut pasted = vec![];
+        for key in keys {
+            let mut spans = r.binary_spans(key);
+            let mut starts = vec![];
+            for (_, rel, len) in clip.notes.iter().filter(|(k, _, _)| *k == key) {
+                let a = at + rel;
+                if a < frames {
+                    spans.push((a, (a + len).min(frames)));
+                    starts.push(a);
+                }
+            }
+            if starts.is_empty() {
+                continue;
+            }
+            let spans = roll::merge(spans);
+            for a in starts {
+                if let Some(sp) = spans.iter().find(|sp| sp.0 <= a && a < sp.1) {
+                    pasted.push((key, sp.0));
+                }
+            }
+            edits.push((key, spans));
+        }
+        if edits.is_empty() {
+            self.info("Nothing to paste here: the play cursor is past the copied notes' room");
+            return;
+        }
+        self.roll.set_selection(pasted);
+        self.roll.mode = roll::Mode::Select;
+        self.apply_edit("Paste", edits, at);
+    }
+
     // ---- nodes ----
+
+    /// Deletes `id` and everything below it (`ids`, from `subtree`), as one undo step.
+    fn delete_nodes(&mut self, id: &str, ids: Vec<String>) {
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        self.remember("Delete", &refs);
+        let Some(col) = &mut self.col else { return };
+        let parent = col.replays.get(id).and_then(|r| r.parent().map(String::from));
+        for i in &ids {
+            col.replays.remove(i);
+            self.edited.insert(i.clone());
+            self.tree_closed.remove(i);
+        }
+        if self.hoist.as_ref().is_some_and(|h| ids.contains(h)) {
+            self.hoist = None;
+        }
+        self.roll.invalidate();
+        let n = ids.len();
+        // If the shown node went, show its parent instead.
+        if self.selected.as_ref().is_some_and(|s| ids.contains(s)) {
+            self.pb = None;
+            self.texture = None;
+            self.selected = None;
+            if let Some(p) = parent {
+                self.select(&p);
+            }
+        }
+        self.info(format!("Deleted {n} node{}. Save to remove the files, or undo.", if n == 1 { "" } else { "s" }));
+    }
 
     fn new_id() -> String {
         uuid::Uuid::new_v4().to_string()
@@ -750,8 +1027,9 @@ impl App {
 
     /// Adds an empty child node that starts where `parent` ends, and selects it.
     fn new_child(&mut self, parent: &str) {
-        let Some(col) = &mut self.col else { return };
         let id = Self::new_id();
+        self.remember("New node", &[&id]);
+        let Some(col) = &mut self.col else { return };
         let r = emucov::format::Replay::new(&id, Some(parent), "New node", 600);
         col.replays.insert(id.clone(), r);
         self.edited.insert(id.clone());
@@ -788,6 +1066,15 @@ impl App {
         let (Some(col), Some(s)) = (&mut self.col, &mut self.session) else { return Ok(()) };
         let h = s.state_hash(col)?;
         let up_id = Self::new_id();
+        let b = Self::new_id();
+        {
+            let mut ids = vec![id.as_str(), up_id.as_str()];
+            if branch {
+                ids.push(b.as_str());
+            }
+            self.remember(if branch { "Branch" } else { "Split" }, &ids);
+        }
+        let (Some(col), Some(_)) = (&mut self.col, &mut self.session) else { return Ok(()) };
         let (mut up, mut down) = col.replays[&id].split_at(f, &up_id)?;
         if let Some((_, want)) = col.replays[&id].checkpoints()?.into_iter().find(|(cf, _)| *cf == f) {
             if want != h {
@@ -804,7 +1091,6 @@ impl App {
         self.edited.insert(up_id.clone());
         self.roll.invalidate();
         if branch {
-            let b = Self::new_id();
             let r = emucov::format::Replay::new(&b, Some(&up_id), "New branch", 600);
             col.replays.insert(b.clone(), r);
             self.edited.insert(b.clone());
@@ -837,6 +1123,12 @@ impl App {
         if d.frames == 0 {
             return Err(anyhow!("a node needs at least one frame"));
         }
+        if d.title.trim() == r.title() && d.frames == old_frames {
+            return Ok(());
+        }
+        self.remember("Node properties", &[&d.id]);
+        let Some(col) = &mut self.col else { return Ok(()) };
+        let r = col.replays.get_mut(&d.id).ok_or_else(|| anyhow!("node is gone"))?;
         r.set("title", d.title.trim());
         self.edited.insert(d.id.clone());
         if d.frames != old_frames {
@@ -867,7 +1159,7 @@ impl App {
     /// existing line, or add a new one when `line_no` is None.
     fn edit_line(&mut self, frame: u64, line_no: Option<usize>, text: Option<&str>) {
         let (Some(col), Some(id)) = (&mut self.col, self.selected.clone()) else { return };
-        let r = col.replays.get_mut(&id).unwrap();
+        let r = col.replays.get(&id).unwrap();
         // Events and screenshots don't touch the game; everything else may.
         let harmless = |t: &str| {
             let t = t.trim_start().to_ascii_uppercase();
@@ -879,6 +1171,12 @@ impl App {
                 return;
             }
         }
+        if line_no.is_none() && text.is_none() {
+            return;
+        }
+        self.remember(if text.is_none() { "Delete line" } else if line_no.is_none() { "Add line" } else { "Edit line" }, &[&id]);
+        let Some(col) = &mut self.col else { return };
+        let r = col.replays.get_mut(&id).unwrap();
         let res = match (line_no, text) {
             (Some(n), t) => r.replace_line(n, t),
             (None, Some(t)) => r.insert_line(frame, t),
@@ -898,6 +1196,46 @@ impl App {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        // One confirmation for Node > Delete and the tree's right-click Delete.
+        let pending = self.delete_dialog.clone().and_then(|id| self.col.as_ref().filter(|c| c.replays.contains_key(&id)).map(|c| (id, c)));
+        if pending.is_none() {
+            self.delete_dialog = None;
+        }
+        if let Some((id, col)) = pending {
+            let r = &col.replays[&id];
+            let ids = subtree(col, &id);
+            let frames: u64 = ids.iter().map(|i| col.replays[i].frames().unwrap_or(0)).sum();
+            let title = r.title().to_string();
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new("Delete node").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+                ui.label(RichText::new(format!("Delete \"{title}\"?")).strong());
+                let below = ids.len() - 1;
+                if below > 0 {
+                    ui.label(RichText::new(format!("This also deletes the {below} node{} below it.", if below == 1 { "" } else { "s" })).color(Color32::from_rgb(240, 160, 60)));
+                }
+                ui.label(format!("{} node{}, {frames} frames in all. Undo brings them back; the files are removed when you save.", ids.len(), if ids.len() == 1 { "" } else { "s" }));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new(if ids.len() == 1 { "Delete".to_string() } else { format!("Delete {} nodes", ids.len()) }).color(Color32::from_rgb(240, 110, 100))).clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+            if confirm {
+                self.delete_dialog = None;
+                self.delete_nodes(&id, ids);
+            } else if cancel || !open {
+                self.delete_dialog = None;
+            }
+        }
         if let Some(mut d) = self.node_dialog.take() {
             let mut open = true;
             let mut apply = false;
@@ -1009,6 +1347,30 @@ impl App {
                     ui.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
+            ui.menu_button("Edit", |ui| {
+                use egui::{Key, KeyboardShortcut, Modifiers};
+                let ctx = ui.ctx().clone();
+                let sc = |m: Modifiers, k: Key| ctx.format_shortcut(&KeyboardShortcut::new(m, k));
+                let undo_label = self.undo.last().map_or("Undo".to_string(), |s| format!("Undo {}", s.label.to_lowercase()));
+                if ui.add_enabled(!self.undo.is_empty(), egui::Button::new(undo_label).shortcut_text(sc(Modifiers::COMMAND, Key::Z))).clicked() {
+                    self.undo();
+                }
+                let redo_label = self.redo.last().map_or("Redo".to_string(), |s| format!("Redo {}", s.label.to_lowercase()));
+                if ui.add_enabled(!self.redo.is_empty(), egui::Button::new(redo_label).shortcut_text(sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z))).clicked() {
+                    self.redo();
+                }
+                ui.separator();
+                let has_sel = !self.roll.selected_notes().is_empty();
+                if ui.add_enabled(has_sel, egui::Button::new("Cut").shortcut_text(sc(Modifiers::COMMAND, Key::X))).clicked() {
+                    self.cut();
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Copy").shortcut_text(sc(Modifiers::COMMAND, Key::C))).clicked() {
+                    self.copy();
+                }
+                if ui.add_enabled(self.clip.is_some() && self.pb.is_some(), egui::Button::new("Paste at play cursor").shortcut_text(sc(Modifiers::COMMAND, Key::V))).clicked() {
+                    self.paste();
+                }
+            });
             ui.menu_button("Emulation", |ui| {
                 let has = self.pb.is_some();
                 if ui.add_enabled(has, egui::Button::new(if self.playing { "Pause" } else { "Play" }).shortcut_text("Space")).clicked() {
@@ -1068,6 +1430,10 @@ impl App {
                 }
                 if ui.add_enabled(sel.is_some(), egui::Button::new("Properties…")).clicked() {
                     self.open_node_dialog(sel.as_deref().unwrap());
+                }
+                ui.separator();
+                if ui.add_enabled(sel.is_some(), egui::Button::new("Delete…")).on_hover_text("Delete this node and everything below it").clicked() {
+                    self.delete_dialog = sel.clone();
                 }
             });
             ui.menu_button("Input", |ui| {
@@ -1227,6 +1593,7 @@ impl App {
         ui.separator();
         let mut clicked: Option<String> = None;
         let mut double: Option<String> = None;
+        let mut rename_done: Option<(String, Option<String>)> = None;
         let mut toggled: Option<String> = None;
         let mut context: Option<(String, &str)> = None;
         // Rows in tree order. An only child continues its parent's column instead of
@@ -1284,7 +1651,26 @@ impl App {
                         title = title.italics().color(Color32::from_rgb(240, 210, 90));
                     }
                     let sel = self.selected.as_deref() == Some(id);
-                    let resp = ui.selectable_label(sel, title);
+                    let resp = match &mut self.renaming {
+                        Some((rid, text, focus)) if rid == id => {
+                            let w = (ui.available_width() - 50.0).max(80.0);
+                            let mut out = egui::TextEdit::singleline(text).id_salt("tree_rename").desired_width(w).show(ui);
+                            if *focus {
+                                // Start with the whole title selected, as IDEs do.
+                                *focus = false;
+                                out.response.response.request_focus();
+                                let n = text.chars().count();
+                                out.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
+                                out.state.store(ui.ctx(), out.response.response.id);
+                            } else if out.response.response.lost_focus() {
+                                // Enter or clicking away keeps the new title; Escape cancels.
+                                let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                rename_done = Some((id.to_string(), (!cancel).then(|| text.trim().to_string())));
+                            }
+                            out.response.response
+                        }
+                        _ => ui.selectable_label(sel, title),
+                    };
                     let frames = r.frames().unwrap_or(0);
                     ui.label(RichText::new(format!("{frames}f")).weak().small());
                     if r.is_poked() {
@@ -1316,6 +1702,9 @@ impl App {
                         }
                         if ui.button("Properties…").clicked() {
                             context = Some((id.to_string(), "props"));
+                        }
+                        if ui.button("Delete…").on_hover_text("Delete this node and everything below it").clicked() {
+                            context = Some((id.to_string(), "delete"));
                         }
                         ui.separator();
                         if ui.add_enabled(hoist != Some(id), egui::Button::new("Focus here")).on_hover_text("Show only this node and what is below it").clicked() {
@@ -1356,6 +1745,23 @@ impl App {
         if let Some(id) = double {
             self.play_node(&id);
         }
+        if let Some((id, title)) = rename_done {
+            self.renaming = None;
+            // The Enter that ended the rename must not start another one.
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            let changed = title.as_ref().is_some_and(|t| !t.is_empty() && self.col.as_ref().and_then(|c| c.replays.get(&id)).is_some_and(|r| r.title() != t));
+            if changed {
+                self.remember("Rename", &[&id]);
+            }
+            if let (Some(t), Some(col)) = (title.filter(|_| changed), &mut self.col) {
+                if let Some(r) = col.replays.get_mut(&id) {
+                    {
+                        r.set("title", &t);
+                        self.edited.insert(id);
+                    }
+                }
+            }
+        }
         match context {
             Some((id, "child")) => {
                 if self.selected.as_deref() != Some(id.as_str()) {
@@ -1369,6 +1775,7 @@ impl App {
                 self.hoist = Some(id);
             }
             Some((_, "unhoist")) => self.hoist = None,
+            Some((id, "delete")) => self.delete_dialog = Some(id),
             Some((id, _)) => self.open_node_dialog(&id),
             None => {}
         }
@@ -1498,6 +1905,66 @@ impl App {
             )
         });
         let add_event = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::E));
+        // Redo first: Cmd+Z alone would also match Cmd+Shift+Z.
+        let (undo, redo, mut cut, mut copy, mut paste) = ctx.input_mut(|i| {
+            let redo = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y);
+            let undo = i.consume_key(Modifiers::COMMAND, Key::Z);
+            (undo, redo, i.consume_key(Modifiers::COMMAND, Key::X), i.consume_key(Modifiers::COMMAND, Key::C), i.consume_key(Modifiers::COMMAND, Key::V))
+        });
+        // Some platforms deliver the clipboard keys as events instead of key presses.
+        ctx.input_mut(|i| {
+            i.events.retain(|e| match e {
+                egui::Event::Cut => {
+                    cut = true;
+                    false
+                }
+                egui::Event::Copy => {
+                    copy = true;
+                    false
+                }
+                egui::Event::Paste(_) => {
+                    paste = true;
+                    false
+                }
+                _ => true,
+            })
+        });
+        if redo {
+            self.redo();
+        } else if undo {
+            self.undo();
+        }
+        if cut {
+            self.cut();
+        } else if copy {
+            self.copy();
+        }
+        if paste {
+            self.paste();
+        }
+        let (rename, draw, select) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::F2),
+                i.consume_key(Modifiers::NONE, Key::D),
+                i.consume_key(Modifiers::NONE, Key::S),
+            )
+        });
+        if draw {
+            self.roll.mode = roll::Mode::Draw;
+        }
+        if select {
+            self.roll.mode = roll::Mode::Select;
+        }
+        if rename && self.node_dialog.is_none() && self.frame_dialog.is_none() && self.renaming.is_none() {
+            if let (Some(id), Some(col)) = (&self.selected, &self.col) {
+                let title = col.replays[id].title().to_string();
+                self.renaming = Some((id.clone(), title, true));
+                // Make sure the row is visible.
+                if self.hoist.as_ref().is_some_and(|h| col.chain(id).is_ok_and(|c| !c.contains(&h.as_str()))) {
+                    self.hoist = None;
+                }
+            }
+        }
         if add_event && self.pb.is_some() {
             let f = self.pb.as_ref().and_then(|p| p.shown()).unwrap_or(0);
             self.open_frame_dialog(f, "[EVENT] ");
@@ -1541,6 +2008,9 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         CTX.with(|c| *c.borrow_mut() = Some(ctx.clone()));
         self.shortcuts(&ctx);
+        if let Some(t) = self.ctx_copy.take() {
+            ctx.copy_text(t);
+        }
         let dt = ctx.input(|i| i.unstable_dt).min(0.1) as f64;
         self.work();
         if self.job.is_some() {
@@ -1576,7 +2046,7 @@ impl eframe::App for App {
                 self.playing = false;
                 self.seek(f);
             }
-            Some(roll::Action::Edit { key, spans, from }) => self.apply_edit(key, spans, from),
+            Some(roll::Action::Edit { edits, from }) => self.apply_edit("Edit notes", edits, from),
             Some(roll::Action::OpenFrame(f)) => self.open_frame_dialog(f, ""),
             None => {}
         }
