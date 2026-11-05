@@ -130,6 +130,9 @@ copy of the unchanged ones.
 | `diffs` | content key, frame, base (a snapshot or the previous diff), manifest of changed pages |
 | `images` | content key, frame, role (`start`, `marker`, `screenshot`), PNG |
 | `coverage` | content key, region, covered ranges (today's table, re-keyed) |
+| `coverage_sum` | function or block → how many current clean segments cover it, and the first one (a cache, see "Coverage") |
+| `unreachable` | ROM ranges loaded from the collection's `unreachable.txt`, with their comments |
+| `parity` | comparison core, content key, block → result (`match`, `differs`), first differing frame, evidence |
 | `first_hits` | content key, ROM offset, first frame it ran, CPU address, bank or overlay |
 | `code` | ROM offset → instruction, block id, function (from the symbol map and the sweep) |
 | `runs` | when hydrate or play runs happened (today's table) |
@@ -277,26 +280,66 @@ to.
    `.emucov/states/` into it. Add the GUI's memory LRU with `max_memory`, and
    hydration of a segment or subtree with pause and stop.
 2. **Coverage.** Move the coverage tables into `cache.db`, keyed by content, so a
-   split or join simply re-records them. Add `first_hits` and `code`, plus
-   `emucov where`.
+   split or join simply re-records them. Add `first_hits`, `code`, `coverage_sum`
+   (clean segments only) and `unreachable.txt`, plus `emucov where`. The `parity`
+   table comes with comparison cores, once it's decided how parity is checked.
 3. **Diffs.** Add `diffs` with `diff_every`, `diff_at_markers` and `exclude`, then
    the presets, a RAM view in the GUI, and the
    watched-address lanes from the Tetris notes.
 4. **Agents.** Add `emucov sql`, an MCP server with the common queries, and
    `cache pack` / `unpack`.
 
+## Coverage
+
+Coverage uses the terms in SPEC.md: covered, uncovered, unreachable, parity and no
+parity.
+
+**Stored per content key, never per collection.** When a segment is played, the
+connector reports the ROM bytes it executed during that segment's own frames (not
+its parents'). These are saved as covered ranges in `coverage`, with the first frame
+of each in `first_hits`. A segment's coverage is a fact about its content, so it
+never goes stale. A dirty or edited segment simply has a different content key.
+
+**The collection's coverage is worked out from the segments as they are now.** A
+block is covered if any segment in `segments_now` that is currently **clean** has it
+in its ranges. Dirty segments don't count, because their hashes say they no longer
+play as recorded. Unplayed segments don't count either. Status:
+
+- `unreachable` (blue) if the block is in a range from `unreachable.txt`.
+- Otherwise, `no parity` (red) if any comparison core has a `differs` row for it from
+  a clean segment.
+- Otherwise, `parity` (purple) if a comparison core matched every clean segment that
+  covers it.
+- Otherwise, `covered` (green) if any clean segment covers it.
+- Otherwise, `uncovered`.
+
+Parity is kept per comparison core, so the GUI and reports pick which comparison
+core to color by.
+
+**Keeping it fast.** Unioning instruction ranges across hundreds of segments on every
+edit would be too slow for the GUI. So `coverage_sum` keeps, for each function and
+block, how many clean segments cover it. When a segment turns dirty or clean, only
+its own blocks are counted down or up. Instruction-level detail is read from
+`coverage` on demand, for example when looking at one function. The GUI shows the
+per-function and per-block view live, and instruction detail only when asked.
+
+**Unreachable ranges** live in `unreachable.txt`, in version control, as one ROM
+range per line with `#` comments. The table is reloaded whenever the file changes.
+
+**Reports** (the gap list, per-function percentages, and an export for
+collaborators) are queries over these tables, so the CLI, the GUI and an MCP server
+all give the same numbers.
+
 ## Decided
 
-- **One baseline core per collection, and a version change is only a warning.** A
+- **One baseline core per collection, and a version change is a warning.** A
   collection is anchored to the core named in `collection.toml`. Emulator cores are
-  stable, and a new version is very unlikely to change how a game plays. So the setup
-  id that keys the cache covers the ROM, the core's name and its options, but not its
-  version. When the running core's version differs from the recorded one, the tools
-  warn and carry on. The state hashes still catch any real difference. A snapshot
-  that fails to load falls back to playing. Comparison cores (decomps wrapped as
-  libretro cores, or other emulators) never load our snapshots. They play the same
-  inputs from power-on and work out for themselves what a snapshot of memory means
-  to them.
+  stable, and a new version is very unlikely to change how a game plays. When the
+  running core's version differs from the recorded one, the tools warn and carry on.
+  The state hashes still catch any real difference. Comparison cores (decomps wrapped
+  as libretro cores, or other emulators) never load our snapshots. They play the
+  same inputs from power-on and work out for themselves what a snapshot of memory
+  means to them.
 - **Snapshot layout is checked per core, not designed for up front.** Pages only
   dedup if memory sits at the same offset in every snapshot. Most cores write a
   fixed-size, fixed-layout state, and Mupen64Plus-Next (N64) does. The cores that
@@ -309,6 +352,12 @@ to.
   game.
 
 ## Open questions
+
+- **Should the core version be part of the cache key?** If it is, a new version starts
+  an empty cache, which is safe but means everything is hydrated again. If it isn't,
+  snapshots and coverage carry over and the warning is the only signal: a snapshot
+  that fails to load falls back to playing, and the state hashes catch a game that
+  plays differently. I lean towards leaving it out, but this is undecided.
 
 - **N64 page size.** 64 KB is a guess for the N64 presets. Smaller pages dedup better
   but make longer manifests. Try 16, 64 and 256 KB on a real game once pages exist.
