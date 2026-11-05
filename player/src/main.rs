@@ -1,4 +1,4 @@
-use emucov::{coverage, libretro};
+use emucov::{cache, coverage, libretro};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use emucov::collection::{sha256_file, Collection, Config, CoreConfig, HashConfig, LocalConfig, PortConfig, RomConfig, Status, SymbolsConfig};
 use emucov::format::Replay;
+use emucov::hydrate::Hydrator;
 use emucov::player::{PlayOptions, ReplayResult, Session};
 
 #[derive(Parser)]
@@ -24,6 +25,9 @@ struct Local {
     /// libretro core library (default: the one saved in .emucov/local.toml)
     #[arg(long, global = true)]
     core: Option<PathBuf>,
+    /// Run without the local database (.emucov/cache.db), playing everything from power-on
+    #[arg(long, global = true)]
+    no_db: bool,
 }
 
 #[derive(Subcommand)]
@@ -47,7 +51,7 @@ enum Cmd {
         #[arg(long)]
         symbols: Option<PathBuf>,
     },
-    /// Create an empty replay
+    /// Create an empty segment
     New {
         dir: PathBuf,
         #[arg(long)]
@@ -57,9 +61,9 @@ enum Cmd {
         #[arg(long, default_value_t = 60)]
         frames: u64,
     },
-    /// Show the replay tree with clean, dirty and unverified marks (no emulation)
+    /// Show the segment tree with clean, dirty and unverified marks (no emulation)
     Status { dir: PathBuf },
-    /// Play one replay (and its ancestors), check hashes, and save screenshots
+    /// Play one segment (and its ancestors), check hashes, and save screenshots
     Play {
         dir: PathBuf,
         id: String,
@@ -68,17 +72,17 @@ enum Cmd {
         /// Save the last frame (and any [SCREENSHOT] frames) as PNGs here
         #[arg(long)]
         screenshots: Option<PathBuf>,
-        /// Also capture these frames (relative to the replay)
+        /// Also capture these frames (relative to the segment)
         #[arg(long, value_delimiter = ',')]
         shot: Vec<u64>,
-        /// Replay from the trunk instead of a cached ancestor state
+        /// Play from the root segment instead of a stored ancestor state
         #[arg(long)]
         no_cache: bool,
         /// Write the hashes this run produced into the replay files
         #[arg(long)]
         accept: bool,
     },
-    /// Play every replay, check hashes, and record coverage
+    /// Play every segment, check hashes, and record coverage
     Run {
         dir: PathBuf,
         #[command(flatten)]
@@ -89,11 +93,54 @@ enum Cmd {
         /// Write the hashes this run produced into the replay files
         #[arg(long)]
         accept: bool,
-        /// Save each replay's last frame to .emucov/screenshots/
+        /// Save each segment's last frame to .emucov/screenshots/
         #[arg(long)]
         screenshots: bool,
     },
-    /// Report coverage from the latest run
+    /// Fill the local database: play the segments whose current content isn't stored yet
+    Hydrate {
+        dir: PathBuf,
+        #[command(flatten)]
+        local: Local,
+        /// Only this segment (id or unique prefix)
+        segment: Option<String>,
+        /// With a segment: also every segment below it
+        #[arg(long)]
+        children: bool,
+        /// Try to clean dirty segments: when a segment still ends with its recorded hashes,
+        /// write its new start hash so it is clean again; otherwise report the mismatch
+        #[arg(long)]
+        clean: bool,
+        /// Play segments again even if their content is stored
+        #[arg(long)]
+        force: bool,
+    },
+    /// Which segments first run a ROM offset or symbol, at which frame
+    Where {
+        dir: PathBuf,
+        /// PRG:0x1F3A, 0x1F3A (PRG) or a symbol name
+        what: String,
+        #[command(flatten)]
+        local: Local,
+    },
+    /// Write the core state at a frame of a segment, to start a trace from
+    Snapshot {
+        dir: PathBuf,
+        segment: String,
+        frame: u64,
+        #[arg(long)]
+        out: PathBuf,
+        #[command(flatten)]
+        local: Local,
+    },
+    /// Run an SQL query on the local database
+    Sql { dir: PathBuf, query: String },
+    /// Local database size, or clean it up
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCmd,
+    },
+    /// Report coverage of the current segments
     Report {
         dir: PathBuf,
         #[command(flatten)]
@@ -104,6 +151,18 @@ enum Cmd {
         /// Write a CSV of uncovered blocks for collaborators
         #[arg(long)]
         gaps: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCmd {
+    /// What the local database holds
+    Stats { dir: PathBuf },
+    /// Drop content no current segment uses, and pages no snapshot uses
+    Gc {
+        dir: PathBuf,
+        #[command(flatten)]
+        local: Local,
     },
 }
 
@@ -123,6 +182,12 @@ fn real_main() -> Result<()> {
         Cmd::Play { dir, id, local, screenshots, shot, no_cache, accept } => play(&dir, &id, &local, screenshots, shot, no_cache, accept),
         Cmd::Run { dir, local, from_scratch, accept, screenshots } => run(&dir, &local, from_scratch, accept, screenshots),
         Cmd::Report { dir, local, json, gaps } => report(&dir, &local, json, gaps),
+        Cmd::Hydrate { dir, local, segment, children, clean, force } => hydrate(&dir, &local, segment, children, clean, force),
+        Cmd::Where { dir, what, local } => where_cmd(&dir, &what, &local),
+        Cmd::Snapshot { dir, segment, frame, out, local } => snapshot_cmd(&dir, &segment, frame, &out, &local),
+        Cmd::Sql { dir, query } => sql(&dir, &query),
+        Cmd::Cache { cmd: CacheCmd::Stats { dir } } => cache_stats(&dir),
+        Cmd::Cache { cmd: CacheCmd::Gc { dir, local } } => cache_gc(&dir, &local),
     }
 }
 
@@ -131,9 +196,18 @@ fn resolve_local(col: &Collection, local: &Local) -> Result<(PathBuf, PathBuf)> 
     let rom = local.rom.clone().or(saved.rom).ok_or_else(|| anyhow!("no ROM given; pass --rom (it is then remembered)"))?;
     let core = local.core.clone().or(saved.core).ok_or_else(|| anyhow!("no core given; pass --core (it is then remembered)"))?;
     if local.rom.is_some() || local.core.is_some() {
-        col.save_local(&LocalConfig { rom: Some(std::fs::canonicalize(&rom)?), core: Some(std::fs::canonicalize(&core)?) })?;
+        let mut saved = col.load_local()?;
+        saved.rom = Some(std::fs::canonicalize(&rom)?);
+        saved.core = Some(std::fs::canonicalize(&core)?);
+        col.save_local(&saved)?;
     }
     Ok((rom, core))
+}
+
+fn open_session(col: &Collection, local: &Local) -> Result<Session> {
+    let (rom, core) = resolve_local(col, local)?;
+    let use_db = !local.no_db && col.load_local()?.database.unwrap_or(true);
+    Session::open_with(col, &rom, &core, use_db)
 }
 
 fn init(dir: &Path, name: &str, rom: &Path, core_path: &Path, core_build: Option<String>, options: &[String], symbols: Option<&Path>) -> Result<()> {
@@ -179,10 +253,11 @@ fn init(dir: &Path, name: &str, rom: &Path, core_path: &Path, core_build: Option
         hash: HashConfig { algorithm: "blake3".into(), regions },
         tick: None,
         symbols: syms,
+        cache: None,
     };
     std::fs::write(dir.join("collection.toml"), toml::to_string_pretty(&config)?)?;
     let col = Collection::open(dir)?;
-    col.save_local(&LocalConfig { rom: Some(std::fs::canonicalize(rom)?), core: Some(std::fs::canonicalize(core_path)?) })?;
+    col.save_local(&LocalConfig { rom: Some(std::fs::canonicalize(rom)?), core: Some(std::fs::canonicalize(core_path)?), ..Default::default() })?;
     println!("created {}", dir.join("collection.toml").display());
     Ok(())
 }
@@ -267,11 +342,10 @@ fn save_shots(res: &ReplayResult, dir: &Path) -> Result<()> {
 
 fn play(dir: &Path, id: &str, local: &Local, shots: Option<PathBuf>, extra: Vec<u64>, no_cache: bool, do_accept: bool) -> Result<()> {
     let mut col = Collection::open(dir)?;
-    let (rom, core) = resolve_local(&col, local)?;
     let id = col.resolve(id)?.to_string();
     let results = {
-        let mut s = Session::open(&col, &rom, &core)?;
-        let opts = PlayOptions { end_screenshot: shots.is_some(), extra_shots: extra };
+        let mut s = open_session(&col, local)?;
+        let opts = PlayOptions { end_screenshot: shots.is_some(), extra_shots: extra, record: true };
         s.play_chain(&col, &id, &opts, !no_cache)?
     };
     let mut bad = false;
@@ -298,21 +372,22 @@ fn play(dir: &Path, id: &str, local: &Local, shots: Option<PathBuf>, extra: Vec<
 
 fn run(dir: &Path, local: &Local, from_scratch: bool, do_accept: bool, screenshots: bool) -> Result<()> {
     let col = Collection::open(dir)?;
-    let (rom, core) = resolve_local(&col, local)?;
-    let store = coverage::Store::open(&col.local_dir().join("coverage.sqlite"))?;
     let shot_dir = col.local_dir().join("screenshots");
     // What --accept needs, kept after the session (which borrows the collection) ends.
     let mut accepted: Vec<(ReplayResult, &'static str)> = vec![];
     let started = std::time::Instant::now();
     let mut total_frames = 0u64;
     {
-        let mut s = Session::open(&col, &rom, &core)?;
+        let mut s = open_session(&col, local)?;
         if !s.core.has_connector() {
             eprintln!("note: this core has no coverage connector; recording hashes only");
         }
-        let run_id = store.begin_run(&s.setup_id, &col.config.core.build, from_scratch)?;
-        let opts = PlayOptions { end_screenshot: screenshots, extra_shots: vec![] };
-        s.play_all(&col, &opts, from_scratch, |_s, res| {
+        let run_id = match &s.cache {
+            Some(c) => Some(c.begin_run(&col.config.core.build, if from_scratch { "run --from-scratch" } else { "run" })?),
+            None => None,
+        };
+        let opts = PlayOptions { end_screenshot: screenshots, extra_shots: vec![], record: true };
+        s.play_all(&col, &opts, from_scratch, |s, res| {
             let outcome = judge(&col, res);
             let depth = col.chain(&res.id)?.len() - 1;
             println!(
@@ -327,7 +402,10 @@ fn run(dir: &Path, local: &Local, from_scratch: bool, do_accept: bool, screensho
             if screenshots {
                 save_shots(res, &shot_dir)?;
             }
-            store.record(run_id, &col, res, outcome)?;
+            if let (Some(c), Some(run)) = (&s.cache, run_id) {
+                let key = s.content_key(&col, &res.id, &res.start_hash)?;
+                c.run_result(run, &res.id, &key, outcome)?;
+            }
             total_frames += res.frames;
             accepted.push((
                 ReplayResult {
@@ -370,8 +448,8 @@ fn report(dir: &Path, local: &Local, json: Option<PathBuf>, gaps: Option<PathBuf
         Ok((rom, _)) => Some(std::fs::read(&rom).with_context(|| format!("reading {}", rom.display()))?),
         Err(_) => None,
     };
-    let store = coverage::Store::open(&col.local_dir().join("coverage.sqlite"))?;
-    let rep = coverage::build_report(&col, &store, rom.as_deref())?;
+    let conn = cache::Cache::open_readonly(&col)?;
+    let rep = coverage::build_report(&col, &conn, rom.as_deref())?;
     coverage::print_report(&rep, &col);
     if let Some(j) = json {
         std::fs::write(&j, serde_json::to_string_pretty(&rep)?)?;
@@ -383,3 +461,208 @@ fn report(dir: &Path, local: &Local, json: Option<PathBuf>, gaps: Option<PathBuf
     }
     Ok(())
 }
+
+fn hydrate(dir: &Path, local: &Local, segment: Option<String>, children: bool, clean: bool, force: bool) -> Result<()> {
+    if local.no_db {
+        bail!("hydrate fills the local database, so it can't run with --no-db");
+    }
+    let mut col = Collection::open(dir)?;
+    let seg = match &segment {
+        Some(s) => Some(col.resolve(s)?.to_string()),
+        None => None,
+    };
+    let mut h = Hydrator::new(&col, seg.as_deref().map(|s| (s, children)), clean, force)?;
+    let mut s = open_session(&col, local)?;
+    let started = std::time::Instant::now();
+    while !h.done() {
+        for ev in h.step(&mut s, &mut col, std::time::Duration::from_secs(3600), 0)? {
+            let depth = col.chain(&ev.id)?.len() - 1;
+            println!("{:<7} {:<9} {}{} {}", ev.action, ev.verdict, "  ".repeat(depth), &ev.id[..8.min(ev.id.len())], col.replays[&ev.id].title());
+        }
+    }
+    let played = h.events.iter().filter(|e| e.action == "played").count();
+    println!("{played} played ({} frames in {:.1}s), {} already stored", h.frames_played, started.elapsed().as_secs_f64(), h.events.len() - played);
+    let problems = h.problems();
+    if !problems.is_empty() {
+        println!("{} segments don't match their recorded hashes:", problems.len());
+        for p in problems {
+            println!("  {} {}: {}", &p.id[..8.min(p.id.len())], col.replays[&p.id].title(), p.verdict);
+        }
+    }
+    Ok(())
+}
+
+fn latest_setup(conn: &rusqlite::Connection) -> Result<String> {
+    conn.query_row("SELECT setup FROM contents ORDER BY played_at DESC LIMIT 1", [], |r| r.get(0)).context("the local database is empty; run `emucov hydrate` first")
+}
+
+fn where_cmd(dir: &Path, what: &str, local: &Local) -> Result<()> {
+    let col = Collection::open(dir)?;
+    let conn = cache::Cache::open_readonly(&col)?;
+    let (region, offset) = if let Ok(ro) = emucov::player::parse_region_offset(what) {
+        ro
+    } else if let Some(h) = what.strip_prefix("0x") {
+        ("PRG".to_string(), u64::from_str_radix(h, 16)?)
+    } else {
+        // A symbol name: needs the symbol map.
+        let mut found = None;
+        for sym in &col.config.symbols {
+            let path = col.root.join(&sym.file);
+            let funcs = match sym.format.as_str() {
+                "ca65-dbg" => emucov::analysis::load_ca65_dbg(&path, sym.rom_header.unwrap_or(16))?,
+                "csv" => emucov::analysis::load_csv(&path)?,
+                _ => continue,
+            };
+            if let Some(f) = funcs.iter().find(|f| f.name == what) {
+                found = Some(("PRG".to_string(), f.offset));
+            }
+        }
+        let _ = local;
+        found.ok_or_else(|| anyhow!("{what} is not an offset (PRG:0x1234 or 0x1234) or a symbol in the collection's symbol maps"))?
+    };
+    let setup = latest_setup(&conn)?;
+    let keys = cache::current_keys(&conn, &col, &setup)?;
+    let mut st = conn.prepare("SELECT content, frame FROM first_hits WHERE region = ?1 AND rom_offset = ?2")?;
+    let rows: Vec<(String, u64)> = st.query_map(rusqlite::params![region, offset as i64], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?.collect::<rusqlite::Result<_>>()?;
+    let mut hits = vec![];
+    for (id, (key, status)) in &keys {
+        let Some(key) = key else { continue };
+        for (c, f) in &rows {
+            if c == key {
+                let near: Option<i64> = conn.query_row("SELECT max(frame) FROM frames WHERE content = ?1 AND frame <= ?2", rusqlite::params![key, *f as i64], |r| r.get(0))?;
+                hits.push((id.clone(), *f, near, *status));
+            }
+        }
+    }
+    if hits.is_empty() {
+        println!("no current segment runs {region}:{offset:#x} (as recorded in the local database)");
+        return Ok(());
+    }
+    hits.sort_by_key(|(id, f, _, _)| (col.chain(id).map(|c| c.len()).unwrap_or(0), *f));
+    println!("{region}:{offset:#x} first runs in:");
+    for (id, f, near, status) in hits {
+        let note = if status == Status::Dirty { "  (dirty: doesn't count)" } else { "" };
+        let near = near.map(|n| format!("nearest snapshot at frame {n}")).unwrap_or_else(|| "no snapshot stored".into());
+        println!("  {} {}  frame {f}  ({near}){note}", &id[..8.min(id.len())], col.replays[&id].title());
+    }
+    Ok(())
+}
+
+fn snapshot_cmd(dir: &Path, segment: &str, frame: u64, out: &Path, local: &Local) -> Result<()> {
+    let col = Collection::open(dir)?;
+    let id = col.resolve(segment)?.to_string();
+    let frames = col.replays[&id].frames()?;
+    if frame > frames {
+        bail!("{} has {frames} frames", &id[..8.min(id.len())]);
+    }
+    let mut s = open_session(&col, local)?;
+    s.enter_replay(&col, &id)?;
+    let start = s.state_hash(&col)?;
+    let mut at = 0;
+    if let Some((f, state)) = s.nearest_stored(&col, &id, &start, frame)? {
+        if f > 0 {
+            s.load_state(&state)?;
+            at = f;
+        }
+    }
+    s.restore_inputs(&col, &id, at)?;
+    for f in at..frame {
+        s.step(&col, &id, f, false)?;
+    }
+    let state = s.snapshot()?;
+    std::fs::write(out, &state)?;
+    println!("wrote {} ({} bytes; frame {frame} of {}, played {} frames from {})", out.display(), state.len(), &id[..8.min(id.len())], frame - at, if at == 0 { "the segment's start".to_string() } else { format!("the snapshot at frame {at}") });
+    Ok(())
+}
+
+fn sql(dir: &Path, query: &str) -> Result<()> {
+    let col = Collection::open(dir)?;
+    let conn = cache::Cache::open_readonly(&col)?;
+    let mut st = conn.prepare(query)?;
+    let names: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
+    println!("{}", names.join("\t"));
+    let n = names.len();
+    let mut rows = st.query([])?;
+    while let Some(row) = rows.next()? {
+        let mut cells = vec![];
+        for i in 0..n {
+            use rusqlite::types::ValueRef;
+            cells.push(match row.get_ref(i)? {
+                ValueRef::Null => "NULL".to_string(),
+                ValueRef::Integer(v) => v.to_string(),
+                ValueRef::Real(v) => v.to_string(),
+                ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                ValueRef::Blob(b) => format!("<{} bytes>", b.len()),
+            });
+        }
+        println!("{}", cells.join("\t"));
+    }
+    Ok(())
+}
+
+fn human(bytes: i64) -> String {
+    let b = bytes as f64;
+    if b >= 1e9 {
+        format!("{:.2} GB", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else if b >= 1e3 {
+        format!("{:.1} KB", b / 1e3)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn cache_stats(dir: &Path) -> Result<()> {
+    let col = Collection::open(dir)?;
+    let conn = cache::Cache::open_readonly(&col)?;
+    let size = std::fs::metadata(cache::cache_path(&col)).map(|m| m.len()).unwrap_or(0);
+    println!("{} ({})", cache::cache_path(&col).display(), human(size as i64));
+    let settings = cache::CacheSettings::resolve(col.config.cache.as_ref(), col.load_local()?.cache.as_ref())?;
+    println!(
+        "settings: preset {}, pages {}, a snapshot every {} frames{}, previews {:?}",
+        settings.preset,
+        settings.page_bytes.map(|b| format!("{} KB", b / 1024)).unwrap_or_else(|| "1:1".into()),
+        settings.diff_every,
+        if settings.diff_at_markers { " and at markers" } else { "" },
+        settings.previews
+    );
+    for (name, q, bytes_q) in [
+        ("contents", "SELECT count(*) FROM contents", None),
+        ("snapshots", "SELECT count(*) FROM snapshots", Some("SELECT coalesce(sum(size),0) FROM snapshots")),
+        ("pages", "SELECT count(*) FROM pages", Some("SELECT coalesce(sum(length(data)),0) FROM pages")),
+        ("stored frames", "SELECT count(*) FROM frames", None),
+        ("previews", "SELECT count(*) FROM images", Some("SELECT coalesce(sum(length(png)),0) FROM images")),
+        ("coverage rows", "SELECT count(*) FROM coverage", Some("SELECT coalesce(sum(length(flags)),0) FROM coverage")),
+        ("first hits", "SELECT count(*) FROM first_hits", None),
+    ] {
+        let n: i64 = conn.query_row(q, [], |r| r.get(0))?;
+        let b = match bytes_q {
+            Some(bq) => format!("  {}", human(conn.query_row(bq, [], |r| r.get(0))?)),
+            None => String::new(),
+        };
+        println!("  {name:<14} {n:>8}{b}");
+    }
+    let raw: i64 = conn.query_row("SELECT coalesce(sum(size),0) FROM snapshots", [], |r| r.get(0))?;
+    let stored: i64 = conn.query_row("SELECT coalesce(sum(length(data)),0) FROM pages", [], |r| r.get(0))?;
+    if stored > 0 {
+        println!("  snapshots take {} as pages, {:.1}x smaller than {} raw", human(stored), raw as f64 / stored as f64, human(raw));
+    }
+    if let Some(b) = settings.budget_bytes {
+        if size > b {
+            println!("  over the {} budget; run `emucov cache gc`", human(b as i64));
+        }
+    }
+    Ok(())
+}
+
+fn cache_gc(dir: &Path, local: &Local) -> Result<()> {
+    let col = Collection::open(dir)?;
+    let mut s = open_session(&col, local)?;
+    let c = s.cache.as_mut().ok_or_else(|| anyhow!("gc needs the local database"))?;
+    let before = c.file_size();
+    let (contents, snaps, pages) = c.gc(&col)?;
+    println!("removed {contents} contents, {snaps} snapshots and {pages} pages; {} -> {}", human(before as i64), human(c.file_size() as i64));
+    Ok(())
+}
+

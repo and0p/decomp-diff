@@ -20,6 +20,9 @@ pub struct Config {
     pub tick: Option<TickConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub symbols: Vec<SymbolsConfig>,
+    /// Thresholds for the local database (CACHE_PLAN.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<crate::cache::CacheConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -73,6 +76,15 @@ pub struct LocalConfig {
     pub rom: Option<PathBuf>,
     #[serde(default)]
     pub core: Option<PathBuf>,
+    /// false = run without the local database, as the tools did before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<bool>,
+    /// The GUI's in-memory snapshot cache limit, in MB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_mb: Option<u64>,
+    /// Overrides collection.toml's [cache] on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<crate::cache::CacheConfig>,
 }
 
 pub struct Collection {
@@ -259,7 +271,7 @@ impl Collection {
     }
 
     /// Deletes the file of a replay that is no longer in the collection (after an undo of
-    /// a split or of a new node). Does nothing if the replay was never saved.
+    /// a split or of a new segment). Does nothing if the replay was never saved.
     pub fn delete_replay_file(&mut self, id: &str) -> Result<()> {
         if let Some(path) = self.paths.remove(id) {
             if path.exists() {

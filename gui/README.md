@@ -18,112 +18,94 @@ played in the GUI.
 ## How seeking works now
 
 - Video frames are not cached. While a replay plays, the GUI keeps a save state
-  at the start of every 10th frame (`SNAP_EVERY` in `src/main.rs`).
-- A seek loads the nearest save state at or before the target. It sets the held
-  inputs again, because input state is not part of a save state. Then it runs
-  the core forward at most 9 frames and draws only the last one.
-- Save states exist only for frames that playback or scrubbing has already run
-  through. The first jump far ahead runs every frame up to that point.
+  in memory at the start of every 10th frame (`SNAP_EVERY` in `src/main.rs`).
+- A seek uses the nearest snapshot at or before the target: from memory, or from
+  the local database (`.emucov/cache.db`) when a stored one is nearer. It sets
+  the held inputs again, because input state is not part of a save state, then
+  runs the core forward and draws only the last frame. How many snapshots the
+  database has depends on the collection's `[cache]` settings (QUICKSTART.md);
+  with `diff_every = 60`, a seek anywhere is near instant.
+- Selecting a segment starts from its parent's end snapshot in the database when the
+  parent is clean, so deep segments open without replaying the chain. The GUI also
+  stores each segment's start snapshot, and the end snapshot of segments with children.
 - Long work runs in slices of about 25 ms per screen refresh (`JOB_SLICE`), so
   the window keeps drawing. This covers a seek more than 30 frames past the last
-  run frame, and selecting a node whose ancestors have no usable cached state (the
-  GUI plays the chain from the nearest clean cache or from power-on). While it
-  runs, a progress bar shows in a fixed slot at the right of the status bar, for
-  example "Seeking to frame 2354" or "Playing up to "Defend"". The slot is
-  reserved when empty, so nothing moves. Clicking another node cancels the job;
-  a seek during a node load is applied once the load finishes.
+  run frame, and selecting a segment whose ancestors have no stored state (the GUI
+  plays the chain). While it runs, a progress bar shows in a fixed slot at the
+  right of the status bar, for example "Seeking to frame 2354" or "Playing up to
+  "Defend"". Clicking another segment cancels the job; a seek during a segment load is
+  applied once the load finishes.
 - An edit drops the save states after the edited frame and redraws the current frame.
-- Nothing is evicted. Memory grows with replay length (an NES state is a few
-  tens of KB, about 10 MB for a 3600-frame replay). That is fine for NES, but not
-  for cores with large states (N64, PS1, and so on).
+- **Memory limit.** In-memory snapshots stay under Emulation > Snapshot memory
+  (`max_memory_mb` in `.emucov/local.toml`, 512 MB by default). Past it, the
+  snapshots farthest from the playhead go first; frame 0 always stays, and
+  anchors every 300 frames stay while they fit. An NES state is a few tens of KB,
+  so NES never reaches it; it matters for cores with large states.
 
-## Planned: a configurable save-state cache (not implemented yet)
+## Hydrating
 
-1. **The connector declares its state size.** Each core's connector config gets
-   a field for the approximate size of one save state, for example `state_size =
-   "30KiB"`. This tells the GUI how many states fit in a given amount of memory
-   without measuring first. If the field is missing, the GUI can measure the
-   first `retro_serialize_size`.
-2. **The user sets a maximum cache size.** This is a GUI setting (and could also
-   be a per-collection local setting), for example `max_state_cache = "256MiB"`.
-   The number of states it can keep is the cache size divided by the state size.
-3. **Keep a tail of states during playback.** Save states go into a ring buffer
-   that follows the playhead. When the budget is full, the oldest states furthest
-   from the playhead are dropped first.
-   - The spacing between states can be derived from the budget. If the budget
-     covers the whole replay at one state per frame, keep every frame. Otherwise
-     space them out so the tail covers a useful window, such as the last N seconds.
-   - The state at frame 0 of the replay is always kept, and so are sparse anchors
-     (for example every few hundred frames). A long seek backwards then never
-     needs to replay from the parent.
-4. **Optional video cache.** For slow cores, keep the most recent decoded frames
-   (also within the budget) so that scrubbing backwards inside the tail does not
-   need the core at all.
-
-Open question: where the connector config lives. Today a collection's
-`collection.toml` has a `[core]` section (name, build, options), and
-`connectors/<core>/` has only a patch and build script. A small
-`connectors/<core>/connector.toml` that the build script copies next to the
-built core could hold `state_size` and other per-core facts, such as the
-frame rate or which memory regions are worth hashing.
+Emulation > Hydrate all (or right-click > Hydrate this segment / this and below)
+runs the shared `emucov::hydrate::Hydrator` in the same 25 ms slices, showing
+every 4th frame. Selecting, seeking and playing wait until it ends; Pause and
+Stop are in the status bar. Afterwards the selected segment is loaded again.
 
 ## Open question: splits and coverage
 
-Splitting a node changes no state: the same frames still run with the same inputs.
-Coverage, however, will be recorded per node once the GUI tracks it. After a split, the
-coverage stored for the old node (now the second half, under the same id) covers both
+Splitting a segment changes no state: the same frames still run with the same inputs.
+Coverage, however, will be recorded per segment once the GUI tracks it. After a split, the
+coverage stored for the old segment (now the second half, under the same id) covers both
 halves. The recorded coverage for both parts needs to be marked stale and gathered again,
 or the old record needs to be cut at the split frame. The cut is only possible if coverage
 is stored per frame range, so this decision belongs with the coverage tracker design.
 
 ## Undo and redo
 
-Every edit records the affected nodes' full text before the change as one undo step
-(`remember` in `src/main.rs`): note edits, cut and paste, frame lines, renames, node
-properties, accepting an end hash, new nodes, splits and branches. Undo puts those nodes
-back (removing nodes the step created) and records the reverse step for redo. The history
+Every edit records the affected segments' full text before the change as one undo step
+(`remember` in `src/main.rs`): note edits, cut and paste, frame lines, renames, segment
+properties, accepting an end hash, new segments, splits and branches. Undo puts those segments
+back (removing segments the step created) and records the reverse step for redo. The history
 holds 200 steps and is cleared when a collection is opened or reloaded.
 
-After an undo on the node being shown, playback drops its save states from the first
-changed frame on and redraws where you are. If the step changed the node's length or
-parent, another node, or one of its ancestors, the node is loaded again instead. A node
+After an undo on the segment being shown, playback drops its save states from the first
+changed frame on and redraws where you are. If the step changed the segment's length or
+parent, another segment, or one of its ancestors, the segment is loaded again instead. A segment
 removed by undo has its file deleted on the next Save.
 
 Cut, copy and paste work on selected notes in the piano roll. The copy is kept inside the
 app, and the notes also go on the system clipboard as replay lines with frames relative
 to the first note. Paste puts the leftmost copied note at the play cursor.
 
-## Deleting nodes
+## Deleting segments
 
-Node > Delete… and Delete… in the tree's right-click menu open the same confirmation.
-It names the node, warns how many nodes below it go too, and gives the total frames.
+Segment > Delete… and Delete… in the tree's right-click menu open the same confirmation.
+It names the segment, warns how many segments below it go too, and gives the total frames.
 Deleting removes the whole branch (`delete_nodes` in `src/main.rs`) as one undo step.
-The files are removed on Save. If the node being shown was deleted, its parent is shown.
+The files are removed on Save. If the segment being shown was deleted, its parent is shown.
 
-Later: merge a node into its children (its inputs go at the start of each child, so no
+Later: merge a segment into its children (its inputs go at the start of each child, so no
 hash changes; with one child, this is the inverse of Split). Another option is moving
 the children up to the grandparent, which turns everything below dirty. Neither is planned yet.
 
 ## Marker list (implemented)
 
-The left sidebar has two tabs, **Nodes** (the tree) and **Markers**. Markers lists every
+The left sidebar has two tabs, **Segments** (the tree) and **Markers**. Markers lists every
 event in the collection alphabetically, then RAM writes, resets, device changes and RNG
-lines. Each row shows the frame and the node (with its parent when another node has the
-same title), and the filter matches marker text and node titles. Clicking a row selects
-the node and seeks to the frame. This lets markers do the job of tiny nodes that only
+lines. Each row shows the frame and the segment (with its parent when another segment has the
+same title), and the filter matches marker text and segment titles. Clicking a row selects
+the segment and seeks to the frame. This lets markers do the job of tiny segments that only
 exist to name a moment. Checkpoints and screenshots aren't listed, since they have no
 names. Ideas: group repeated texts, follow the tree's Focus here, and list a marker's
 "first frame where a watched value differs" once that exists.
 
-## Joining nodes (implemented: join with parent)
+## Joining segments (implemented: join with parent)
 
-Joining a node to its parent keeps every frame and input in the same order, so the
+Joining a segment to its parent keeps every frame and input in the same order, so the
 emulator does exactly the same thing and every hash below stays valid.
 
-**Join with parent** (Node menu and right-click, on a node whose parent has only that
+**Join with parent** (Segment menu and right-click, on a segment whose parent has only that
 child) asks first. The parent keeps its id and title and grows by the child's frames. The
 child's lines move by the parent's length (inputs the parent still held are released at
-the join, as a node start would), the child's children move up, and the end hash comes
+the join, as a segment start would), the child's children move up, and the end hash comes
 from the child. The child's start hash becomes a checkpoint at the join frame. The dialog
 has "Leave a marker", on by default, with an editable text that starts as the child's
 title: an event at the join frame keeps whatever moment made the author split there
@@ -145,6 +127,6 @@ Not done yet:
 - Only one core runs at a time. Showing two cores side by side will need a second
   process, because a libretro core has global state.
 - There is no warning before you lose unsaved edits (on Open, Reload or Quit).
-- Nodes can't be moved from the GUI yet.
-- A long load cannot be cancelled except by selecting another node. MAX speed still runs on the UI thread.
+- Segments can't be moved from the GUI yet.
+- A long load cannot be cancelled except by selecting another segment. MAX speed still runs on the UI thread.
 - Tested on Linux and macOS (build only); Windows has not been tried.

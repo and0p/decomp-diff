@@ -663,6 +663,18 @@ impl Core {
         out
     }
 
+    /// The connector's live flags for region `i`, without copying (for per-frame scans).
+    pub fn coverage_slice(&mut self, i: usize) -> Option<&[u8]> {
+        let c = self.connector.as_ref()?;
+        unsafe {
+            let mut r = EmucovRegionC { name: std::ptr::null(), flags: std::ptr::null_mut(), size: 0 };
+            if !(c.get_region)(i as _, &mut r) || r.flags.is_null() {
+                return None;
+            }
+            Some(std::slice::from_raw_parts(r.flags, r.size))
+        }
+    }
+
     pub fn coverage_region_index(&mut self, name: &str) -> Option<usize> {
         let Some(c) = &self.connector else { return None };
         unsafe {

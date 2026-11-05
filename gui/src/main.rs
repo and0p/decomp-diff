@@ -8,6 +8,7 @@ use anyhow::{anyhow, Result};
 use eframe::egui::{self, Color32, RichText};
 use emucov::collection::{Collection, LocalConfig, Status};
 use emucov::format::{Command, InputKey};
+use emucov::hydrate::Hydrator;
 use emucov::player::{trunk_start_frame, Session};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -55,6 +56,8 @@ struct Playback {
     end_hash: Option<String>,
     /// State hash at frame 0, before any of this replay's lines.
     start_hash: Option<String>,
+    /// Frames with a snapshot in the local database, for this content.
+    stored: Vec<u64>,
 }
 
 impl Playback {
@@ -79,10 +82,10 @@ struct App {
     tree_closed: HashSet<String>,
     /// Tree filter text: matches title, id or tags.
     filter: String,
-    /// Sidebar shows the marker list instead of the node tree.
+    /// Sidebar shows the marker list instead of the segment tree.
     markers_tab: bool,
     marker_filter: String,
-    /// The node the tree is focused on (hoisted): only it and its descendants show.
+    /// The segment the tree is focused on (hoisted): only it and its descendants show.
     hoist: Option<String>,
     /// Indent every level of the tree, instead of keeping only children in their parent's column.
     indent_all: bool,
@@ -91,17 +94,17 @@ struct App {
     message: Option<(String, bool)>,
     /// Frames per tick multiplier; 0 means as fast as possible.
     speed: u32,
-    /// At the end of a node with exactly one child, carry on into it.
+    /// At the end of a segment with exactly one child, carry on into it.
     auto_continue: bool,
-    /// "Play to": nodes still to play through after the current one, and the last of them.
+    /// "Play to": segments still to play through after the current one, and the last of them.
     route: Vec<String>,
     route_target: Option<String>,
     node_dialog: Option<NodeDialog>,
-    /// Inline rename in the tree: node id, text, and whether focus is still to be given.
+    /// Inline rename in the tree: segment id, text, and whether focus is still to be given.
     renaming: Option<(String, String, bool)>,
-    /// The node waiting for delete confirmation.
+    /// The segment waiting for delete confirmation.
     delete_dialog: Option<String>,
-    /// Join with parent, waiting on its confirmation: (node id, leave a marker, marker text).
+    /// Join with parent, waiting on its confirmation: (segment id, leave a marker, marker text).
     join_dialog: Option<(String, bool, String)>,
     undo: Vec<UndoStep>,
     redo: Vec<UndoStep>,
@@ -109,11 +112,23 @@ struct App {
     /// Text to put on the system clipboard at the end of this frame.
     ctx_copy: Option<String>,
     frame_dialog: Option<FrameDialog>,
+    /// Hydration in progress (it has the core to itself until it ends).
+    hydrating: Option<Hydrating>,
+    /// Segments whose current content is in the local database.
+    stored_ids: HashSet<String>,
+    /// Limit for in-memory snapshots of the current segment, in MB.
+    max_memory_mb: u64,
+}
+
+struct Hydrating {
+    h: Hydrator,
+    paused: bool,
+    what: String,
 }
 
 /// Work too long to do in one screen refresh.
 enum Job {
-    /// Run the selected node forward until `to` frames have run.
+    /// Run the selected segment forward until `to` frames have run.
     Seek { from: u64, to: u64 },
     /// Play ancestors (`queue`) without a cached state to reach the start of `id`.
     Enter { id: String, queue: Vec<String>, qi: usize, frame: u64, start_frame: u64, done: u64, total: u64, then_seek: Option<u64> },
@@ -122,18 +137,18 @@ enum Job {
 /// Time spent on a job per screen refresh.
 const JOB_SLICE: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// One step of undo history: the affected nodes as they were before the change
-/// (None: the node did not exist), and where the user was.
+/// One step of undo history: the affected segments as they were before the change
+/// (None: the segment did not exist), and where the user was.
 struct UndoStep {
     label: String,
-    nodes: Vec<(String, Option<emucov::format::Replay>)>,
+    segments: Vec<(String, Option<emucov::format::Replay>)>,
     selected: Option<String>,
     frame: Option<u64>,
 }
 
 const UNDO_LIMIT: usize = 200;
 
-const JOIN_TIP: &str = "Merge this node into its parent: the parent keeps its name and grows by this node's frames. Only for a node with no siblings.";
+const JOIN_TIP: &str = "Merge this segment into its parent: the parent keeps its name and grows by this segment's frames. Only for a segment with no siblings.";
 
 /// Copied notes: button, start relative to the leftmost copied note, and length.
 struct Clip {
@@ -191,6 +206,9 @@ impl Default for App {
             clip: None,
             ctx_copy: None,
             frame_dialog: None,
+            hydrating: None,
+            stored_ids: HashSet::new(),
+            max_memory_mb: 512,
         }
     }
 }
@@ -238,7 +256,7 @@ fn fold_button(ui: &mut egui::Ui, collapse: bool) -> egui::Response {
     resp
 }
 
-/// `id` and every node below it.
+/// `id` and every segment below it.
 /// One named marker in the collection, for the sidebar's marker list.
 struct ListedMarker<'a> {
     id: &'a str,
@@ -250,8 +268,8 @@ struct ListedMarker<'a> {
 }
 
 /// The sidebar's Markers tab: every event (then writes, resets, device changes and RNG
-/// lines) in the collection, alphabetically, with a filter on the marker and node text.
-/// Returns the node and frame to show when a row is clicked.
+/// lines) in the collection, alphabetically, with a filter on the marker and segment text.
+/// Returns the segment and frame to show when a row is clicked.
 fn marker_list(ui: &mut egui::Ui, col: &Collection, filter: &mut String, at: Option<(&str, u64)>) -> Option<(String, u64)> {
     let mut all: Vec<ListedMarker> = vec![];
     for (id, r) in &col.replays {
@@ -277,7 +295,7 @@ fn marker_list(ui: &mut egui::Ui, col: &Collection, filter: &mut String, at: Opt
             filter.clear();
         }
         let w = ui.available_width();
-        ui.add(egui::TextEdit::singleline(filter).id_salt("marker_filter").hint_text("Filter: marker or node").desired_width(w));
+        ui.add(egui::TextEdit::singleline(filter).id_salt("marker_filter").hint_text("Filter: marker or segment").desired_width(w));
     });
     let needle = filter.trim().to_lowercase();
     let shown: Vec<&ListedMarker> = all
@@ -297,7 +315,7 @@ fn marker_list(ui: &mut egui::Ui, col: &Collection, filter: &mut String, at: Opt
             let title = col.replays[m.id].title();
             let here = at == Some((m.id, m.frame));
             let path: Vec<&str> = col.chain(m.id).unwrap_or_default().iter().map(|i| col.replays[*i].title()).collect();
-            // Second line: the node, with its parent in front when another node has the same title.
+            // Second line: the segment, with its parent in front when another segment has the same title.
             let twin = col.replays.iter().any(|(k, r)| k != m.id && r.title() == title);
             let place = match (twin, path.len()) {
                 (true, n) if n >= 2 => format!("frame {} · {} › {title}", m.frame, path[n - 2]),
@@ -329,6 +347,27 @@ fn marker_list(ui: &mut egui::Ui, col: &Collection, filter: &mut String, at: Opt
     pick
 }
 
+/// Keeps in-memory snapshots under `budget` bytes. Frame 0 always stays, and so do
+/// anchors every 300 frames while they fit; the snapshots farthest from `at` go first.
+fn trim_snapshots(snaps: &mut BTreeMap<u64, Vec<u8>>, at: u64, budget: u64) {
+    let size = |m: &BTreeMap<u64, Vec<u8>>| m.values().map(|v| v.len() as u64).sum::<u64>();
+    let mut total = size(snaps);
+    if total <= budget {
+        return;
+    }
+    let mut order: Vec<u64> = snaps.keys().copied().filter(|k| *k != 0).collect();
+    // Non-anchors first, each group farthest from the playhead first.
+    order.sort_by_key(|k| (k % 300 == 0, std::cmp::Reverse(k.abs_diff(at))));
+    for k in order {
+        if total <= budget {
+            break;
+        }
+        if let Some(v) = snaps.remove(&k) {
+            total -= v.len() as u64;
+        }
+    }
+}
+
 fn subtree(col: &Collection, id: &str) -> Vec<String> {
     let mut out = vec![id.to_string()];
     let mut i = 0;
@@ -340,7 +379,7 @@ fn subtree(col: &Collection, id: &str) -> Vec<String> {
     out
 }
 
-/// The first frame where two versions of a node's lines differ, if they do.
+/// The first frame where two versions of a segment's lines differ, if they do.
 fn first_change(a: &emucov::format::Replay, b: &emucov::format::Replay) -> Option<u64> {
     let n = a.lines.len().min(b.lines.len());
     for i in 0..n {
@@ -418,9 +457,12 @@ impl App {
                 self.roll.forget();
                 let first = col.tree_order().first().map(|(id, _)| id.to_string());
                 let n = col.replays.len();
+                self.max_memory_mb = col.load_local().ok().and_then(|l| l.max_memory_mb).unwrap_or(512);
+                self.hydrating = None;
                 self.col = Some(col);
                 self.open_session();
-                self.info(format!("Opened {} ({n} replays)", dir.display()));
+                self.refresh_stored();
+                self.info(format!("Opened {} ({n} segments)", dir.display()));
                 if let Some(id) = first {
                     self.select(&id);
                 }
@@ -480,7 +522,7 @@ impl App {
         let Some(col) = &mut self.col else { return };
         let ids: Vec<String> = self.edited.iter().cloned().collect();
         for id in &ids {
-            // A node removed by undo (a split or a new node) loses its file.
+            // A segment removed by undo (a split or a new segment) loses its file.
             let res = if col.replays.contains_key(id) { col.save_replay(id) } else { col.delete_replay_file(id) };
             if let Err(e) = res {
                 self.message = Some((format!("Saving {id}: {e:#}"), true));
@@ -488,7 +530,7 @@ impl App {
             }
         }
         self.edited.clear();
-        self.info(format!("Saved {} replay(s)", ids.len()));
+        self.info(format!("Saved {} segment(s)", ids.len()));
     }
 
     fn reload(&mut self) {
@@ -506,6 +548,11 @@ impl App {
     // ---- playback ----
 
     fn select(&mut self, id: &str) {
+        if self.hydrating.is_some() {
+            self.selected = Some(id.to_string());
+            self.info("Hydrating: the segment is shown once hydration stops or finishes.");
+            return;
+        }
         self.playing = false;
         self.route.clear();
         self.route_target = None;
@@ -513,7 +560,7 @@ impl App {
         self.selected = Some(id.to_string());
         self.pb = None;
         if let Err(e) = self.try_select(id) {
-            self.error(format!("Could not reach the start of this replay: {e:#}"));
+            self.error(format!("Could not reach the start of this segment: {e:#}"));
         }
     }
 
@@ -558,12 +605,21 @@ impl App {
         let checkpoints = r.checkpoints().unwrap_or_default().into_iter().collect();
         let snap = s.snapshot()?;
         let start_hash = s.state_hash(col)?;
-        self.pb = Some(Playback { id: id.to_string(), start_frame, frames, ran: 0, snapshots: BTreeMap::from([(0, snap)]), checkpoints, checkpoint_miss: None, end_hash: None, start_hash: Some(start_hash) });
+        // Keep the start state in the database too, so the next visit starts here directly.
+        if let Some(c) = &mut s.cache {
+            c.put_snapshot(&start_hash, &snap)?;
+        }
+        let stored = s.stored_frames(col, id, &start_hash).unwrap_or_default();
+        self.pb = Some(Playback { id: id.to_string(), start_frame, frames, ran: 0, snapshots: BTreeMap::from([(0, snap)]), checkpoints, checkpoint_miss: None, end_hash: None, start_hash: Some(start_hash), stored });
         Ok(())
     }
 
     /// Does one slice of the current job.
     fn work(&mut self) {
+        if self.hydrating.is_some() {
+            self.hydrate_work();
+            return;
+        }
         let Some(job) = self.job.take() else { return };
         if let Err(e) = self.try_work(job) {
             self.job = None;
@@ -645,6 +701,7 @@ impl App {
         let k = pb.ran;
         if k % SNAP_EVERY == 0 && !pb.snapshots.contains_key(&k) {
             pb.snapshots.insert(k, s.snapshot()?);
+            trim_snapshots(&mut pb.snapshots, k, self.max_memory_mb * 1024 * 1024);
         }
         if let Some(want) = pb.checkpoints.get(&k) {
             let got = s.state_hash(col)?;
@@ -655,7 +712,15 @@ impl App {
         let frame = s.step(col, &pb.id, k, capture || k + 1 == pb.frames)?;
         pb.ran += 1;
         if pb.ran == pb.frames {
-            pb.end_hash = Some(s.state_hash(col)?);
+            let h = s.state_hash(col)?;
+            // The end state is where every child starts: keep it in the database.
+            if !col.children(Some(&pb.id)).is_empty() {
+                let state = s.snapshot()?;
+                if let Some(c) = &mut s.cache {
+                    c.put_snapshot(&h, &state)?;
+                }
+            }
+            pb.end_hash = Some(h);
         }
         if let Some(f) = frame {
             let img = egui::ColorImage::from_rgb([f.width as usize, f.height as usize], &f.rgb);
@@ -688,6 +753,20 @@ impl App {
             return Ok(());
         }
         let want_ran = (target + 1).min(pb.frames);
+        // A snapshot in the database nearer than any in memory: load it into memory first.
+        let mem_k = pb.snapshots.range(..want_ran).next_back().map(|(k, _)| *k).unwrap_or(0);
+        let db_k = pb.stored.iter().rev().find(|f| **f < want_ran).copied();
+        if let (Some(f), Some(start)) = (db_k, pb.start_hash.clone()) {
+            if f > mem_k && (want_ran <= pb.ran || f > pb.ran) {
+                let id = pb.id.clone();
+                if let (Some(col), Some(s)) = (&self.col, &self.session) {
+                    if let Some((sf, state)) = s.nearest_stored(col, &id, &start, f)? {
+                        self.pb.as_mut().unwrap().snapshots.insert(sf, state);
+                    }
+                }
+            }
+        }
+        let Some(pb) = &self.pb else { return Ok(()) };
         if want_ran != pb.ran || self.texture.is_none() {
             // Restart from the nearest snapshot that still leaves one frame to draw,
             // unless running on from where we are is quicker.
@@ -736,8 +815,8 @@ impl App {
         }
     }
 
-    /// Double-click in the tree: select the node if needed and play it.
-    /// While the node is still loading, playback starts once it is ready.
+    /// Double-click in the tree: select the segment if needed and play it.
+    /// While the segment is still loading, playback starts once it is ready.
     fn play_node(&mut self, id: &str) {
         if self.selected.as_deref() != Some(id) {
             self.select(id);
@@ -755,7 +834,7 @@ impl App {
     }
 
     fn tick(&mut self, dt: f64) {
-        if !self.playing || self.job.is_some() {
+        if !self.playing || self.job.is_some() || self.hydrating.is_some() {
             self.clock = 0.0;
             return;
         }
@@ -822,8 +901,8 @@ impl App {
         }
     }
 
-    /// Plays through to the end of `target`: on from the playhead when the current node is
-    /// on the way there, otherwise from the start of the first node below where the two
+    /// Plays through to the end of `target`: on from the playhead when the current segment is
+    /// on the way there, otherwise from the start of the first segment below where the two
     /// paths meet (or from the trunk).
     fn play_to(&mut self, target: &str) {
         let Some(col) = &self.col else { return };
@@ -836,7 +915,7 @@ impl App {
             None => {
                 let cur_chain: Vec<String> = cur.as_deref().and_then(|c| col.chain(c).ok()).unwrap_or_default().into_iter().map(String::from).collect();
                 let common = path.iter().zip(cur_chain.iter()).take_while(|(a, b)| a == b).count();
-                // `common` nodes are shared; start just below them, or at the target if it is one of them.
+                // `common` segments are shared; start just below them, or at the target if it is one of them.
                 (common.min(path.len() - 1), false)
             }
         };
@@ -850,10 +929,10 @@ impl App {
         self.playing = self.pb.is_some();
         self.clock = 0.0;
         let title = col_title(self.col.as_ref(), target);
-        self.info(format!("Playing to the end of \"{title}\" ({} node(s) on the way)", self.route.len() + 1));
+        self.info(format!("Playing to the end of \"{title}\" ({} segment(s) on the way)", self.route.len() + 1));
     }
 
-    /// The only child of the current node, if neither has unsaved changes.
+    /// The only child of the current segment, if neither has unsaved changes.
     fn next_node(&self) -> Option<String> {
         let (col, pb) = (self.col.as_ref()?, self.pb.as_ref()?);
         let kids = col.children(Some(&pb.id));
@@ -863,7 +942,7 @@ impl App {
         Some(kids[0].to_string())
     }
 
-    /// Moves from the end of the current node straight into `child`, keeping the core's state.
+    /// Moves from the end of the current segment straight into `child`, keeping the core's state.
     fn continue_into(&mut self, child: &str) -> Result<()> {
         let (Some(col), Some(s), Some(pb)) = (&self.col, &mut self.session, &self.pb) else { return Ok(()) };
         let start_frame = pb.start_frame + pb.frames;
@@ -873,7 +952,7 @@ impl App {
         let r = &col.replays[child];
         let frames = r.frames().unwrap_or(0);
         let checkpoints = r.checkpoints().unwrap_or_default().into_iter().collect();
-        self.pb = Some(Playback { id: child.to_string(), start_frame, frames, ran: 0, snapshots: BTreeMap::from([(0, snap)]), checkpoints, checkpoint_miss: None, end_hash: None, start_hash });
+        self.pb = Some(Playback { id: child.to_string(), start_frame, frames, ran: 0, snapshots: BTreeMap::from([(0, snap)]), checkpoints, checkpoint_miss: None, end_hash: None, start_hash, stored: vec![] });
         self.selected = Some(child.to_string());
         self.roll.follow_to(0);
         Ok(())
@@ -896,7 +975,7 @@ impl App {
     }
 
     /// After a change at frame `from` of `id`: drops the end hash and later checkpoints
-    /// (so the node and everything below turn unverified or dirty) and redraws.
+    /// (so the segment and everything below turn unverified or dirty) and redraws.
     fn invalidate_from(&mut self, id: &str, from: u64) {
         let Some(col) = &mut self.col else { return };
         let id = id.to_string();
@@ -939,17 +1018,17 @@ impl App {
             r.set("start-hash", sh);
         }
         self.edited.insert(pb.id.clone());
-        self.info("Accepted the new end hash. Save to keep it; child replays will check against it.");
+        self.info("Accepted the new end hash. Save to keep it; child segments will check against it.");
     }
 
     // ---- undo, redo and clipboard ----
 
-    /// Records the nodes `ids` as they are now, before a change, as one undo step.
+    /// Records the segments `ids` as they are now, before a change, as one undo step.
     fn remember(&mut self, label: &str, ids: &[&str]) {
         let Some(col) = &self.col else { return };
-        let nodes = ids.iter().map(|id| (id.to_string(), col.replays.get(*id).cloned())).collect();
+        let segments = ids.iter().map(|id| (id.to_string(), col.replays.get(*id).cloned())).collect();
         let frame = self.pb.as_ref().and_then(|p| p.shown());
-        self.undo.push(UndoStep { label: label.to_string(), nodes, selected: self.selected.clone(), frame });
+        self.undo.push(UndoStep { label: label.to_string(), segments, selected: self.selected.clone(), frame });
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
         }
@@ -974,7 +1053,7 @@ impl App {
         }
     }
 
-    /// Puts the nodes of `step` back and returns the step that reverses it.
+    /// Puts the segments of `step` back and returns the step that reverses it.
     fn restore(&mut self, step: UndoStep) -> UndoStep {
         self.renaming = None;
         self.playing = false;
@@ -982,12 +1061,12 @@ impl App {
         let cur = self.selected.clone();
         let Some(col) = &mut self.col else { return step };
         let chain: Vec<String> = cur.as_deref().and_then(|c| col.chain(c).ok()).unwrap_or_default().into_iter().map(String::from).collect();
-        // A change to the current node alone, keeping its length and parent, only needs the
-        // frames from the first difference on to be run again. Anything else reloads the node.
+        // A change to the current segment alone, keeping its length and parent, only needs the
+        // frames from the first difference on to be run again. Anything else reloads the segment.
         let mut first_diff: Option<u64> = None;
         let mut reload = false;
         let mut back = vec![];
-        for (id, before) in step.nodes {
+        for (id, before) in step.segments {
             let now = col.replays.get(&id).cloned();
             if cur.as_deref() == Some(id.as_str()) {
                 match (&now, &before) {
@@ -1012,7 +1091,7 @@ impl App {
             self.edited.insert(id.clone());
             back.push((id, now));
         }
-        let reverse = UndoStep { label: step.label, nodes: back, selected: cur.clone(), frame: here };
+        let reverse = UndoStep { label: step.label, segments: back, selected: cur.clone(), frame: here };
         self.roll.invalidate();
         let target = step.selected.filter(|s| col.replays.contains_key(s));
         if self.hoist.as_ref().is_some_and(|h| !col.replays.contains_key(h)) {
@@ -1033,7 +1112,7 @@ impl App {
                 }
             }
         } else if let (Some(from), Some(id)) = (first_diff, &cur) {
-            // Same node: drop what playback knew past the first change and redraw here.
+            // Same segment: drop what playback knew past the first change and redraw here.
             let checkpoints: BTreeMap<u64, String> = col.replays[id].checkpoints().unwrap_or_default().into_iter().collect();
             if let Some(pb) = &mut self.pb {
                 pb.snapshots.retain(|k, _| *k <= from);
@@ -1083,7 +1162,7 @@ impl App {
     }
 
     /// Pastes the copied notes so the leftmost one starts at the play cursor. The pasted
-    /// notes become the selection; notes past the node's end are cut off.
+    /// notes become the selection; notes past the segment's end are cut off.
     fn paste(&mut self) {
         let (Some(clip), Some(col), Some(id), Some(pb)) = (&self.clip, &self.col, &self.selected, &self.pb) else { return };
         let at = pb.shown().unwrap_or(0);
@@ -1122,9 +1201,9 @@ impl App {
         self.apply_edit("Paste", edits, at);
     }
 
-    // ---- nodes ----
+    // ---- segments ----
 
-    /// A node can be joined into its parent when it is the parent's only child.
+    /// A segment can be joined into its parent when it is the parent's only child.
     fn can_join(&self, id: &str) -> bool {
         let Some(col) = &self.col else { return false };
         col.replays.get(id).and_then(|r| r.parent()).is_some_and(|p| col.children(Some(p)).len() == 1)
@@ -1143,7 +1222,7 @@ impl App {
 
     fn try_join(&mut self, id: &str, marker: Option<&str>) -> Result<()> {
         if !self.can_join(id) {
-            return Err(anyhow!("only a node whose parent has no other children can be joined"));
+            return Err(anyhow!("only a segment whose parent has no other children can be joined"));
         }
         let col = self.col.as_ref().unwrap();
         let child = col.replays[id].clone();
@@ -1151,7 +1230,7 @@ impl App {
         let kids: Vec<String> = col.children(Some(id)).into_iter().map(String::from).collect();
         let mut p = col.replays[&pid].clone();
         let (pf, cf) = (p.frames()?, child.frames()?);
-        // Every input is released when a node starts, so release what the parent still
+        // Every input is released when a segment starts, so release what the parent still
         // holds at its end; then the child's own lines follow, shifted by the parent's length.
         let mut held: BTreeMap<InputKey, i16> = BTreeMap::new();
         for l in &p.lines {
@@ -1227,7 +1306,7 @@ impl App {
         }
         self.roll.invalidate();
         let n = ids.len();
-        // If the shown node went, show its parent instead.
+        // If the shown segment went, show its parent instead.
         if self.selected.as_ref().is_some_and(|s| ids.contains(s)) {
             self.pb = None;
             self.texture = None;
@@ -1236,29 +1315,29 @@ impl App {
                 self.select(&p);
             }
         }
-        self.info(format!("Deleted {n} node{}. Save to remove the files, or undo.", if n == 1 { "" } else { "s" }));
+        self.info(format!("Deleted {n} segment{}. Save to remove the files, or undo.", if n == 1 { "" } else { "s" }));
     }
 
     fn new_id() -> String {
         uuid::Uuid::new_v4().to_string()
     }
 
-    /// Adds an empty child node that starts where `parent` ends, and selects it.
+    /// Adds an empty child segment that starts where `parent` ends, and selects it.
     fn new_child(&mut self, parent: &str) {
         let id = Self::new_id();
-        self.remember("New node", &[&id]);
+        self.remember("New segment", &[&id]);
         let Some(col) = &mut self.col else { return };
-        let r = emucov::format::Replay::new(&id, Some(parent), "New node", 600);
+        let r = emucov::format::Replay::new(&id, Some(parent), "New segment", 600);
         col.replays.insert(id.clone(), r);
         self.edited.insert(id.clone());
         self.tree_closed.remove(parent);
-        self.info("Added a 600-frame node. Change its title and length with Node > Properties.");
+        self.info("Added a 600-frame segment. Change its title and length with Segment > Properties.");
         self.select(&id);
         self.open_node_dialog(&id);
     }
 
-    /// Splits the selected node at the playhead: frames before it stay in this node,
-    /// the rest move to a new child that inherits this node's children. With `branch`,
+    /// Splits the selected segment at the playhead: frames before it stay in this segment,
+    /// the rest move to a new child that inherits this segment's children. With `branch`,
     /// also adds an empty sibling of that child, so a second path starts at the playhead.
     fn split_here(&mut self, branch: bool) {
         if let Err(e) = self.try_split(branch) {
@@ -1267,7 +1346,7 @@ impl App {
     }
 
     fn try_split(&mut self, branch: bool) -> Result<()> {
-        let pb = self.pb.as_ref().ok_or_else(|| anyhow!("select a node first"))?;
+        let pb = self.pb.as_ref().ok_or_else(|| anyhow!("select a segment first"))?;
         let id = pb.id.clone();
         // The playhead shows frame f; the split goes right after it, so frame f stays upstream.
         let f = pb.shown().unwrap_or(0) + 1;
@@ -1299,7 +1378,7 @@ impl App {
                 self.message = Some((format!("Note: the recorded checkpoint at frame {f} does not match this playback"), true));
             }
         }
-        // The cut gets a fresh state hash. The second half keeps the node's id, children and
+        // The cut gets a fresh state hash. The second half keeps the segment's id, children and
         // old end hash, so it and everything below are assumed clean.
         up.set("end-hash", &h);
         down.set("start-hash", &h);
@@ -1312,11 +1391,11 @@ impl App {
             let r = emucov::format::Replay::new(&b, Some(&up_id), "New branch", 600);
             col.replays.insert(b.clone(), r);
             self.edited.insert(b.clone());
-            self.info(format!("Split at frame {f}: the first {f} frames are a new parent node, and a new branch starts beside the rest."));
+            self.info(format!("Split at frame {f}: the first {f} frames are a new parent segment, and a new branch starts beside the rest."));
             self.select(&b);
             self.open_node_dialog(&b);
         } else {
-            self.info(format!("Split at frame {f}: the first {f} frames are now a new parent node."));
+            self.info(format!("Split at frame {f}: the first {f} frames are now a new parent segment."));
             self.select(&up_id);
             self.seek(f - 1);
         }
@@ -1331,7 +1410,7 @@ impl App {
 
     fn apply_node_dialog(&mut self, d: &NodeDialog) -> Result<()> {
         let Some(col) = &mut self.col else { return Ok(()) };
-        let r = col.replays.get_mut(&d.id).ok_or_else(|| anyhow!("node is gone"))?;
+        let r = col.replays.get_mut(&d.id).ok_or_else(|| anyhow!("segment is gone"))?;
         let old_frames = r.frames()?;
         if let Some(last) = r.lines.last() {
             if d.frames <= last.frame {
@@ -1339,14 +1418,14 @@ impl App {
             }
         }
         if d.frames == 0 {
-            return Err(anyhow!("a node needs at least one frame"));
+            return Err(anyhow!("a segment needs at least one frame"));
         }
         if d.title.trim() == r.title() && d.frames == old_frames {
             return Ok(());
         }
-        self.remember("Node properties", &[&d.id]);
+        self.remember("Segment properties", &[&d.id]);
         let Some(col) = &mut self.col else { return Ok(()) };
-        let r = col.replays.get_mut(&d.id).ok_or_else(|| anyhow!("node is gone"))?;
+        let r = col.replays.get_mut(&d.id).ok_or_else(|| anyhow!("segment is gone"))?;
         r.set("title", d.title.trim());
         self.edited.insert(d.id.clone());
         if d.frames != old_frames {
@@ -1373,7 +1452,7 @@ impl App {
         d.rows = r.lines.iter().filter(|l| l.frame == d.frame && !matches!(l.command, Command::Input { .. })).filter_map(|l| r.line_command_text(l.line_no).map(|t| (l.line_no, t))).collect();
     }
 
-    /// Changes a non-input line on the selected node: replace (Some) or delete (None) an
+    /// Changes a non-input line on the selected segment: replace (Some) or delete (None) an
     /// existing line, or add a new one when `line_no` is None.
     fn edit_line(&mut self, frame: u64, line_no: Option<usize>, text: Option<&str>) {
         let (Some(col), Some(id)) = (&mut self.col, self.selected.clone()) else { return };
@@ -1414,7 +1493,7 @@ impl App {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
-        // One confirmation for Node > Delete and the tree's right-click Delete.
+        // One confirmation for Segment > Delete and the tree's right-click Delete.
         let pending = self.delete_dialog.clone().and_then(|id| self.col.as_ref().filter(|c| c.replays.contains_key(&id)).map(|c| (id, c)));
         if pending.is_none() {
             self.delete_dialog = None;
@@ -1427,16 +1506,16 @@ impl App {
             let mut open = true;
             let mut confirm = false;
             let mut cancel = false;
-            egui::Window::new("Delete node").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+            egui::Window::new("Delete segment").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
                 ui.label(RichText::new(format!("Delete \"{title}\"?")).strong());
                 let below = ids.len() - 1;
                 if below > 0 {
-                    ui.label(RichText::new(format!("This also deletes the {below} node{} below it.", if below == 1 { "" } else { "s" })).color(Color32::from_rgb(240, 160, 60)));
+                    ui.label(RichText::new(format!("This also deletes the {below} segment{} below it.", if below == 1 { "" } else { "s" })).color(Color32::from_rgb(240, 160, 60)));
                 }
-                ui.label(format!("{} node{}, {frames} frames in all. Undo brings them back; the files are removed when you save.", ids.len(), if ids.len() == 1 { "" } else { "s" }));
+                ui.label(format!("{} segment{}, {frames} frames in all. Undo brings them back; the files are removed when you save.", ids.len(), if ids.len() == 1 { "" } else { "s" }));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new(if ids.len() == 1 { "Delete".to_string() } else { format!("Delete {} nodes", ids.len()) }).color(Color32::from_rgb(240, 110, 100))).clicked() {
+                    if ui.button(RichText::new(if ids.len() == 1 { "Delete".to_string() } else { format!("Delete {} segments", ids.len()) }).color(Color32::from_rgb(240, 110, 100))).clicked() {
                         confirm = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -1497,7 +1576,7 @@ impl App {
         if let Some(mut d) = self.node_dialog.take() {
             let mut open = true;
             let mut apply = false;
-            egui::Window::new("Node properties").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Window::new("Segment properties").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
                 egui::Grid::new("node_props").num_columns(2).show(ui, |ui| {
                     ui.label("Title");
                     ui.add(egui::TextEdit::singleline(&mut d.title).desired_width(320.0));
@@ -1589,7 +1668,7 @@ impl App {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Open collection…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().set_title("Open a replay collection folder").pick_folder() {
+                    if let Some(dir) = rfd::FileDialog::new().set_title("Open a collection folder").pick_folder() {
                         self.open_collection(&dir);
                     }
                 }
@@ -1657,6 +1736,31 @@ impl App {
                     self.accept_end_hash();
                 }
                 ui.separator();
+                let db_on = self.session.as_ref().is_some_and(|s| s.cache.is_some());
+                let idle = self.hydrating.is_none();
+                if ui.add_enabled(db_on && idle, egui::Button::new("Hydrate all")).on_hover_text("Play every segment whose current content isn't in the local database yet").clicked() {
+                    self.start_hydrate(None, false);
+                }
+                if ui
+                    .add_enabled(db_on && idle && self.edited.is_empty(), egui::Button::new("Hydrate and clean all"))
+                    .on_hover_text("Also re-check dirty segments: one that still ends with its recorded hashes gets its new start hash (written to its file); the others are listed")
+                    .on_disabled_hover_text("Save first: cleaning writes replay files")
+                    .clicked()
+                {
+                    self.start_hydrate(None, true);
+                }
+                let mut use_db = self.col.as_ref().and_then(|c| c.load_local().ok()).and_then(|l| l.database).unwrap_or(true);
+                if ui.add_enabled(self.col.is_some() && idle, egui::Checkbox::new(&mut use_db, "Use the local database")).on_hover_text("Off: play from power-on and keep snapshots only in memory, as before the database existed").changed() {
+                    self.set_database(use_db);
+                }
+                ui.menu_button(format!("Snapshot memory: {} MB", self.max_memory_mb), |ui| {
+                    for mb in [128, 256, 512, 1024, 2048, 4096] {
+                        if ui.radio(self.max_memory_mb == mb, format!("{mb} MB")).clicked() {
+                            self.set_max_memory(mb);
+                        }
+                    }
+                });
+                ui.separator();
                 let has_col = self.col.is_some();
                 if ui.add_enabled(has_col, egui::Button::new("Set ROM…")).clicked() {
                     if let Some(f) = rfd::FileDialog::new().set_title("Choose the ROM").pick_file() {
@@ -1669,16 +1773,16 @@ impl App {
                     }
                 }
             });
-            ui.menu_button("Node", |ui| {
+            ui.menu_button("Segment", |ui| {
                 let sel = self.selected.clone();
                 let has = sel.is_some() && self.pb.is_some();
-                if ui.add_enabled(has, egui::Button::new("New child at end")).on_hover_text("A new empty node that starts where this one ends").clicked() {
+                if ui.add_enabled(has, egui::Button::new("New child at end")).on_hover_text("A new empty segment that starts where this one ends").clicked() {
                     self.new_child(sel.as_deref().unwrap());
                 }
-                if ui.add_enabled(has, egui::Button::new("Branch at playhead")).on_hover_text("Split this node after the playhead and start a second path there").clicked() {
+                if ui.add_enabled(has, egui::Button::new("Branch at playhead")).on_hover_text("Split this segment after the playhead and start a second path there").clicked() {
                     self.split_here(true);
                 }
-                if ui.add_enabled(has, egui::Button::new("Split at playhead")).on_hover_text("Cut this node in two after the playhead; its children move to the second half").clicked() {
+                if ui.add_enabled(has, egui::Button::new("Split at playhead")).on_hover_text("Cut this segment in two after the playhead; its children move to the second half").clicked() {
                     self.split_here(false);
                 }
                 ui.separator();
@@ -1690,11 +1794,11 @@ impl App {
                     self.open_node_dialog(sel.as_deref().unwrap());
                 }
                 let joinable = sel.as_deref().is_some_and(|s| self.can_join(s));
-                if ui.add_enabled(joinable, egui::Button::new("Join with parent")).on_hover_text(JOIN_TIP).on_disabled_hover_text("Only for a node whose parent has no other children").clicked() {
+                if ui.add_enabled(joinable, egui::Button::new("Join with parent")).on_hover_text(JOIN_TIP).on_disabled_hover_text("Only for a segment whose parent has no other children").clicked() {
                     self.join_with_parent(&sel.clone().unwrap());
                 }
                 ui.separator();
-                if ui.add_enabled(sel.is_some(), egui::Button::new("Delete…")).on_hover_text("Delete this node and everything below it").clicked() {
+                if ui.add_enabled(sel.is_some(), egui::Button::new("Delete…")).on_hover_text("Delete this segment and everything below it").clicked() {
                     self.delete_dialog = sel.clone();
                 }
             });
@@ -1751,7 +1855,7 @@ impl App {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            for (on, name) in [(false, "Nodes"), (true, "Markers")] {
+            for (on, name) in [(false, "Segments"), (true, "Markers")] {
                 if ui.selectable_label(self.markers_tab == on, name).clicked() {
                     self.markers_tab = on;
                 }
@@ -1769,7 +1873,7 @@ impl App {
             }
             return;
         }
-        // Breadcrumbs while the tree is focused on one node.
+        // Breadcrumbs while the tree is focused on one segment.
         let mut new_hoist: Option<Option<String>> = None;
         let hoist: Option<&str> = self.hoist.as_deref().and_then(|h| col.replays.get_key_value(h)).map(|(k, _)| k.as_str());
         if self.hoist.is_some() && hoist.is_none() {
@@ -1783,7 +1887,7 @@ impl App {
                     new_hoist = Some(None);
                 }
                 let n = chain.len();
-                // Long paths show the first node, a menu for the middle, and the last three.
+                // Long paths show the first segment, a menu for the middle, and the last three.
                 let (head, hidden, tail) = if n > 5 { (&chain[..1], &chain[1..n - 3], &chain[n - 3..]) } else { (&chain[..0], &chain[..0], &chain[..]) };
                 let short = |t: &str| if t.chars().count() > 18 { format!("{}…", t.chars().take(17).collect::<String>()) } else { t.to_string() };
                 let crumb = |ui: &mut egui::Ui, id: &str, new_hoist: &mut Option<Option<String>>| {
@@ -1836,8 +1940,8 @@ impl App {
             ui.add(egui::TextEdit::singleline(&mut self.filter).id_salt("tree_filter").hint_text("Filter: title, id or tag").desired_width(w));
         });
         match fold {
-            // Collapse every node that has children, below the focused node if there is one,
-            // so the roots (or the focused node's children) stay visible.
+            // Collapse every segment that has children, below the focused segment if there is one,
+            // so the roots (or the focused segment's children) stay visible.
             Some(true) => {
                 for id in col.replays.keys() {
                     let inside = hoist.is_none_or(|h| h != id && col.chain(id).is_ok_and(|c| c.contains(&h)));
@@ -1849,7 +1953,8 @@ impl App {
             Some(false) => self.tree_closed.clear(),
             None => {}
         }
-        // While filtering, show the matches and the path down to each of them, ignoring collapsed nodes.
+        let db_on = self.session.as_ref().is_some_and(|s| s.cache.is_some()) && self.hydrating.is_none();
+        // While filtering, show the matches and the path down to each of them, ignoring collapsed segments.
         let needle = self.filter.trim().to_lowercase();
         let (matches, shown): (HashSet<&str>, HashSet<&str>) = if needle.is_empty() {
             Default::default()
@@ -1873,7 +1978,7 @@ impl App {
         let filtering = !needle.is_empty();
         if filtering {
             ui.label(RichText::new(match matches.len() {
-                0 => "No matching nodes".to_string(),
+                0 => "No matching segments".to_string(),
                 1 => "1 match".to_string(),
                 n => format!("{n} matches"),
             }).weak().small());
@@ -1962,6 +2067,9 @@ impl App {
                     };
                     let frames = r.frames().unwrap_or(0);
                     ui.label(RichText::new(format!("{frames}f")).weak().small());
+                    if self.stored_ids.contains(id) {
+                        ui.label(RichText::new("db").small().color(Color32::from_rgb(110, 150, 190))).on_hover_text("Hydrated: this segment's current content is in the local database");
+                    }
                     if r.is_poked() {
                         ui.label(RichText::new("poke").small().color(Color32::from_rgb(200, 120, 220))).on_hover_text("Has [WRITE] lines: memory is changed directly");
                     }
@@ -1983,7 +2091,7 @@ impl App {
                         clicked = Some(id.to_string());
                     }
                     resp.context_menu(|ui| {
-                        if ui.button("Play to here").on_hover_text("Play through to the end of this node").clicked() {
+                        if ui.button("Play to here").on_hover_text("Play through to the end of this segment").clicked() {
                             context = Some((id.to_string(), "playto"));
                         }
                         if ui.button("New child at end").clicked() {
@@ -1993,14 +2101,21 @@ impl App {
                             context = Some((id.to_string(), "props"));
                         }
                         let joinable = r.parent().is_some_and(|p| col.children(Some(p)).len() == 1);
-                        if ui.add_enabled(joinable, egui::Button::new("Join with parent")).on_hover_text(JOIN_TIP).on_disabled_hover_text("Only for a node whose parent has no other children").clicked() {
+                        if ui.add_enabled(joinable, egui::Button::new("Join with parent")).on_hover_text(JOIN_TIP).on_disabled_hover_text("Only for a segment whose parent has no other children").clicked() {
                             context = Some((id.to_string(), "join"));
                         }
-                        if ui.button("Delete…").on_hover_text("Delete this node and everything below it").clicked() {
+                        if ui.button("Delete…").on_hover_text("Delete this segment and everything below it").clicked() {
                             context = Some((id.to_string(), "delete"));
                         }
                         ui.separator();
-                        if ui.add_enabled(hoist != Some(id), egui::Button::new("Focus here")).on_hover_text("Show only this node and what is below it").clicked() {
+                        if ui.add_enabled(db_on, egui::Button::new("Hydrate this segment")).on_disabled_hover_text("Needs the local database").clicked() {
+                            context = Some((id.to_string(), "hydrate1"));
+                        }
+                        if ui.add_enabled(db_on, egui::Button::new("Hydrate this and below")).on_disabled_hover_text("Needs the local database").clicked() {
+                            context = Some((id.to_string(), "hydrate"));
+                        }
+                        ui.separator();
+                        if ui.add_enabled(hoist != Some(id), egui::Button::new("Focus here")).on_hover_text("Show only this segment and what is below it").clicked() {
                             context = Some((id.to_string(), "hoist"));
                         }
                         if hoist.is_some() && ui.button("Show whole tree").clicked() {
@@ -2009,7 +2124,7 @@ impl App {
                     });
                 });
                 if chained {
-                    // A short line up to the parent row marks a node that continues its parent's chain.
+                    // A short line up to the parent row marks a segment that continues its parent's chain.
                     let rect = row.response.rect;
                     let x = rect.left() + depth as f32 * 14.0 + 7.0;
                     let gap = ui.spacing().item_spacing.y;
@@ -2070,14 +2185,209 @@ impl App {
             Some((_, "unhoist")) => self.hoist = None,
             Some((id, "delete")) => self.delete_dialog = Some(id),
             Some((id, "join")) => self.join_with_parent(&id),
+            Some((id, "hydrate1")) => self.start_hydrate(Some((id, false)), false),
+            Some((id, "hydrate")) => self.start_hydrate(Some((id, true)), false),
             Some((id, _)) => self.open_node_dialog(&id),
             None => {}
+        }
+    }
+
+    // ---- local database ----
+
+    /// Which segments' current content is stored (the tree's "db" marks).
+    fn refresh_stored(&mut self) {
+        self.stored_ids.clear();
+        let (Some(col), Some(s)) = (&self.col, &self.session) else { return };
+        let Some(c) = &s.cache else { return };
+        if let Ok(keys) = emucov::cache::current_keys(c.conn(), col, &c.setup) {
+            for (id, (key, _)) in keys {
+                if let Some(k) = key {
+                    if c.content(&k).ok().flatten().is_some() {
+                        self.stored_ids.insert(id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_hydrate(&mut self, scope: Option<(String, bool)>, clean: bool) {
+        let Some(col) = &self.col else { return };
+        if self.session.as_ref().is_none_or(|s| s.cache.is_none()) {
+            self.error("Hydration needs the local database (Emulation → Use the local database).");
+            return;
+        }
+        let what = match &scope {
+            None => if clean { "all segments, cleaning dirty ones".to_string() } else { "all segments".to_string() },
+            Some((id, false)) => format!("\"{}\"", col_title(Some(col), id)),
+            Some((id, true)) => format!("\"{}\" and below", col_title(Some(col), id)),
+        };
+        match Hydrator::new(col, scope.as_ref().map(|(id, ch)| (id.as_str(), *ch)), clean, false) {
+            Ok(h) => {
+                self.playing = false;
+                self.job = None;
+                self.pb = None;
+                self.hydrating = Some(Hydrating { h, paused: false, what });
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
+    /// One slice of hydration; shows every 4th frame in the emulator view.
+    fn hydrate_work(&mut self) {
+        let Some(hy) = &mut self.hydrating else { return };
+        if hy.paused {
+            return;
+        }
+        let (Some(col), Some(s)) = (&mut self.col, &mut self.session) else { return };
+        match hy.h.step(s, col, JOB_SLICE, 4) {
+            Ok(events) => {
+                if let Some(f) = hy.h.last_frame() {
+                    let img = egui::ColorImage::from_rgb([f.width as usize, f.height as usize], &f.rgb);
+                    match &mut self.texture {
+                        Some(t) => t.set(img, egui::TextureOptions::NEAREST),
+                        None => self.texture = Some(egui_ctx().load_texture("preview", img, egui::TextureOptions::NEAREST)),
+                    }
+                }
+                if !events.is_empty() {
+                    self.refresh_stored();
+                }
+                if self.hydrating.as_ref().is_some_and(|h| h.h.done()) {
+                    self.end_hydrate(false);
+                }
+            }
+            Err(e) => {
+                self.hydrating = None;
+                self.error(format!("Hydration stopped: {e:#}"));
+                self.reselect();
+            }
+        }
+    }
+
+    fn end_hydrate(&mut self, stopped: bool) {
+        let Some(hy) = self.hydrating.take() else { return };
+        let played = hy.h.events.iter().filter(|e| e.action == "played").count();
+        let stored = hy.h.events.len() - played;
+        let cleaned = hy.h.events.iter().filter(|e| e.verdict == "cleaned").count();
+        let problems: Vec<String> = hy.h.problems().iter().map(|e| format!("{} ({})", col_title(self.col.as_ref(), &e.id), e.verdict)).collect();
+        let mut msg = format!("{} {}: {played} played, {stored} already stored", if stopped { "Stopped hydrating" } else { "Hydrated" }, hy.what);
+        if cleaned > 0 {
+            msg += &format!(", {cleaned} cleaned");
+        }
+        self.refresh_stored();
+        if problems.is_empty() {
+            self.info(msg);
+        } else {
+            self.error(format!("{msg}. Not matching their recorded hashes: {}", problems.join(", ")));
+        }
+        // Cleaning may have rewritten files: pick up the new hashes.
+        if hy.h.clean && cleaned > 0 {
+            if let Some(col) = &mut self.col {
+                for e in hy.h.events.iter().filter(|e| e.verdict == "cleaned") {
+                    if let Some(p) = col.paths.get(&e.id).cloned() {
+                        if let Ok(r) = emucov::format::Replay::load(&p) {
+                            col.replays.insert(e.id.clone(), r);
+                        }
+                    }
+                }
+            }
+        }
+        self.reselect();
+    }
+
+    /// Shows the selected segment again after hydration used the core.
+    fn reselect(&mut self) {
+        if let Some(id) = self.selected.clone() {
+            if self.col.as_ref().is_some_and(|c| c.replays.contains_key(&id)) {
+                self.select(&id);
+            }
+        }
+    }
+
+    fn set_database(&mut self, on: bool) {
+        let Some(col) = &self.col else { return };
+        let mut local = col.load_local().unwrap_or_default();
+        local.database = if on { None } else { Some(false) };
+        if let Err(e) = col.save_local(&local) {
+            self.error(e);
+            return;
+        }
+        self.pb = None;
+        self.open_session();
+        self.refresh_stored();
+        self.reselect();
+        self.info(if on { "Using the local database" } else { "Running without the local database" });
+    }
+
+    fn set_max_memory(&mut self, mb: u64) {
+        self.max_memory_mb = mb;
+        if let Some(col) = &self.col {
+            let mut local = col.load_local().unwrap_or_default();
+            local.max_memory_mb = Some(mb);
+            let _ = col.save_local(&local);
+        }
+        if let Some(pb) = &mut self.pb {
+            let at = pb.ran;
+            trim_snapshots(&mut pb.snapshots, at, mb * 1024 * 1024);
         }
     }
 
     fn transport(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let has = self.pb.is_some();
+            // Segment back and forward.
+            let (parent, kids): (Option<String>, Vec<(String, String)>) = match (&self.col, &self.selected) {
+                (Some(col), Some(id)) if col.replays.contains_key(id) => (
+                    col.replays[id].parent().map(String::from),
+                    col.children(Some(id)).into_iter().map(|k| (k.to_string(), col_title(Some(col), k))).collect(),
+                ),
+                _ => (None, vec![]),
+            };
+            let idle = self.hydrating.is_none();
+            if ui
+                .add_enabled(idle && parent.is_some(), egui::Button::new("⏪ parent"))
+                .on_hover_text(match &parent {
+                    Some(p) => format!("Back to the end of the parent segment, \"{}\"", col_title(self.col.as_ref(), p)),
+                    None => String::new(),
+                })
+                .on_disabled_hover_text("A root segment has no parent")
+                .clicked()
+            {
+                if let Some(p) = parent {
+                    self.segment_back(&p);
+                }
+            }
+            match kids.len() {
+                0 | 1 => {
+                    let tip = match kids.first() {
+                        Some((_, t)) => format!("Forward into the child segment, \"{t}\""),
+                        None => String::new(),
+                    };
+                    if ui.add_enabled(idle && kids.len() == 1, egui::Button::new("child ⏩")).on_hover_text(tip).on_disabled_hover_text("This segment has no children").clicked() {
+                        self.segment_forward(&kids[0].0);
+                    }
+                }
+                n => {
+                    let mut pick = None;
+                    ui.add_enabled_ui(idle, |ui| {
+                        ui.menu_button("child ⏩ ⏷", |ui| {
+                            ui.label(RichText::new(format!("{n} child segments")).weak().small());
+                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                for (k, t) in &kids {
+                                    if ui.add(egui::Button::selectable(false, t.as_str()).truncate()).on_hover_text(&k[..8.min(k.len())]).clicked() {
+                                        pick = Some(k.clone());
+                                    }
+                                }
+                            });
+                        })
+                        .response
+                        .on_hover_text("Forward into a child segment");
+                    });
+                    if let Some(k) = pick {
+                        self.segment_forward(&k);
+                    }
+                }
+            }
+            ui.separator();
             ui.add_enabled_ui(has, |ui| {
                 if ui.button("⏮").on_hover_text("Go to start (Home)").clicked() {
                     self.playing = false;
@@ -2107,7 +2417,7 @@ impl App {
                     }
                 }
                 ui.separator();
-                ui.checkbox(&mut self.auto_continue, "continue").on_hover_text("At the end of a node with exactly one child, and no unsaved changes in either, keep playing into the child");
+                ui.checkbox(&mut self.auto_continue, "continue").on_hover_text("At the end of a segment with exactly one child, and no unsaved changes in either, keep playing into the child");
             });
         });
         ui.horizontal(|ui| {
@@ -2132,10 +2442,47 @@ impl App {
         });
     }
 
+    /// Selects the parent and goes to its last frame.
+    fn segment_back(&mut self, parent: &str) {
+        self.playing = false;
+        self.route.clear();
+        self.route_target = None;
+        self.select(parent);
+        let e = self.col.as_ref().and_then(|c| c.replays.get(parent)).and_then(|r| r.frames().ok()).unwrap_or(1).saturating_sub(1);
+        self.seek(e);
+        self.roll.follow_to(e);
+    }
+
+    /// Goes to frame 0 of `child`: straight on from the current state when the playhead is at
+    /// the end of this segment (as continue does), otherwise by loading the child.
+    fn segment_forward(&mut self, child: &str) {
+        self.route.clear();
+        self.route_target = None;
+        let at_end = self.pb.as_ref().is_some_and(|pb| pb.ran == pb.frames && pb.end_hash.is_some());
+        let unsaved = self.edited.contains(child) || self.selected.as_ref().is_some_and(|s| self.edited.contains(s));
+        if at_end && !unsaved && self.job.is_none() {
+            if let Err(e) = self.continue_into(child) {
+                self.playing = false;
+                self.error(e);
+            }
+            return;
+        }
+        self.playing = false;
+        self.select(child);
+        self.roll.follow_to(0);
+    }
+
     fn preview(&mut self, ui: &mut egui::Ui) {
-        self.transport(ui);
-        ui.separator();
-        let avail = ui.available_rect_before_wrap();
+        // The picture fills what's left above the transport (two rows below it).
+        let full = ui.available_rect_before_wrap();
+        let bar_h = 2.0 * ui.spacing().interact_size.y + 3.0 * ui.spacing().item_spacing.y + 8.0;
+        let avail = egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, (full.max.y - bar_h).max(full.min.y)));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(avail), |ui| self.picture(ui, avail));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(egui::pos2(full.min.x, avail.max.y + 4.0), full.max)), |ui| self.transport(ui));
+        ui.allocate_rect(full, egui::Sense::hover());
+    }
+
+    fn picture(&mut self, ui: &mut egui::Ui, avail: egui::Rect) {
         ui.painter().rect_filled(avail, 0.0, Color32::from_gray(12));
         if let Some(err) = &self.core_error {
             ui.scope_builder(egui::UiBuilder::new().max_rect(avail.shrink(24.0)), |ui| {
@@ -2153,7 +2500,6 @@ impl App {
         }
         let rect = egui::Rect::from_center_size(avail.center(), size * scale);
         ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-        ui.allocate_rect(avail, egui::Sense::hover());
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -2165,6 +2511,32 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Fixed slot for the progress bar, so nothing moves when it appears.
                 let slot = egui::vec2(260.0, 16.0);
+                if let Some(hy) = &self.hydrating {
+                    let n = hy.h.targets.len().max(1);
+                    let (frac, name) = match hy.h.progress() {
+                        Some((id, f, frames)) => ((hy.h.i as f32 + f as f32 / frames.max(1) as f32) / n as f32, col_title(self.col.as_ref(), id)),
+                        None => (hy.h.i as f32 / n as f32, String::new()),
+                    };
+                    let text = format!("{} {}/{}{}", if hy.paused { "Paused" } else { "Hydrating" }, (hy.h.i + 1).min(n), n, if name.is_empty() { String::new() } else { format!(": \"{name}\"") });
+                    ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).desired_width(slot.x).desired_height(slot.y).text(RichText::new(text).small()).corner_radius(3.0));
+                    let mut stop = false;
+                    let mut toggle = false;
+                    if ui.small_button("Stop").on_hover_text("Stop hydrating; finished segments stay stored").clicked() {
+                        stop = true;
+                    }
+                    if ui.small_button(if hy.paused { "Resume" } else { "Pause" }).clicked() {
+                        toggle = true;
+                    }
+                    if toggle {
+                        if let Some(h) = &mut self.hydrating {
+                            h.paused = !h.paused;
+                        }
+                    }
+                    if stop {
+                        self.end_hydrate(true);
+                    }
+                    return;
+                }
                 match self.job_progress() {
                     Some((f, text)) => {
                         ui.add(egui::ProgressBar::new(f.clamp(0.0, 1.0)).desired_width(slot.x).desired_height(slot.y).text(RichText::new(text).small()).corner_radius(3.0));
@@ -2307,7 +2679,7 @@ impl eframe::App for App {
         }
         let dt = ctx.input(|i| i.unstable_dt).min(0.1) as f64;
         self.work();
-        if self.job.is_some() {
+        if self.job.is_some() || self.hydrating.as_ref().is_some_and(|h| !h.paused) {
             ctx.request_repaint();
         }
         self.tick(dt);
@@ -2329,7 +2701,7 @@ impl eframe::App for App {
                 let shown = self.pb.as_ref().and_then(|p| p.shown());
                 action = self.roll.show(ui, col, id, shown, self.playing);
             } else {
-                ui.label("Select a replay to see its inputs.");
+                ui.label("Select a segment to see its inputs.");
             }
         });
         egui::CentralPanel::default().show(ui, |ui| self.preview(ui));

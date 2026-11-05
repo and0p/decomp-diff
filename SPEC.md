@@ -13,8 +13,8 @@ marked **(reserved)**, which files may carry but the tools do not act on yet.
 ## Terminology
 
 These are the working terms (open to change). The file format and the tools still
-use the older words in places ("replay" for segment, "node" in the GUI, "save
-state" for snapshot). They'll be renamed together.
+use the older words in places ("replay" for segment, "save state" for snapshot).
+The GUI and the docs already say "segment" where they used to say "node".
 
 | Term | Meaning |
 |---|---|
@@ -51,7 +51,8 @@ my-collection/
   blobs/
     blake3-<hex>         SRAM and save-state blobs, named by content hash
   symbols/               optional: symbol maps for rolling coverage up into functions
-  .emucov/               local only, never committed (states cache, coverage.sqlite, screenshots)
+  unreachable.txt        optional: ROM ranges no input can reach, left out of coverage
+  .emucov/               local only, never committed (local.toml, cache.db, screenshots)
 ```
 
 Replays are stored **flat**, named by id. The tree lives in each file's
@@ -289,7 +290,7 @@ same setup, its hash matches the ancestor's `end-hash`, and the ancestor is
 clean (section 8), so nothing above it has changed since. Otherwise they play
 the chain from the trunk.
 
-A player that has just finished a node may go straight on into one of its
+A player that has just finished a segment may go straight on into one of its
 children without reloading anything. The core is already in the child's start
 state; the player only releases all inputs and sets port devices for the child
 (section 3.2).
@@ -373,6 +374,19 @@ For each replay, the player stores which ROM bytes ran as an instruction's
 first byte (opcode) and which ran as operands, during that replay's own frames
 only. Ancestors' frames are not counted again.
 
+It keeps this in the local database (`.emucov/cache.db`, see CACHE_PLAN.md)
+keyed by the segment's **content key**, so the totals always describe the
+current files: a report counts only clean segments whose current content has
+been played, and says how many were dirty or not played yet. Each segment also
+records the frame at which each ROM byte first ran in it, which answers "which
+segment reaches this code, and when".
+
+`unreachable.txt` at the collection root lists ROM ranges that no input can
+reach (dead code, debug paths). It is version controlled. One range per line,
+`0x8000-0x80FF` or a single `0x8123`, optionally prefixed by a region
+(`PRG:0x8000-0x80FF`), with `#` comments. Instructions and blocks inside them
+are left out of the totals.
+
 Coverage rolls up into basic blocks and functions when a symbol map is given:
 
 - `ca65-dbg`: the `.dbg` file from the cc65 linker (`ld65 --dbgfile`). Each
@@ -395,17 +409,17 @@ reaches) to show collaborators where help is needed.
 These are the tree edits the GUI offers. They are defined here so that any
 tool doing the same edit produces the same files.
 
-**New child.** A new replay with `parent` set to the node, a fresh id, no
-hashes, and a length chosen by the author. It starts where the node ends.
+**New child.** A new replay with `parent` set to the segment, a fresh id, no
+hashes, and a length chosen by the author. It starts where the segment ends.
 
-**Split at frame `f`** (`0 < f < frames`). One node becomes two:
+**Split at frame `f`** (`0 < f < frames`). One segment becomes two:
 
-- The **second part** keeps the node's id, title, tags, children and
-  `end-hash`. Its body is the node's lines from frame `f` on, renumbered from 0,
+- The **second part** keeps the segment's id, title, tags, children and
+  `end-hash`. Its body is the segment's lines from frame `f` on, renumbered from 0,
   and its `frames` is the old length minus `f`. Its `parent` becomes the first
   part. Checkpoints after `f` move to it, renumbered. It loses `save` and
   `sram`, because only a trunk may name blobs.
-- The **first part** gets a new id and takes the node's old place under its
+- The **first part** gets a new id and takes the segment's old place under its
   parent. It keeps frames `0..f`, the earlier checkpoints, and any `save` or
   `sram`. By default its title is the old title plus "(first f frames)".
 - The state hash at the cut (at the start of frame `f`, after the first part
@@ -417,7 +431,7 @@ hashes, and a length chosen by the author. It starts where the node ends.
   it again.
 
 Keeping the id on the second part means children and outside references to the
-node stay valid. Coverage recorded for the old node (section 9) covered both
+segment stay valid. Coverage recorded for the old segment (section 9) covered both
 parts; tools must mark it stale or re-record it after a split.
 
 **Branch at frame `f`.** A split at `f`, plus a new empty child of the first
@@ -429,9 +443,72 @@ past its last body line.
 
 ## 11. Future directions (notes, not part of format v1)
 
+- **Sticky children (GUI).** Off by default; a toggle turns it on (where is still open,
+  perhaps at the bottom of the Segments tab). While it's on:
+  - The tree highlights the selected segment's whole chain, from it up through every
+    parent to the root segment.
+  - The GUI remembers the deepest segment the author has been in on that chain (the
+    *tip*), and only the tip: the sticky path is always "the tip's ancestors", so it
+    stays right through splits and joins. Example: from 1>2>7>12, going back to 2
+    keeps >7>12 as the sticky children. They stay highlighted as part of the chain,
+    but faded, because they are ahead of the playhead rather than behind it.
+  - **continue** follows the sticky children from any segment on the path, even where
+    a segment has more than one child. Past the tip, it falls back to the normal rule
+    (carry on only into an only child).
+  - Selecting a segment on the path keeps the tip. Selecting one below the tip makes
+    it the new tip. Selecting anything else (a sibling branch such as 1>2>8, or another
+    tree such as 5>28>14) replaces the path with the new selection's chain, because it
+    no longer leads to the old tip. Deleting the tip moves it to its nearest surviving
+    ancestor.
+  - The transport's **child** button becomes a split button: its main part goes into
+    the sticky child, and a narrow down arrow at its side opens the list of all
+    children to pick another one. With sticky off (or no sticky child here), the main
+    part goes into an only child and opens the list when there are several, as it
+    does now.
+  - **Rewinding up the chain** (with sticky on or off). Stepping or seeking back past frame 0 goes into the
+    parent's last frames (loading a snapshot of the parent, from memory or the local
+    database), and playing forward from there follows the sticky children back down. A
+    possible next step is one timeline across the whole chain, with the segment
+    boundaries drawn on the ruler.
+  - **Neighbours on the piano roll.** Draw the end of the parent to the left of frame
+    0, and the start of the next (sticky or only) child to the right of the last frame,
+    faded and read-only, with the boundary marked on the ruler. Clicking or dragging
+    in the faded part does nothing, so a misclick can't switch segments. Only an arrow
+    key or a playback control (stepping, playing, the segment back and forward
+    buttons) moves across the boundary, and that switches over fully: the other
+    segment becomes the selected one, the playhead moves with it even when paused, and
+    only then can it be edited. No edit ever spans two segments.
+- **One piano roll mode instead of Draw and Select** (in the style of FL Studio's
+  piano roll):
+  - Click an empty cell to add a press, as long as the last press made or resized.
+    Keep the button down and drag to set its length.
+  - Drag a press's body to move it in time and its edges to resize it. Plain drags
+    never change rows.
+  - **Transpose** (move presses to the adjacent button row, for example A to B) only
+    on purpose: drag while holding a modifier (Alt), or press Alt+Up / Alt+Down with
+    presses selected. A press can't move into another controller's rows.
+  - Click selects a press; Shift+click adds to the selection. Ctrl/Cmd+drag on empty
+    space draws a selection box, since a plain drag there makes a press. Right-click or
+    Delete removes. Presses that end up overlapping merge, as today.
+- **Return to the edit.** An option (on by default, to try) so that any edit pauses
+  playback and moves the playhead to the earliest frame edited since playback last
+  ran, showing that frame recomputed. Today the GUI drops the snapshots after the edit
+  and recomputes the frame under the playhead, which is correct but hard to trust,
+  because the picture doesn't visibly change and may be far from the edit. Also: mark
+  the frames after an unplayed edit as stale on the ruler until they run again, and
+  dim the picture while it shows a frame from before the latest edit.
+- **Backups without version control.** `emucov backup <dir>` (and File > Back up… in
+  the GUI) writes the collection's shared files to a ZIP: `collection.toml`, `replays/`,
+  `blobs/`, `symbols/` and `unreachable.txt`, never `.emucov/` (the database can be
+  rebuilt by hydrating) and never the ROM. `emucov restore <zip> <dir>` puts them back,
+  replacing `replays/` whole so deleted segments come back and new ones go. Useful
+  before a big agent-driven edit or an experiment, for authors who don't use git.
+  Possible extras: an automatic backup before risky commands (a bulk clean, a large
+  agent edit), named backups under `.emucov/backups/` with a limit on how many are
+  kept, and a `diff` between a backup and the current files listed by segment title.
 - **Local database.** Everything derived from playing a collection goes into a local
   store that isn't in version control: save states, RAM snapshots and diffs, PNG
-  previews of node starts, ends and markers, block and instruction coverage, and cross
+  previews of segment starts, ends and markers, block and instruction coverage, and cross
   references from code to the replays and frames that run it. Authors and
   collaborators fill it on their own machines, and agents query it while decompiling.
   SRAM that a trunk starts from stays in `blobs/` (section 4), which is in version
@@ -448,8 +525,8 @@ past its last body line.
 - **Side-by-side comparison** with a second libretro instance, namely a decompilation
   built as a core. Its video output may or may not match. The same inputs drive both,
   and the GUI compares state hashes and video.
-- **Run and check everything from the GUI:** play the whole tree (or the dirty nodes),
-  check every RAM hash, and list the nodes that no longer match.
+- **Run and check everything from the GUI:** play the whole tree (or the dirty segments),
+  check every RAM hash, and list the segments that no longer match.
 - **Terminology.** Rename the format, the tools and the docs to the terms in the
   Terminology section (segment, snapshot, root segment, and so on).
 - **Shorter replay ids.** Replace UUIDs with something short enough to quote in docs

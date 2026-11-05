@@ -317,7 +317,7 @@ enum Item {
 }
 
 impl RollState {
-    /// The selected notes with their spans, in the node the roll last drew.
+    /// The selected notes with their spans, in the segment the roll last drew.
     pub fn selected_notes(&self) -> Vec<(InputKey, (u64, u64))> {
         let Some(m) = &self.model else { return vec![] };
         self.sel
@@ -395,12 +395,12 @@ impl RollState {
             }
             ui.separator();
             let used: Vec<&str> = m.groups.iter().filter(|g| g.used()).map(|g| g.name.as_str()).collect();
-            ui.label(egui::RichText::new(if used.is_empty() { "no inputs in this replay".to_string() } else { format!("uses {}", used.join(", ")) }).weak());
+            ui.label(egui::RichText::new(if used.is_empty() { "no inputs in this segment".to_string() } else { format!("uses {}", used.join(", ")) }).weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.checkbox(&mut self.all_buttons, "all buttons");
                 ui.checkbox(&mut self.labels, "labels");
                 ui.checkbox(&mut self.follow, "follow");
-                if ui.small_button("fit").on_hover_text("Fit the whole replay").clicked() {
+                if ui.small_button("fit").on_hover_text("Fit the whole segment").clicked() {
                     let w = (ui.available_width() + 200.0 - LABEL_W).max(100.0);
                     self.px_per_frame = (w / m.frames.max(1) as f32).clamp(0.02, 48.0);
                     self.scroll_x = 0.0;
@@ -422,7 +422,7 @@ impl RollState {
         let font = FontId::proportional(11.0);
         let measure = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x;
         // Expanded lane: each marker gets a row with room for its whole label, worked out in
-        // pixels from the start of the node, so rows don't change while scrolling.
+        // pixels from the start of the segment, so rows don't change while scrolling.
         // Events take the top rows; RAM writes and everything else go below them.
         let mut exp_row = vec![0usize; m.markers.len()];
         let mut event_rows = 0;

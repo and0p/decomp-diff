@@ -1,6 +1,6 @@
 # Plan: the local database
 
-Status: proposal. This file covers the first item under "Future directions" in
+Status: mostly implemented (see "What's built" at the end). This file covers the first item under "Future directions" in
 SPEC.md (section 11): a local store for everything derived from playing a
 collection. It uses the words defined in SPEC.md's "Terminology" section:
 segment, snapshot, diff, child segment, save and macro.
@@ -363,3 +363,31 @@ all give the same numbers.
   but make longer manifests. Try 16, 64 and 256 KB on a real game once pages exist.
 - **How often to write a full manifest** in a chain of diffs. I'd suggest every 8
   diffs.
+
+## What's built
+
+Implemented in `player/src/cache.rs` and `player/src/hydrate.rs`, used by the CLI
+and the GUI:
+
+- `cache.db` with `setups`, `contents`, `segment_runs`, `segments_now`, `pages`,
+  `snapshots`, `frames`, `images`, `coverage`, `first_hits`, `unreachable`, `runs`
+  and `run_results`. `.emucov/states/` and `coverage.sqlite` are no longer used.
+- Content keys, snapshots split into hashed zstd pages (1:1 unless `page_kb` is
+  set), snapshots at frame 0, every `diff_every` frames, at markers and at the end
+  of segments with children; start and marker previews; the four presets.
+- Hydration of everything, a segment or a subtree, with `--clean` and `--force`
+  on the CLI and pause, stop and live view in the GUI.
+- Coverage keyed by content (clean, hydrated segments only), `first_hits`,
+  `unreachable.txt`, and `emucov where`, `snapshot`, `sql`, `cache stats` and
+  `cache gc`. `--no-db` and `database = false`.
+- The GUI's memory limit (`max_memory_mb`) and seeking from stored snapshots.
+
+Not built yet:
+
+- `exclude` is parsed but not applied when hashing or storing.
+- Pages are stored whole; zstd `--patch-from` against the previous page isn't done.
+- `code` and `coverage_sum` (the report recomputes from `coverage` each time, which
+  is fast enough at NES sizes), and `parity` (waits on comparison cores).
+- The RAM view, watched-address lanes, the MCP server and `cache pack` / `unpack`.
+- Snapshot layout per core (no core needs it yet).
+

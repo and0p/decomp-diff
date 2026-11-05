@@ -1,98 +1,17 @@
 //! Local coverage database and reports (SPEC.md section 9).
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::analysis::{self, AnalyzedFunction};
 use crate::collection::Collection;
-use crate::player::ReplayResult;
+use crate::cache;
+use crate::collection::Status;
 
 pub const FLAG_OPCODE: u8 = 0x01;
-
-pub struct Store {
-    conn: Connection,
-}
-
-impl Store {
-    pub fn open(path: &Path) -> Result<Store> {
-        if let Some(d) = path.parent() {
-            std::fs::create_dir_all(d)?;
-        }
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS runs(
-                id INTEGER PRIMARY KEY, created TEXT NOT NULL, setup TEXT NOT NULL,
-                core TEXT NOT NULL, from_scratch INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS replay_runs(
-                run_id INTEGER NOT NULL, replay_id TEXT NOT NULL, parent TEXT, title TEXT,
-                start_frame INTEGER, frames INTEGER, start_hash TEXT, end_hash TEXT,
-                ticks INTEGER, poked INTEGER, outcome TEXT,
-                PRIMARY KEY(run_id, replay_id));
-             CREATE TABLE IF NOT EXISTS coverage(
-                run_id INTEGER NOT NULL, replay_id TEXT NOT NULL, region TEXT NOT NULL, flags BLOB NOT NULL,
-                PRIMARY KEY(run_id, replay_id, region));",
-        )?;
-        Ok(Store { conn })
-    }
-
-    pub fn begin_run(&self, setup: &str, core: &str, from_scratch: bool) -> Result<i64> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-        self.conn.execute(
-            "INSERT INTO runs(created, setup, core, from_scratch) VALUES (?1, ?2, ?3, ?4)",
-            params![now.to_string(), setup, core, from_scratch as i32],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    pub fn record(&self, run: i64, col: &Collection, res: &ReplayResult, outcome: &str) -> Result<()> {
-        let r = &col.replays[&res.id];
-        self.conn.execute(
-            "INSERT OR REPLACE INTO replay_runs VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![
-                run,
-                res.id,
-                r.parent(),
-                r.title(),
-                res.start_frame as i64,
-                res.frames as i64,
-                res.start_hash,
-                res.end_hash,
-                res.ticks.map(|t| t as i64),
-                res.poked as i32,
-                outcome
-            ],
-        )?;
-        for reg in &res.coverage {
-            self.conn.execute("INSERT OR REPLACE INTO coverage VALUES (?1,?2,?3,?4)", params![run, res.id, reg.name, reg.flags])?;
-        }
-        Ok(())
-    }
-
-    pub fn latest_run(&self) -> Result<Option<i64>> {
-        Ok(self.conn.query_row("SELECT MAX(id) FROM runs", [], |r| r.get(0))?)
-    }
-
-    /// replay id -> region -> flags
-    pub fn load_run(&self, run: i64) -> Result<BTreeMap<String, BTreeMap<String, Vec<u8>>>> {
-        let mut out: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
-        let mut st = self.conn.prepare("SELECT replay_id, region, flags FROM coverage WHERE run_id = ?1")?;
-        let rows = st.query_map([run], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?)))?;
-        for row in rows {
-            let (id, region, flags) = row?;
-            out.entry(id).or_default().insert(region, flags);
-        }
-        Ok(out)
-    }
-
-    pub fn load_ticks(&self, run: i64) -> Result<HashMap<String, Option<i64>>> {
-        let mut st = self.conn.prepare("SELECT replay_id, ticks FROM replay_runs WHERE run_id = ?1")?;
-        let rows = st.query_map([run], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))?;
-        rows.map(|r| r.map_err(Into::into)).collect()
-    }
-}
 
 // ---- report -------------------------------------------------------------------
 
@@ -107,6 +26,11 @@ pub struct Totals {
     pub played_only_instructions_covered: usize,
     pub executed_bytes_by_region: BTreeMap<String, usize>,
     pub executed_outside_symbols: usize,
+    /// Instructions inside unreachable.txt ranges (left out of the counts above).
+    pub unreachable_instructions: usize,
+    /// Segments left out because they are dirty, or have not been played yet.
+    pub dirty_segments: usize,
+    pub unplayed_segments: usize,
 }
 
 #[derive(Serialize)]
@@ -138,7 +62,8 @@ pub struct FunctionRow {
 
 #[derive(Serialize)]
 pub struct Report {
-    pub run: i64,
+    /// The setup (ROM, core and options) the coverage was recorded with.
+    pub setup: String,
     pub symbols: bool,
     pub totals: Totals,
     pub replays: Vec<ReplayRow>,
@@ -159,13 +84,39 @@ fn opcode_set(flags: &[u8]) -> Vec<bool> {
     flags.iter().map(|f| f & FLAG_OPCODE != 0).collect()
 }
 
-pub fn build_report(col: &Collection, store: &Store, rom: Option<&[u8]>) -> Result<Report> {
-    let run = store.latest_run()?.context("no runs recorded yet; run `emucov run` first")?;
-    let cov = store.load_run(run)?;
-    let ticks = store.load_ticks(run)?;
-    if cov.is_empty() {
-        bail!("the latest run recorded no coverage (was the core built with a coverage connector?)");
+/// Coverage of the collection as it is now, from the local database: every segment that
+/// isn't dirty and has been played with its current content counts (SPEC.md, "Coverage").
+pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>) -> Result<Report> {
+    let setup: String = conn
+        .query_row("SELECT setup FROM contents ORDER BY played_at DESC LIMIT 1", [], |r| r.get(0))
+        .context("nothing has been played into the local database yet; run `emucov hydrate` first")?;
+    let keys = cache::current_keys(conn, col, &setup)?;
+    let mut cov: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
+    let mut ticks: HashMap<String, Option<i64>> = HashMap::new();
+    let (mut dirty_segments, mut unplayed_segments) = (0, 0);
+    for (id, (key, status)) in &keys {
+        if *status == Status::Dirty {
+            dirty_segments += 1;
+            continue;
+        }
+        let Some(key) = key else {
+            unplayed_segments += 1;
+            continue;
+        };
+        let regions = cache::coverage_of(conn, key)?;
+        if regions.is_empty() {
+            unplayed_segments += 1;
+            continue;
+        }
+        cov.insert(id.clone(), regions.into_iter().collect());
+        let t: Option<Option<i64>> = conn.query_row("SELECT ticks FROM contents WHERE key = ?1", [key], |r| r.get(0)).ok();
+        ticks.insert(id.clone(), t.flatten());
     }
+    if cov.is_empty() {
+        bail!("no segment has coverage recorded for its current content (was the core built with a coverage connector?); run `emucov hydrate`");
+    }
+    let unreachable = cache::load_unreachable(col)?;
+    let is_unreachable = |off: u64| unreachable.iter().any(|u| u.region == "PRG" && off >= u.start && off <= u.end);
 
     // Symbols -> analyzed functions (PRG only for now, 6502).
     let mut analyzed: Vec<AnalyzedFunction> = vec![];
@@ -182,6 +133,13 @@ pub fn build_report(col: &Collection, store: &Store, rom: Option<&[u8]>) -> Resu
         analyzed.extend(analysis::analyze_6502(&funcs, prg));
     }
     let symbols = !analyzed.is_empty();
+    let mut unreachable_instructions = 0;
+    for f in &mut analyzed {
+        let before = f.instructions.len();
+        f.instructions.retain(|i| !is_unreachable(i.offset));
+        f.blocks.retain(|b| !is_unreachable(b.offset));
+        unreachable_instructions += before - f.instructions.len();
+    }
 
     // Units of coverage: instruction offsets in PRG when we have symbols, else opcode bytes.
     let units: Vec<u64> = if symbols {
@@ -330,7 +288,7 @@ pub fn build_report(col: &Collection, store: &Store, rom: Option<&[u8]>) -> Resu
     }
 
     Ok(Report {
-        run,
+        setup,
         symbols,
         totals: Totals {
             functions: nf,
@@ -342,6 +300,9 @@ pub fn build_report(col: &Collection, store: &Store, rom: Option<&[u8]>) -> Resu
             played_only_instructions_covered: npi,
             executed_bytes_by_region,
             executed_outside_symbols,
+            unreachable_instructions,
+            dirty_segments,
+            unplayed_segments,
         },
         replays,
         smallest_set,
@@ -359,7 +320,13 @@ fn pct(a: usize, b: usize) -> String {
 
 pub fn print_report(rep: &Report, col: &Collection) {
     let t = &rep.totals;
-    println!("Coverage, run {}", rep.run);
+    println!("Coverage of the current segments (setup {})", rep.setup);
+    if t.dirty_segments + t.unplayed_segments > 0 {
+        println!("  left out: {} dirty, {} not played with their current content", t.dirty_segments, t.unplayed_segments);
+    }
+    if t.unreachable_instructions > 0 {
+        println!("  unreachable (unreachable.txt): {} instructions, not counted", t.unreachable_instructions);
+    }
     if rep.symbols {
         println!("  functions entered    {:>6} / {:<6} {}", t.functions_entered, t.functions, pct(t.functions_entered, t.functions));
         println!("  basic blocks         {:>6} / {:<6} {}", t.blocks_covered, t.blocks, pct(t.blocks_covered, t.blocks));

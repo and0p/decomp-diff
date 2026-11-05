@@ -2,8 +2,10 @@
 //! The `emucov` command-line tool and the GUI are both built on this library.
 
 pub mod analysis;
+pub mod cache;
 pub mod collection;
 pub mod coverage;
 pub mod format;
+pub mod hydrate;
 pub mod libretro;
 pub mod player;

@@ -26,14 +26,45 @@ emucov new   <dir> [--parent ID] [--title TEXT] [--frames N]     # prints the ne
 emucov status <dir>                                              # tree with clean / dirty / unverified marks
 emucov play  <dir> <id> [--screenshots DIR] [--shot 60,120] [--no-cache] [--accept]
 emucov run   <dir> [--from-scratch] [--accept] [--screenshots]   # play everything, check hashes, record coverage
-emucov report <dir> [--json FILE] [--gaps FILE.csv]
+emucov hydrate <dir> [SEGMENT [--children]] [--clean] [--force]  # fill the local database
+emucov report <dir> [--json FILE] [--gaps FILE.csv]              # coverage of the current, clean segments
+emucov where <dir> PRG:0x1234 | 0x8123 | SYMBOL                 # which segments first run it, at which frame
+emucov snapshot <dir> SEGMENT FRAME --out FILE                   # the core state there, to start a trace from
+emucov sql   <dir> "SELECT ..."                                  # query the local database
+emucov cache stats <dir> | emucov cache gc <dir>                 # size, or drop what no segment uses
 ```
+
+Every command that plays takes `--no-db` to run without the local database.
 
 - `--rom` and `--core` are remembered per collection in `.emucov/local.toml`, which is never committed.
 - Ids can be shortened to any unique prefix.
 - `init` records **every** core option's current value in `collection.toml`, so the setup is pinned.
 - `run` exits with an error when a replay's hashes differ from the recorded ones. `--accept` writes the new hashes instead.
 - `run --from-scratch` replays every chain from power-on instead of from cached parent states, which checks that save states round-trip exactly.
+
+### The local database
+
+`.emucov/cache.db` (SQLite, never committed) holds what playing produced, keyed by each segment's content (its setup, start state and lines), so an edit invalidates only that segment. The design is in [CACHE_PLAN.md](CACHE_PLAN.md).
+
+- **Snapshots** of the core state at frame 0, every `diff_every` frames, at markers, and at the end of segments with children. Each is split into pages that are stored once by hash and compressed with zstd.
+- **Previews** (PNG) at the start and at markers, coverage flags, and the frame each ROM byte first ran in each segment (for `where`).
+- `hydrate` plays only the segments whose content isn't stored yet; running it again is nearly instant. `SEGMENT --children` limits it to a subtree. `--clean` re-checks dirty segments: one that still ends with its recorded end hash and checkpoints gets its new start hash written to its file (it is clean again); the others are listed as mismatches. `--force` plays even what is stored.
+- `report` reads the database, not the files: it counts only clean segments that have been hydrated, and lists how many were dirty or not played yet. Address ranges in `unreachable.txt` at the collection root (`0x8000-0x80FF # comment`, optionally `PRG:` first) are left out of the totals.
+- `cache gc` deletes contents that no current segment uses, then unused snapshots and pages, and compacts the file.
+- `.emucov/coverage.sqlite` and `.emucov/states/` from before the database are no longer used and can be deleted.
+
+Settings go in `collection.toml` (shared) or `.emucov/local.toml` (this machine, wins):
+
+```toml
+[cache]
+preset = "nes-sparse"   # nes-sparse (default), nes-aggressive, n64-sparse, n64-aggressive
+page_kb = 4             # split snapshots into pages of this size; missing, or the snapshot size or more, keeps them whole
+diff_every = 300        # also store a snapshot every N frames (0: only at frame 0 and markers)
+diff_at_markers = true
+previews = "thumb"      # none, thumb (half size) or full
+```
+
+`.emucov/local.toml` also takes `database = false` (play without it, like `--no-db`) and `max_memory_mb` (the GUI's in-memory snapshot limit).
 
 ## GUI (prototype)
 
@@ -44,23 +75,24 @@ target/release/emucov-gui ../examples/thwaite       # or File > Open collection�
 
 The ROM and core come from the collection's `.emucov/local.toml` (written by the CLI's `--rom`/`--core`), or set them with Emulation > Set ROM… / Set core….
 
-- Left: two tabs, **Nodes** and **Markers**. Markers lists every event in the collection alphabetically (then writes and other lines) with the frame and node; its filter matches marker text and node titles, and clicking a row goes to that node and frame.
-- Nodes: the replay tree. Dots show clean (green), dirty (orange) and unverified (gray); anything under a dirty replay is dirty too. Edited replays are yellow italics until saved. Click a node to go to it; double-click to play it; Enter (or F2) renames the selected node in place (Enter or clicking away keeps the new name, Escape cancels). The filter box at the top matches titles, id prefixes and tags, and shows each match with the path down to it (the path is dimmed).
-  - Indentation only steps in where a node has more than one child. An only child stays in its parent's column, joined to it by a short line, so a long chain of nodes stays one column however deep it goes.
-  - The third icon (a stepped tree) switches to indenting every level, which reads better for small trees; click it again to keep only children in line. The two icons before it collapse or expand every node. Collapse all keeps the focused node open, so its children still show.
-  - Right-click > **Focus here** shows only that node and what is below it. A breadcrumb bar above the filter shows the path to it (long paths fold the middle into a "… N" menu); click any crumb to focus there, or **All** for the whole tree. The filter searches inside the focused part only.
-- Top: the emulator picture and transport: start, step back, play/pause (Space), step forward, end (Home/End), speed 1×/2×/4×/8×/MAX, and **continue**, which plays straight on into the next node when a node has exactly one child and neither has unsaved changes. Reaching the last frame checks the end hash.
+- Left: two tabs, **Segments** and **Markers**. Markers lists every event in the collection alphabetically (then writes and other lines) with the frame and segment; its filter matches marker text and segment titles, and clicking a row goes to that segment and frame.
+- Segments: the replay tree. Dots show clean (green), dirty (orange) and unverified (gray); anything under a dirty replay is dirty too. Edited replays are yellow italics until saved. Click a segment to go to it; double-click to play it; Enter (or F2) renames the selected segment in place (Enter or clicking away keeps the new name, Escape cancels). The filter box at the top matches titles, id prefixes and tags, and shows each match with the path down to it (the path is dimmed).
+  - Indentation only steps in where a segment has more than one child. An only child stays in its parent's column, joined to it by a short line, so a long chain of segments stays one column however deep it goes.
+  - The third icon (a stepped tree) switches to indenting every level, which reads better for small trees; click it again to keep only children in line. The two icons before it collapse or expand every segment. Collapse all keeps the focused segment open, so its children still show.
+  - Right-click > **Focus here** shows only that segment and what is below it. A breadcrumb bar above the filter shows the path to it (long paths fold the middle into a "… N" menu); click any crumb to focus there, or **All** for the whole tree. The filter searches inside the focused part only.
+- Top: the emulator picture, with the transport below it. **⏪ parent** goes to the last frame of the parent segment (off for a root segment). **child ⏩** goes to frame 0 of the child segment, carrying straight on from the current state when the playhead is at the end; with several children it opens a scrollable list to pick one, and it is off for a segment with no children. Then start, step back, play/pause (Space), step forward, end (Home/End), speed 1×/2×/4×/8×/MAX, and **continue**, which plays straight on into the next segment when a segment has exactly one child and neither has unsaved changes. Reaching the last frame checks the end hash.
 - Bottom: the piano roll. Time runs left to right; one row per button, grouped by controller. Groups the replay uses are tinted and open, unused ones dimmed and closed; click a group name to open or close it. A closed group still shows when any of its buttons are held.
   - Wheel or trackpad over the timeline scrolls time; Ctrl/Cmd+wheel zooms at the pointer; wheel over the names scrolls rows; "fit" shows the whole replay.
   - Click or drag on the ruler to seek.
   - **Draw** mode (D): drag in a button row to press it for those frames; drag over a held span to release it.
   - **Select** mode (S): click a press to select it; Shift+click adds, Alt+Shift+click removes. Drag on empty space to select an area, with the same modifiers. Drag selected presses sideways to move them, and drag either edge of a press to lengthen or shorten it (only while at most one press is selected; the grab zone is a thin strip on the edge). Presses that end up overlapping merge into one. Holding a drag near either end of the roll scrolls it. Delete removes the selected presses; Escape clears the selection.
   - The marker lane shows events, RAM writes, [DEVICE]/[RESET] lines, screenshots and checkpoints. Click "markers" in the label column to open or close it, like a controller. Closed, it is one row: markers on one frame share a box, and markers too close together hide behind the most important one (events first), which shows "+N" for the rest. Open, every marker gets its own box with its whole label: events in the top rows, writes and everything else below. Labels run until the next marker in their row. Hover for all markers at that spot; click one to edit, delete or add lines on that frame. **E** adds an event at the playhead.
-- Edit menu: **Undo** / **Redo** (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z or Ctrl+Y) cover every edit, including splits and new nodes. **Cut**, **Copy** and **Paste** (Ctrl/Cmd+X/C/V) work on the notes selected in the piano roll; paste puts the leftmost copied note at the play cursor and selects what it pasted.
-- Node menu (and right-click in the tree): **Play to here** (right-click only: plays through to the end of that node, on from the playhead if the current node is on the way, otherwise from the first node below where the two paths meet); **New child at end**; **Branch at playhead** (splits the node right after the playhead and starts an empty second path beside the rest); **Split at playhead** (just the split); **Properties** (title and length). **Join with parent** (only for a node with no siblings) merges it into its parent, which keeps its name and grows by its frames; the confirmation can leave a marker at the join, named after the child by default. **Delete…** removes the node and everything below it, after a confirmation that says how many nodes go; undo brings them back, and the files are removed on Save.
-  - In a split, the second half keeps the node's id, title and children; the first part becomes a new node "(first N frames)" in its old place, and the second half becomes its child. The state hash at the cut becomes the first part's end hash and the second half's start hash; the second half keeps the old end hash and everything below it is assumed clean. Inputs held across the cut are pressed again at frame 0 of the second half.
-- Bottom edge: the status bar, with messages on the left and the core and unsaved count on the right. A long seek or node load shows a progress bar there and the window stays usable.
-- An input or RAM write edit drops the node's end hash and later checkpoints, so it and everything below turn unverified or dirty. Event edits don't. Play to the end and use Emulation > Accept end hash to record the new hashes, then File > Save (Ctrl/Cmd+S).
+- Edit menu: **Undo** / **Redo** (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z or Ctrl+Y) cover every edit, including splits and new segments. **Cut**, **Copy** and **Paste** (Ctrl/Cmd+X/C/V) work on the notes selected in the piano roll; paste puts the leftmost copied note at the play cursor and selects what it pasted.
+- Segment menu (and right-click in the tree): **Play to here** (right-click only: plays through to the end of that segment, on from the playhead if the current segment is on the way, otherwise from the first segment below where the two paths meet); **New child at end**; **Branch at playhead** (splits the segment right after the playhead and starts an empty second path beside the rest); **Split at playhead** (just the split); **Properties** (title and length). **Join with parent** (only for a segment with no siblings) merges it into its parent, which keeps its name and grows by its frames; the confirmation can leave a marker at the join, named after the child by default. **Delete…** removes the segment and everything below it, after a confirmation that says how many segments go; undo brings them back, and the files are removed on Save.
+  - In a split, the second half keeps the segment's id, title and children; the first part becomes a new segment "(first N frames)" in its old place, and the second half becomes its child. The state hash at the cut becomes the first part's end hash and the second half's start hash; the second half keeps the old end hash and everything below it is assumed clean. Inputs held across the cut are pressed again at frame 0 of the second half.
+- Bottom edge: the status bar, with messages on the left and the core and unsaved count on the right. A long seek or segment load shows a progress bar there and the window stays usable.
+- The local database (Emulation menu): **Hydrate all**, **Hydrate and clean all** (only with nothing unsaved, since cleaning writes files), and right-click **Hydrate this segment** / **Hydrate this and below**. Hydration shows every 4th frame in the picture and a progress bar with **Pause** and **Stop** in the status bar; finished segments stay stored when you stop. Segments whose current content is stored show a blue **db** after their length. **Use the local database** turns it off (saved in `.emucov/local.toml`), and **Snapshot memory** sets how much memory the current segment's snapshots may use (512 MB by default).
+- An input or RAM write edit drops the segment's end hash and later checkpoints, so it and everything below turn unverified or dirty. Event edits don't. Play to the end and use Emulation > Accept end hash to record the new hashes, then File > Save (Ctrl/Cmd+S).
 
 ## Results on the Thwaite example
 

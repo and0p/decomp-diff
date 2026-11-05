@@ -1,11 +1,12 @@
 //! Plays replays on a loaded core (SPEC.md sections 5 and 6).
 
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use crate::collection::{sha256_file, Collection};
-use crate::format::{device_from_name, Command, InputKey, Replay};
+use crate::cache::{self, Cache, CacheSettings, ContentRow, Recording};
+use crate::collection::{sha256_file, Collection, Status};
+use crate::format::{device_from_name, Command, Replay};
 use crate::libretro::{region_memory_id, Core, CoverageRegion, Frame};
 
 pub struct ReplayResult {
@@ -28,6 +29,53 @@ pub struct PlayOptions {
     pub end_screenshot: bool,
     /// Extra frames (relative) to capture, besides [SCREENSHOT] lines.
     pub extra_shots: Vec<u64>,
+    /// Write what this play produces to the local database (snapshots, previews,
+    /// coverage, first hits), if the session has one.
+    pub record: bool,
+}
+
+/// One segment being played frame by frame (`Session::begin`, `advance`, `finish`), so
+/// a GUI can play it in slices and show it while it records.
+pub struct Recorder {
+    pub id: String,
+    pub start_frame: u64,
+    pub frames: u64,
+    /// The next frame to run.
+    pub f: u64,
+    pub start_hash: String,
+    wanted_checkpoints: Vec<u64>,
+    checkpoints: Vec<(u64, String)>,
+    shots_wanted: Vec<u64>,
+    screenshots: Vec<(u64, Frame)>,
+    record: bool,
+    pub key: String,
+    body: String,
+    store_at: BTreeSet<u64>,
+    preview_at: BTreeSet<u64>,
+    rec: Recording,
+    seen: Vec<(String, Vec<u8>)>,
+    /// The last video frame captured (when `advance` was asked to show it).
+    pub last_frame: Option<Frame>,
+}
+
+/// Ports' devices in effect at the start of `id`: collection defaults plus ancestors' [DEVICE] lines.
+pub fn devices_at_start(col: &Collection, id: &str) -> Result<BTreeMap<u32, u32>> {
+    let mut devs = BTreeMap::new();
+    for p in &col.config.ports {
+        if p.port == 0 {
+            bail!("collection.toml ports start at 1");
+        }
+        devs.insert(p.port - 1, device_from_name(&p.device)?);
+    }
+    let chain = col.chain(id)?;
+    for anc in &chain[..chain.len() - 1] {
+        for l in &col.replays[*anc].lines {
+            if let Command::Device { port, device } = l.command {
+                devs.insert(port, device);
+            }
+        }
+    }
+    Ok(devs)
 }
 
 /// A loaded core plus what it needs to play replays. It does not hold the
@@ -39,11 +87,20 @@ pub struct Session {
     boot_state: Vec<u8>,
     pub setup_id: String,
     pub rom_path: PathBuf,
-    cache_root: PathBuf,
+    /// The local database, unless the session runs without one.
+    pub cache: Option<Cache>,
+    /// The core's reported version, which the setup id leaves out (a warning only).
+    pub core_version: String,
 }
 
 impl Session {
+    /// Opens a session with the local database unless .emucov/local.toml says `database = false`.
     pub fn open(col: &Collection, rom: &Path, core_path: &Path) -> Result<Session> {
+        let use_db = col.load_local()?.database.unwrap_or(true);
+        Self::open_with(col, rom, core_path, use_db)
+    }
+
+    pub fn open_with(col: &Collection, rom: &Path, core_path: &Path, use_db: bool) -> Result<Session> {
         let rom_sha = sha256_file(rom)?;
         if !col.config.rom.sha256.is_empty() && rom_sha != col.config.rom.sha256 {
             bail!(
@@ -80,31 +137,55 @@ impl Session {
             h.update(v.as_bytes());
         }
         let setup_id = h.finalize().to_hex()[..16].to_string();
-        Ok(Session { core, boot_state, setup_id, rom_path: rom.to_path_buf(), cache_root: col.local_dir().join("states") })
+        let core_version = core.library_version.clone();
+        let cache = if use_db {
+            let local = col.load_local()?;
+            let settings = CacheSettings::resolve(col.config.cache.as_ref(), local.cache.as_ref())?;
+            let info = [
+                ("rom_sha256", rom_sha.clone()),
+                ("core", core.library_name.clone()),
+                ("core_version", core_version.clone()),
+                ("core_build", col.config.core.build.clone()),
+                ("core_sha256", core_sha.clone()),
+            ];
+            let mut c = Cache::open(col, &setup_id, &info, settings)?;
+            c.refresh_now(col)?;
+            Some(c)
+        } else {
+            None
+        };
+        Ok(Session { core, boot_state, setup_id, rom_path: rom.to_path_buf(), cache, core_version })
     }
 
-    pub fn state_cache_dir(&self) -> PathBuf {
-        self.cache_root.join(&self.setup_id)
-    }
-
-    /// Ports' devices in effect at the start of `id`: collection defaults plus ancestors' [DEVICE] lines.
     pub fn devices_at_start(&self, col: &Collection, id: &str) -> Result<BTreeMap<u32, u32>> {
-        let mut devs = BTreeMap::new();
-        for p in &col.config.ports {
-            if p.port == 0 {
-                bail!("collection.toml ports start at 1");
+        devices_at_start(col, id)
+    }
+
+    /// The content key `id` has when it starts from a state with hash `start_hash`.
+    pub fn content_key(&self, col: &Collection, id: &str, start_hash: &str) -> Result<String> {
+        let body = cache::body_hash(&col.replays[id], &devices_at_start(col, id)?)?;
+        Ok(cache::content_key(&self.setup_id, start_hash, &body))
+    }
+
+    /// The stored snapshot nearest at or before `frame` inside `id` (started from
+    /// `start_hash`), as (frame, state). Frame 0 is the segment's start.
+    pub fn nearest_stored(&self, col: &Collection, id: &str, start_hash: &str, frame: u64) -> Result<Option<(u64, Vec<u8>)>> {
+        let Some(c) = &self.cache else { return Ok(None) };
+        let key = self.content_key(col, id, start_hash)?;
+        let frames = c.stored_frames(&key)?;
+        for (f, h) in frames.iter().rev().filter(|(f, _)| *f <= frame) {
+            if let Some(s) = c.get_snapshot(h)? {
+                return Ok(Some((*f, s)));
             }
-            devs.insert(p.port - 1, device_from_name(&p.device)?);
         }
-        let chain = col.chain(id)?;
-        for anc in &chain[..chain.len() - 1] {
-            for l in &col.replays[*anc].lines {
-                if let Command::Device { port, device } = l.command {
-                    devs.insert(port, device);
-                }
-            }
-        }
-        Ok(devs)
+        Ok(None)
+    }
+
+    /// Frames inside `id` (started from `start_hash`) that have a stored snapshot.
+    pub fn stored_frames(&self, col: &Collection, id: &str, start_hash: &str) -> Result<Vec<u64>> {
+        let Some(c) = &self.cache else { return Ok(vec![]) };
+        let key = self.content_key(col, id, start_hash)?;
+        Ok(c.stored_frames(&key)?.into_iter().map(|(f, _)| f).collect())
     }
 
     pub fn state_hash(&mut self, col: &Collection) -> Result<String> {
@@ -153,17 +234,24 @@ impl Session {
 
     /// Plays one replay from the core's current state.
     pub fn play(&mut self, col: &Collection, id: &str, start_frame: u64, opts: &PlayOptions) -> Result<ReplayResult> {
+        let mut rec = self.begin(col, id, start_frame, opts)?;
+        while !self.advance(col, &mut rec, false)? {}
+        self.finish(col, rec)
+    }
+
+    /// Starts playing `id` from the core's current state. Call `advance` until it returns
+    /// true, then `finish`.
+    pub fn begin(&mut self, col: &Collection, id: &str, start_frame: u64, opts: &PlayOptions) -> Result<Recorder> {
         let r = &col.replays[id];
         let frames = r.frames()?;
-        for (port, dev) in self.devices_at_start(col, id)? {
-            self.core.set_port_device(port, dev);
+        let devices = devices_at_start(col, id)?;
+        for (port, dev) in &devices {
+            self.core.set_port_device(*port, *dev);
         }
         self.core.clear_inputs();
         self.core.coverage_clear();
-
         let start_hash = self.state_hash(col)?;
         let wanted_checkpoints: Vec<u64> = r.checkpoints()?.into_iter().map(|(f, _)| f).collect();
-        let mut checkpoints = vec![];
         let mut shots_wanted: Vec<u64> = opts.extra_shots.clone();
         for l in &r.lines {
             if matches!(l.command, Command::Screenshot) {
@@ -173,53 +261,140 @@ impl Session {
         if opts.end_screenshot && frames > 0 {
             shots_wanted.push(frames - 1);
         }
-        let mut screenshots = vec![];
-        let mut li = 0;
-        let mut impulses: Vec<InputKey> = vec![];
-        for f in 0..frames {
-            if wanted_checkpoints.contains(&f) {
-                checkpoints.push((f, self.state_hash(col)?));
+        let record = opts.record && self.cache.is_some();
+        let (mut store_at, mut preview_at) = (BTreeSet::new(), BTreeSet::new());
+        let (mut key, mut body, mut seen) = (String::new(), String::new(), vec![]);
+        if let (true, Some(c)) = (record, &self.cache) {
+            let st = &c.settings;
+            body = cache::body_hash(r, &devices)?;
+            key = cache::content_key(&self.setup_id, &start_hash, &body);
+            store_at.insert(0);
+            if st.diff_every > 0 {
+                store_at.extend((st.diff_every..frames).step_by(st.diff_every as usize));
             }
-            while li < r.lines.len() && r.lines[li].frame == f {
-                let line = &r.lines[li];
-                li += 1;
-                match &line.command {
-                    Command::Input { key, value, impulse } => {
-                        self.core.set_input(*key, *value);
-                        if *impulse {
-                            impulses.push(*key);
-                        }
-                    }
-                    Command::Device { port, device } => self.core.set_port_device(*port, *device),
-                    Command::Write { region, address, bytes } => self.write(region, *address, bytes).with_context(|| format!("line {}", line.line_no))?,
-                    Command::Event { .. } | Command::Screenshot => {}
-                    Command::Reset => self.core.reset(),
-                    Command::Rng { .. } => bail!("line {}: [RNG] is reserved and not supported by this player yet", line.line_no),
-                }
+            let markers: Vec<u64> = cache::marker_frames(r).into_iter().filter(|f| *f < frames).collect();
+            if st.diff_at_markers {
+                store_at.extend(markers.iter().copied());
             }
-            let capture = shots_wanted.contains(&f);
-            if let Some(frame) = self.core.run_frame(capture) {
-                screenshots.push((f, frame));
+            if st.preview_start && frames > 0 {
+                preview_at.insert(0);
             }
-            for k in impulses.drain(..) {
-                self.core.set_input(k, 0);
+            if st.preview_markers {
+                preview_at.extend(markers.iter().copied());
+            }
+            for reg in self.core.coverage_regions() {
+                seen.push((reg.name, reg.flags));
             }
         }
+        Ok(Recorder {
+            id: id.to_string(),
+            start_frame,
+            frames,
+            f: 0,
+            start_hash,
+            wanted_checkpoints,
+            checkpoints: vec![],
+            shots_wanted,
+            screenshots: vec![],
+            record,
+            key,
+            body,
+            store_at,
+            preview_at,
+            rec: Recording::default(),
+            seen,
+            last_frame: None,
+        })
+    }
+
+    /// Runs the recorder's next frame. `show` captures its video into `last_frame`.
+    /// Returns true when the segment has no frames left.
+    pub fn advance(&mut self, col: &Collection, rec: &mut Recorder, show: bool) -> Result<bool> {
+        if rec.f >= rec.frames {
+            return Ok(true);
+        }
+        let f = rec.f;
+        if rec.wanted_checkpoints.contains(&f) {
+            let h = self.state_hash(col)?;
+            rec.checkpoints.push((f, h));
+        }
+        if rec.record && rec.store_at.contains(&f) {
+            let h = self.state_hash(col)?;
+            let s = self.core.serialize()?;
+            rec.rec.snapshots.push((f, h, s));
+        }
+        let want_shot = rec.shots_wanted.contains(&f);
+        let want_preview = rec.record && rec.preview_at.contains(&f);
+        let out = self.step(col, &rec.id, f, show || want_shot || want_preview)?;
+        if let Some(frame) = out {
+            if want_shot {
+                rec.screenshots.push((f, frame.clone()));
+            }
+            if want_preview {
+                let previews = self.cache.as_ref().map(|c| c.settings.previews).unwrap_or(cache::Previews::Thumb);
+                let role = if f == 0 { "start" } else { "marker" };
+                rec.rec.images.push((f, role, cache::encode_png(&frame, previews)?));
+            }
+            if show {
+                rec.last_frame = Some(frame);
+            }
+        }
+        if rec.record {
+            // First frame each ROM byte ran as an opcode, within this segment.
+            for i in 0..rec.seen.len() {
+                let Some(cur) = self.core.coverage_slice(i) else { continue };
+                let (name, seen) = &mut rec.seen[i];
+                if seen.len() < cur.len() {
+                    seen.resize(cur.len(), 0);
+                }
+                for (ci, (a, b)) in cur.chunks(64).zip(seen.chunks_mut(64)).enumerate() {
+                    if a == b {
+                        continue;
+                    }
+                    for (j, (x, y)) in a.iter().zip(b.iter_mut()).enumerate() {
+                        if x & crate::coverage::FLAG_OPCODE != 0 && *y & crate::coverage::FLAG_OPCODE == 0 {
+                            rec.rec.first_hits.push((name.clone(), (ci * 64 + j) as u64, f));
+                        }
+                        *y = *x;
+                    }
+                }
+            }
+        }
+        rec.f += 1;
+        Ok(rec.f >= rec.frames)
+    }
+
+    /// Ends a played segment: end hash, coverage, and (when recording) the database rows.
+    pub fn finish(&mut self, col: &Collection, mut rec: Recorder) -> Result<ReplayResult> {
         let end_hash = self.state_hash(col)?;
         let ticks = if col.config.tick.is_some() { self.core.tick_count() } else { None };
         let coverage = self.core.coverage_regions();
         let end_state = self.core.serialize()?;
+        let has_children = !col.children(Some(&rec.id)).is_empty();
+        let poked = col.replays[&rec.id].is_poked();
+        if let Some(c) = &mut self.cache {
+            if rec.record {
+                if has_children {
+                    rec.rec.snapshots.push((rec.frames, end_hash.clone(), end_state.clone()));
+                }
+                rec.rec.coverage = coverage.iter().map(|r| (r.name.clone(), r.flags.clone())).collect();
+                let row = ContentRow { key: rec.key.clone(), segment_id: rec.id.clone(), start_hash: rec.start_hash.clone(), end_hash: end_hash.clone(), body: rec.body.clone(), frames: rec.frames, ticks };
+                c.record(&row, &rec.rec)?;
+            } else if has_children {
+                c.put_snapshot(&end_hash, &end_state)?;
+            }
+        }
         Ok(ReplayResult {
-            id: id.to_string(),
-            start_frame,
-            frames,
-            start_hash,
+            id: rec.id,
+            start_frame: rec.start_frame,
+            frames: rec.frames,
+            start_hash: rec.start_hash,
             end_hash,
-            checkpoints,
+            checkpoints: rec.checkpoints,
             ticks,
-            poked: r.is_poked(),
+            poked,
             coverage,
-            screenshots,
+            screenshots: rec.screenshots,
             end_state,
         })
     }
@@ -275,7 +450,6 @@ impl Session {
             if !col.children(Some(id)).is_empty() {
                 end_states.insert(id.clone(), (result.end_state.clone(), result.start_frame + result.frames));
             }
-            self.save_cached_state(&result)?;
             each(self, &result)?;
         }
         Ok(())
@@ -303,10 +477,9 @@ impl Session {
         }
         let mut results = vec![];
         for (i, c) in chain.iter().enumerate().skip(start_at) {
-            let o = if i == chain.len() - 1 { opts.clone() } else { PlayOptions::default() };
+            let o = if i == chain.len() - 1 { opts.clone() } else { PlayOptions { record: opts.record, ..Default::default() } };
             let res = self.play(col, c, start_frame, &o)?;
             start_frame += res.frames;
-            self.save_cached_state(&res)?;
             results.push(res);
         }
         Ok(results)
@@ -319,7 +492,7 @@ impl Session {
     /// start frame counted from power-on.
     pub fn enter_replay(&mut self, col: &Collection, id: &str) -> Result<u64> {
         let chain: Vec<String> = col.chain(id)?.into_iter().map(String::from).collect();
-        let quiet = PlayOptions::default();
+        let quiet = PlayOptions { record: true, ..Default::default() };
         let mut start_frame = trunk_start_frame(&col.replays[&chain[0]]);
         if chain.len() == 1 {
             self.start_trunk(col, &col.replays[&chain[0]])?;
@@ -392,29 +565,16 @@ impl Session {
         self.core.serialize()
     }
 
-    fn save_cached_state(&self, res: &ReplayResult) -> Result<()> {
-        let dir = self.state_cache_dir();
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join(format!("{}.state", res.id)), &res.end_state)?;
-        std::fs::write(dir.join(format!("{}.hash", res.id)), &res.end_hash)?;
-        Ok(())
-    }
-
-    /// A cached end state is used only if it matches the replay's recorded end-hash.
+    /// The stored end state of `id`, used only while `id` is clean and the stored state
+    /// has the hash its file records.
     pub fn load_cached_state(&self, col: &Collection, id: &str) -> Result<Option<Vec<u8>>> {
-        let dir = self.state_cache_dir();
-        let (sp, hp) = (dir.join(format!("{id}.state")), dir.join(format!("{id}.hash")));
-        if !sp.exists() || !hp.exists() {
+        let Some(c) = &self.cache else { return Ok(None) };
+        if col.tree_status(id) != Status::Clean {
             return Ok(None);
         }
-        // A branch above may have been edited (in memory, or on disk since the cache was made).
-        if col.tree_status(id) != crate::collection::Status::Clean {
-            return Ok(None);
-        }
-        let cached_hash = std::fs::read_to_string(hp)?;
         match col.replays[id].get("end-hash") {
-            Some(h) if h == cached_hash.trim() => Ok(Some(std::fs::read(sp)?)),
-            _ => Ok(None),
+            Some(h) => c.get_snapshot(h),
+            None => Ok(None),
         }
     }
 }
