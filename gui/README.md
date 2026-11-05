@@ -104,6 +104,39 @@ Later: merge a node into its children (its inputs go at the start of each child,
 hash changes; with one child, this is the inverse of Split). Another option is moving
 the children up to the grandparent, which turns everything below dirty. Neither is planned yet.
 
+## Marker list (implemented)
+
+The left sidebar has two tabs, **Nodes** (the tree) and **Markers**. Markers lists every
+event in the collection alphabetically, then RAM writes, resets, device changes and RNG
+lines. Each row shows the frame and the node (with its parent when another node has the
+same title), and the filter matches marker text and node titles. Clicking a row selects
+the node and seeks to the frame. This lets markers do the job of tiny nodes that only
+exist to name a moment. Checkpoints and screenshots aren't listed, since they have no
+names. Ideas: group repeated texts, follow the tree's Focus here, and list a marker's
+"first frame where a watched value differs" once that exists.
+
+## Joining nodes (implemented: join with parent)
+
+Joining a node to its parent keeps every frame and input in the same order, so the
+emulator does exactly the same thing and every hash below stays valid.
+
+**Join with parent** (Node menu and right-click, on a node whose parent has only that
+child) asks first. The parent keeps its id and title and grows by the child's frames. The
+child's lines move by the parent's length (inputs the parent still held are released at
+the join, as a node start would), the child's children move up, and the end hash comes
+from the child. The child's start hash becomes a checkpoint at the join frame. The dialog
+has "Leave a marker", on by default, with an editable text that starts as the child's
+title: an event at the join frame keeps whatever moment made the author split there
+("menu fully open", "victory pose finished"). Undo splits them again.
+
+Not done yet:
+
+2. **Join with only child** (same operation, offered on the parent).
+3. **Merge into children** (the parent has several children): copy the parent's frames
+   onto the front of every child, then remove the parent. No hash changes, but the frames
+   are duplicated in each child.
+4. **Join a chain**: select a run of only-children in the tree and join them all at once.
+
 ## Other known gaps
 
 - Only button inputs get rows. Analog, lightgun and pointer inputs show as ticks
@@ -112,6 +145,6 @@ the children up to the grandparent, which turns everything below dirty. Neither 
 - Only one core runs at a time. Showing two cores side by side will need a second
   process, because a libretro core has global state.
 - There is no warning before you lose unsaved edits (on Open, Reload or Quit).
-- Nodes can't be moved or merged from the GUI yet.
+- Nodes can't be moved from the GUI yet.
 - A long load cannot be cancelled except by selecting another node. MAX speed still runs on the UI thread.
 - Tested on Linux and macOS (build only); Windows has not been tried.

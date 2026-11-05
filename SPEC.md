@@ -10,9 +10,35 @@ Status: draft v1. The headless player (`emucov`) and the desktop editor
 (`emucov-gui`) in this repository implement everything here except items
 marked **(reserved)**, which files may carry but the tools do not act on yet.
 
-Terms: a **replay** file is one **node** of the tree (the GUI says "node").
-A **trunk** has no parent. A **branch** is any node with children, and a
-**leaf** has none.
+## Terminology
+
+These are the working terms (open to change). The file format and the tools still
+use the older words in places ("replay" for segment, "node" in the GUI, "save
+state" for snapshot). They'll be renamed together.
+
+| Term | Meaning |
+|---|---|
+| **Segment** | One replay file: inputs by frame, metadata, hashes and a parent link. It is one entry in the GUI's sidebar tree. (Formerly "replay" in this spec and "node" in the GUI.) |
+| **Root segment** | A segment with no parent. It starts from power-on, or from a save or snapshot blob. (Formerly "trunk".) |
+| **Child segment / children** | Segments that start where their parent ends. A segment with no children is a leaf. |
+| **Snapshot** | A serialized emulator state, more or less a "save state". It may leave out memory that doesn't help the tools. |
+| **Diff** | A patch from one snapshot to a later one, storing only what changed. |
+| **Save** | Only the game's own saves: SRAM, memory cards and cartridge save chips. Never an emulator save state. |
+| **Marker** | A named point in a segment: an `[EVENT]`, or another line the GUI shows in the marker lane (writes, resets, device changes). |
+| **Macro** | Future: anything an author can script, for example RNG manipulation or pokes, kept locally and referred to by name. |
+| **Hydrate** | Play a collection (or part of it) to fill the local database with snapshots, diffs, previews and coverage. |
+| **Content key** | A hash of a segment's setup, start state and inputs. Derived data in the local database is filed under it (see CACHE_PLAN.md). |
+| **Baseline** | The collection's reference core (the original emulator) and the results it produces from the inputs. Also called the oracle. There is one per collection, and it rarely changes. |
+| **Comparison core** | Any other core played against the baseline with the same inputs, usually a decomp built as a libretro core, but possibly another emulator. Working name; "candidate" is another option. A collection can list more than one. |
+| **Coverage** | An instruction or block counts as covered when at least one clean segment executed it. Dirty segments don't count. Shown **green**, the same green as a clean segment. |
+| **Uncovered** | In the ROM, not executed by any clean segment, and not marked unreachable. This is where the next segments should go. Shown in the default text color. |
+| **Parity** | A comparison core matched the baseline every time the baseline executed an instruction or block. Shown **purple**. If parity hasn't been checked, a covered block stays green. |
+| **No parity** | A comparison core has been shown to differ from the baseline at an instruction or block. Shown **red**. |
+| **Unreachable** | An instruction or block that is in the ROM but has been determined to be unreachable. Kept in version control (section 11). Shown **blue**. |
+
+Colors in summary: green = covered, purple = parity, red = no parity, blue =
+unreachable, default = uncovered. These are the same in the GUI, reports and any
+export.
 
 ## 1. Collection layout
 
@@ -400,3 +426,73 @@ part, so that a second path starts at the cut.
 **Properties.** Changing `title` changes no state. Changing `frames` drops the
 `end-hash` and any checkpoints past the new end. A replay cannot be shortened
 past its last body line.
+
+## 11. Future directions (notes, not part of format v1)
+
+- **Local database.** Everything derived from playing a collection goes into a local
+  store that isn't in version control: save states, RAM snapshots and diffs, PNG
+  previews of node starts, ends and markers, block and instruction coverage, and cross
+  references from code to the replays and frames that run it. Authors and
+  collaborators fill it on their own machines, and agents query it while decompiling.
+  SRAM that a trunk starts from stays in `blobs/` (section 4), which is in version
+  control. See CACHE_PLAN.md.
+- **Macros and Lua scripts** for active RNG manipulation and pokes, instead of long
+  runs of `[WRITE]` lines. They would be stored locally, and replays would refer to
+  them by name, as `[RNG]` (section 3.7) already reserves.
+- **Coverage in the GUI:** show coverage, and test for new coverage in real time
+  while playing.
+- **Comparison cores in the collection.** The baseline stays fixed, but a collection
+  can list several comparison cores (for example two decomps, or a decomp and
+  another emulator) in `collection.toml`, in version control, each with a name and
+  the core it uses. Parity is tracked per comparison core.
+- **Side-by-side comparison** with a second libretro instance, namely a decompilation
+  built as a core. Its video output may or may not match. The same inputs drive both,
+  and the GUI compares state hashes and video.
+- **Run and check everything from the GUI:** play the whole tree (or the dirty nodes),
+  check every RAM hash, and list the nodes that no longer match.
+- **Terminology.** Rename the format, the tools and the docs to the terms in the
+  Terminology section (segment, snapshot, root segment, and so on).
+- **Shorter replay ids.** Replace UUIDs with something short enough to quote in docs
+  and commit messages, for example 8 characters of base32 (40 bits). Tools must check
+  the new id against every id in the collection when generating one, and try again on
+  a collision. A tool that finds two files with the same id refuses to load the
+  collection. Existing UUIDs stay valid, and the CLI already accepts unique prefixes.
+- **Running without a database** must keep working the way the tools work today. The
+  local database speeds things up, and nothing requires it. Partial hydration is
+  normal (one segment, or a segment and its children), and hydration can be watched
+  live, paused and stopped. A "hydrate and clean" run re-plays dirty segments and
+  reports the ones that no longer match. See CACHE_PLAN.md, "Hydrating".
+- **To discuss: emulator vs decomp mismatches.** When the decomp core and the
+  emulator disagree (state hash, RAM, or video), the comparison should stop ticking
+  and report the first difference it caught: the frame, the regions or addresses
+  that differ, and both values. It should not try to resynchronize. Open questions:
+  - What counts as a match when the decomp's RAM layout differs from the original
+    game's (a map between addresses, or only watched values)?
+  - Should video differences stop the run, or only be logged?
+- **Unreachable code file.** Plan how authors mark code as unreachable, in a form that
+  goes in version control. Likely a text file (for example `unreachable.txt`) with
+  one ROM address range per line and `#` comments explaining why. Reports and the
+  GUI show these ranges in blue and leave them out of the uncovered count.
+- **Dirty segments don't count toward coverage.** A segment's coverage only counts
+  while the segment is clean. Recomputing instruction-level coverage on every edit
+  may be too slow for the GUI. One option is to keep coverage per segment and per
+  function or larger executable block, sum it in a cache, and update only the sums
+  for segments whose clean or dirty status changed.
+- **An MCP server** for agents doing decomp work. It would cover where a block first
+  runs, the nearest snapshot to trace from, coverage and parity per function, and
+  running a segment. The CLI gets the same abilities, including checking parity for
+  a single segment (`emucov parity <segment> --against <comparison core>`).
+- **Open question: how parity is checked.** Nothing is decided yet. The options are:
+  - **RAM while stepping.** Run both cores frame by frame and compare RAM (or the
+    watched regions) after each frame. It's cheap, and it works with any core. A
+    block run on a frame where everything matched gets parity. A mismatch flags
+    everything executed on that frame as a suspect, but doesn't say which block
+    caused it. It also needs the decomp's RAM layout to match, or an address map.
+  - **Tracing.** Hook function entry and exit in both cores (using the symbol maps)
+    and compare arguments, return values and memory writes for each call. It finds
+    the exact function that diverges, but it's costly, and it needs a mapping
+    between baseline addresses and decomp functions.
+  - A likely path is RAM while stepping to find the first frame that differs, then
+    tracing just that frame to find the function. That also fits the plan of
+    stopping at the first mismatch and reporting it.
+

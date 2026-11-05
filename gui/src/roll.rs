@@ -120,8 +120,9 @@ pub struct RollState {
     pub all_buttons: bool,
     /// Show marker text in the lane (otherwise only symbols).
     pub labels: bool,
-    /// Rows in the marker lane; more rows leave more room for labels.
-    pub lane_rows: usize,
+    /// Marker lane expanded: every marker gets room for its whole label,
+    /// events in the top rows and everything else (RAM writes, resets, ...) below.
+    pub markers_open: bool,
     open: HashMap<(u32, u32), bool>,
     gen: u64,
     model: Option<Model>,
@@ -136,7 +137,7 @@ pub struct RollState {
 
 impl Default for RollState {
     fn default() -> Self {
-        RollState { px_per_frame: 4.0, scroll_x: 0.0, scroll_y: 0.0, follow: true, all_buttons: false, labels: true, lane_rows: 1, open: HashMap::new(), gen: 0, model: None, drag: None, mode: Mode::Draw, sel: BTreeSet::new(), gesture: None, scrubbing: false, jump_to: None }
+        RollState { px_per_frame: 4.0, scroll_x: 0.0, scroll_y: 0.0, follow: true, all_buttons: false, labels: true, markers_open: false, open: HashMap::new(), gen: 0, model: None, drag: None, mode: Mode::Draw, sel: BTreeSet::new(), gesture: None, scrubbing: false, jump_to: None }
     }
 }
 
@@ -282,6 +283,25 @@ fn span_at(spans: &[(u64, u64)], f: u64) -> Option<(u64, u64)> {
     spans.iter().copied().find(|s| s.0 <= f && f < s.1)
 }
 
+/// A marker box in the lane: its frame and x, lane row, the markers it stands for (the
+/// first is drawn), and how many of those were hidden because they sat too close.
+struct MBox {
+    frame: u64,
+    x: f32,
+    row: usize,
+    ixs: Vec<usize>,
+    hidden: usize,
+}
+
+/// A marker label cut to `LABEL_CHARS`.
+fn short_label(t: &str) -> String {
+    if t.chars().count() > LABEL_CHARS {
+        t.chars().take(LABEL_CHARS - 1).collect::<String>() + "…"
+    } else {
+        t.to_string()
+    }
+}
+
 fn tick_step(px_per_frame: f32) -> u64 {
     for s in [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200, 18000, 36000] {
         if s as f32 * px_per_frame >= 64.0 {
@@ -379,15 +399,6 @@ impl RollState {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.checkbox(&mut self.all_buttons, "all buttons");
                 ui.checkbox(&mut self.labels, "labels");
-                if ui.small_button("+").on_hover_text("More marker rows").clicked() {
-                    self.lane_rows = (self.lane_rows + 1).min(8);
-                }
-                ui.label(format!("{}", self.lane_rows)).on_hover_text("Marker rows");
-                if ui.small_button("−").on_hover_text("Fewer marker rows").clicked() {
-                    self.lane_rows = self.lane_rows.saturating_sub(1).max(1);
-                }
-                ui.label(egui::RichText::new("marker rows").weak());
-                ui.separator();
                 ui.checkbox(&mut self.follow, "follow");
                 if ui.small_button("fit").on_hover_text("Fit the whole replay").clicked() {
                     let w = (ui.available_width() + 200.0 - LABEL_W).max(100.0);
@@ -408,7 +419,42 @@ impl RollState {
         let painter = ui.painter_at(rect);
         let tl_left = rect.left() + LABEL_W;
         let tl_w = (rect.right() - tl_left).max(1.0);
-        let lane_h = MARK_H * self.lane_rows as f32;
+        let font = FontId::proportional(11.0);
+        let measure = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x;
+        // Expanded lane: each marker gets a row with room for its whole label, worked out in
+        // pixels from the start of the node, so rows don't change while scrolling.
+        // Events take the top rows; RAM writes and everything else go below them.
+        let mut exp_row = vec![0usize; m.markers.len()];
+        let mut event_rows = 0;
+        let mut lane_rows = 1;
+        if self.markers_open && !m.markers.is_empty() {
+            const MAX_ROWS: usize = 12;
+            let mut base = 0;
+            for events in [true, false] {
+                let mut ends: Vec<f32> = vec![];
+                for (i, mk) in m.markers.iter().enumerate().filter(|(_, mk)| (mk.glyph == "⚑") == events) {
+                    let x = mk.frame as f32 * self.px_per_frame;
+                    let label = short_label(&mk.label);
+                    let want = if !self.labels || label.is_empty() { 10.0 } else { 14.0 + measure(&label) };
+                    let r = match ends.iter().position(|e| *e <= x - 6.0) {
+                        Some(r) => r,
+                        None if ends.len() < MAX_ROWS => {
+                            ends.push(f32::NEG_INFINITY);
+                            ends.len() - 1
+                        }
+                        None => (0..ends.len()).min_by(|a, b| ends[*a].total_cmp(&ends[*b])).unwrap(),
+                    };
+                    ends[r] = x + want;
+                    exp_row[i] = base + r;
+                }
+                if events {
+                    event_rows = ends.len();
+                }
+                base += ends.len();
+            }
+            lane_rows = base.max(1);
+        }
+        let lane_h = MARK_H * lane_rows as f32;
         let rows_top = rect.top() + RULER_H + lane_h;
         let ppf = self.px_per_frame;
 
@@ -480,61 +526,78 @@ impl RollState {
         let f0 = self.scroll_x.floor().max(0.0) as u64;
         let f1 = ((self.scroll_x + view_frames).ceil().max(0.0) as u64 + 1).min(m.frames);
 
-        // Marker layout: markers on one frame share a box. Boxes go into the first lane
-        // row with room for their whole label; a label then runs until the next box in its row.
+        // Marker boxes. Collapsed: one row; markers on one frame share a box, and a box too
+        // close to the one before is hidden behind whichever matters more (events first),
+        // which then shows "+N". Expanded: one box per marker, in the rows worked out above.
+        // Either way a label runs until the next box in its row.
         let my = rect.top() + RULER_H + MARK_H * 0.5;
         let row_y = |r: usize| rect.top() + RULER_H + MARK_H * (r as f32 + 0.5);
-        let mut boxes: Vec<(u64, f32, Vec<usize>)> = vec![];
-        let a0 = m.markers.partition_point(|mk| mk.frame < f0);
+        let prio = |mk: &Marker| match mk.glyph {
+            "⚑" => 3,
+            "✔" => 0,
+            "▣" => 1,
+            _ => 2,
+        };
+        let mut boxes: Vec<MBox> = vec![];
+        let a0 = m.markers.partition_point(|mk| mk.frame < f0.saturating_sub(1));
         for (i, mk) in m.markers.iter().enumerate().skip(a0) {
             if mk.frame > f1 {
                 break;
             }
             let x = x_of(mk.frame as f32 + 0.5 * (ppf >= 4.0) as u8 as f32).max(tl_left + 6.0);
+            if self.markers_open {
+                boxes.push(MBox { frame: mk.frame, x, row: exp_row[i], ixs: vec![i], hidden: 0 });
+                continue;
+            }
+            // Room for a glyph and "+N", so a hidden marker always shows up in a count.
+            const GAP: f32 = 30.0;
             match boxes.last_mut() {
-                Some(b) if b.0 == mk.frame || x - b.1 < 3.0 => b.2.push(i),
-                _ => boxes.push((mk.frame, x, vec![i])),
+                Some(b) if b.frame == mk.frame || x - b.x < 3.0 => b.ixs.push(i),
+                Some(b) if x - b.x < GAP => {
+                    let best = |b: &MBox| b.ixs.iter().map(|j| prio(&m.markers[*j])).max().unwrap_or(0);
+                    if prio(mk) > best(b) {
+                        // The new marker matters more: it takes the place of the last box.
+                        let n = b.ixs.len() + b.hidden;
+                        let mut ixs = std::mem::take(&mut b.ixs);
+                        ixs.insert(0, i);
+                        *b = MBox { frame: mk.frame, x, row: 0, ixs, hidden: n };
+                    } else {
+                        b.ixs.push(i);
+                        b.hidden += 1;
+                    }
+                }
+                _ => boxes.push(MBox { frame: mk.frame, x, row: 0, ixs: vec![i], hidden: 0 }),
             }
         }
-        let font = FontId::proportional(11.0);
-        let measure = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x;
-        // Full label text and colour for each box.
-        let texts: Vec<(String, Color32)> = boxes
+        // Label text and colour for each box: the most telling marker's label, then "+N".
+        let texts: Vec<(String, String, Color32)> = boxes
             .iter()
-            .map(|(_, _, ixs)| {
-                if !self.labels {
-                    return (String::new(), Color32::WHITE);
-                }
-                let mut named: Vec<&Marker> = ixs.iter().map(|i| &m.markers[*i]).filter(|mk| !mk.label.is_empty()).collect();
-                // An author's event text says the most, so it goes first.
-                named.sort_by_key(|mk| mk.glyph != "⚑");
-                let mut text = named.first().map(|mk| mk.label.clone()).unwrap_or_default();
-                if ixs.len() > 1 {
-                    text = format!("({}) {text}", ixs.len()).trim_end().to_string();
-                }
-                if text.chars().count() > LABEL_CHARS {
-                    text = text.chars().take(LABEL_CHARS - 1).collect::<String>() + "…";
-                }
-                (text, named.first().map_or(m.markers[ixs[0]].color, |mk| mk.color))
+            .map(|b| {
+                let mut named: Vec<&Marker> = b.ixs.iter().map(|i| &m.markers[*i]).collect();
+                named.sort_by_key(|mk| (std::cmp::Reverse(prio(mk)), mk.label.is_empty()));
+                let lead = named[0];
+                // Markers on the box's own frame beyond the first, plus hidden neighbours.
+                let extra = if self.markers_open { 0 } else { b.ixs.len() - 1 };
+                let more = if extra > 0 { format!("+{extra}") } else { String::new() };
+                let text = if self.labels { short_label(&lead.label) } else { String::new() };
+                (more, text, lead.color)
             })
             .collect();
-        let rows = self.lane_rows.max(1);
-        let mut row_end = vec![f32::NEG_INFINITY; rows];
-        let mut box_row = vec![0usize; boxes.len()];
-        for (bi, (_, x, _)) in boxes.iter().enumerate() {
-            let want = if texts[bi].0.is_empty() { 8.0 } else { 14.0 + measure(&texts[bi].0) };
-            let r = (0..rows).find(|r| row_end[*r] <= x - 6.0).unwrap_or_else(|| (0..rows).min_by(|a, b| row_end[*a].total_cmp(&row_end[*b])).unwrap());
-            box_row[bi] = r;
-            row_end[r] = x + want;
-        }
         let mut marker_rects: Vec<(Rect, usize)> = vec![];
         let mut marker_labels: Vec<(f32, f32, String, Color32)> = vec![];
-        for (bi, (_, x, _)) in boxes.iter().enumerate() {
-            let r = box_row[bi];
-            let next_x = boxes.iter().enumerate().skip(bi + 1).find(|(j, _)| box_row[*j] == r).map_or(rect.right(), |(_, b)| b.1);
+        for (bi, b) in boxes.iter().enumerate() {
+            let x = &b.x;
+            let r = b.row;
+            let next_x = boxes.iter().skip(bi + 1).find(|o| o.row == r).map_or(rect.right(), |o| o.x);
             let mut right = *x + 7.0;
-            let (mut text, c) = texts[bi].clone();
-            let avail = next_x - x - 14.0;
+            let (more, mut text, c) = texts[bi].clone();
+            // The "+N" count stays whole; only the label is cut short.
+            let pre = if more.is_empty() { 0.0 } else { measure(&format!("{more} ")) };
+            if !more.is_empty() && pre - 3.0 <= next_x - x - 12.0 {
+                marker_labels.push((*x + 8.0, row_y(r), more.clone(), Color32::from_gray(190)));
+                right = *x + 8.0 + pre;
+            }
+            let avail = next_x - x - 14.0 - pre;
             if !text.is_empty() && avail > 14.0 {
                 let mut full = measure(&text);
                 while full > avail && text.chars().count() > 1 {
@@ -547,8 +610,8 @@ impl RollState {
                     }
                 }
                 if full <= avail {
-                    marker_labels.push((*x + 8.0, row_y(r), text, c));
-                    right = *x + 10.0 + full;
+                    marker_labels.push((*x + 8.0 + pre, row_y(r), text, c));
+                    right = *x + 10.0 + pre + full;
                 }
             }
             let top = rect.top() + RULER_H + MARK_H * r as f32;
@@ -638,8 +701,10 @@ impl RollState {
         let header_at = |p: Pos2| hit(p).is_some_and(|ix| matches!(items[ix].2, Item::Header(_)));
         if pressed && resp.hovered() {
             if let Some(p) = pointer {
-                if let Some(bi) = marker_at(p) {
-                    action = Some(Action::OpenFrame(boxes[bi].0));
+                if p.x < tl_left && p.y >= rect.top() + RULER_H && p.y < rect.top() + RULER_H + MARK_H {
+                    self.markers_open = !self.markers_open;
+                } else if let Some(bi) = marker_at(p) {
+                    action = Some(Action::OpenFrame(boxes[bi].frame));
                 } else if p.y < rows_top && p.x >= tl_left {
                     self.scrubbing = true;
                 } else if self.mode == Mode::Select && p.x >= tl_left && !header_at(p) {
@@ -989,9 +1054,10 @@ impl RollState {
 
         // Markers lane.
         let mut hover_text: Option<String> = None;
-        for (bi, (_, x, ixs)) in boxes.iter().enumerate() {
-            let first = &m.markers[ixs[0]];
-            let y = row_y(box_row[bi]);
+        for b in &boxes {
+            let first = b.ixs.iter().map(|i| &m.markers[*i]).max_by_key(|mk| prio(mk)).unwrap();
+            let x = &b.x;
+            let y = row_y(b.row);
             grid.line_segment([Pos2::new(*x, y + MARK_H * 0.5), Pos2::new(*x, rect.bottom())], Stroke::new(1.0, first.color.gamma_multiply(0.35)));
             grid.text(Pos2::new(*x, y), Align2::CENTER_CENTER, first.glyph, FontId::proportional(12.0), first.color);
         }
@@ -999,7 +1065,7 @@ impl RollState {
             grid.text(Pos2::new(*x, *y), Align2::LEFT_CENTER, text, font.clone(), *c);
         }
         if let Some(bi) = pointer.and_then(marker_at) {
-            let (f, _, ixs) = &boxes[bi];
+            let (f, ixs) = (&boxes[bi].frame, &boxes[bi].ixs);
             let lines: Vec<String> = ixs.iter().map(|i| format!("frame {}: {}", m.markers[*i].frame, m.markers[*i].text)).collect();
             hover_text = Some(format!("{}\nclick to edit frame {f}", lines.join("\n")));
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1060,7 +1126,23 @@ impl RollState {
         let lp = painter.with_clip_rect(Rect::from_min_max(rect.min, Pos2::new(tl_left, rect.bottom())));
         lp.rect_filled(Rect::from_min_max(rect.min, Pos2::new(tl_left, rect.bottom())), 0.0, Color32::from_gray(28));
         lp.text(Pos2::new(rect.left() + 6.0, rect.top() + RULER_H * 0.5), Align2::LEFT_CENTER, "frame", FontId::proportional(11.0), Color32::from_gray(120));
-        lp.text(Pos2::new(rect.left() + 6.0, my), Align2::LEFT_CENTER, "markers", FontId::proportional(11.0), Color32::from_gray(120));
+        let lane_label = format!("{} markers", if self.markers_open { "⏷" } else { "⏵" });
+        lp.text(Pos2::new(rect.left() + 10.0, my), Align2::LEFT_CENTER, lane_label, FontId::proportional(12.0), Color32::from_gray(200));
+        let n_markers = m.markers.len();
+        if n_markers > 0 {
+            lp.text(Pos2::new(tl_left - 6.0, my), Align2::RIGHT_CENTER, n_markers.to_string(), FontId::monospace(10.5), Color32::from_gray(150));
+        }
+        if self.markers_open && event_rows > 0 && lane_rows > event_rows {
+            lp.text(Pos2::new(rect.left() + 26.0, row_y(event_rows)), Align2::LEFT_CENTER, "writes, other", FontId::proportional(11.0), Color32::from_gray(120));
+        }
+        if self.markers_open {
+            // Faint lines between lane rows, and a stronger one between events and the rest.
+            for r in 1..lane_rows {
+                let y = rect.top() + RULER_H + MARK_H * r as f32;
+                let c = if r == event_rows { Color32::from_gray(55) } else { Color32::from_gray(36) };
+                painter.line_segment([Pos2::new(tl_left, y), Pos2::new(rect.right(), y)], Stroke::new(1.0, c));
+            }
+        }
         let lrows = lp.with_clip_rect(Rect::from_min_max(Pos2::new(rect.left(), rows_top), Pos2::new(tl_left, rect.bottom())));
         for (y0, y1, item) in &items {
             let top = rows_top + y0 - self.scroll_y;

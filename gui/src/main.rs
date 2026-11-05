@@ -79,8 +79,13 @@ struct App {
     tree_closed: HashSet<String>,
     /// Tree filter text: matches title, id or tags.
     filter: String,
+    /// Sidebar shows the marker list instead of the node tree.
+    markers_tab: bool,
+    marker_filter: String,
     /// The node the tree is focused on (hoisted): only it and its descendants show.
     hoist: Option<String>,
+    /// Indent every level of the tree, instead of keeping only children in their parent's column.
+    indent_all: bool,
     edited: BTreeSet<String>,
     roll: roll::RollState,
     message: Option<(String, bool)>,
@@ -96,6 +101,8 @@ struct App {
     renaming: Option<(String, String, bool)>,
     /// The node waiting for delete confirmation.
     delete_dialog: Option<String>,
+    /// Join with parent, waiting on its confirmation: (node id, leave a marker, marker text).
+    join_dialog: Option<(String, bool, String)>,
     undo: Vec<UndoStep>,
     redo: Vec<UndoStep>,
     clip: Option<Clip>,
@@ -125,6 +132,8 @@ struct UndoStep {
 }
 
 const UNDO_LIMIT: usize = 200;
+
+const JOIN_TIP: &str = "Merge this node into its parent: the parent keeps its name and grows by this node's frames. Only for a node with no siblings.";
 
 /// Copied notes: button, start relative to the leftmost copied note, and length.
 struct Clip {
@@ -162,7 +171,10 @@ impl Default for App {
             texture: None,
             tree_closed: HashSet::new(),
             filter: String::new(),
+            markers_tab: false,
+            marker_filter: String::new(),
             hoist: None,
+            indent_all: false,
             edited: BTreeSet::new(),
             roll: roll::RollState::default(),
             message: None,
@@ -173,6 +185,7 @@ impl Default for App {
             node_dialog: None,
             renaming: None,
             delete_dialog: None,
+            join_dialog: None,
             undo: vec![],
             redo: vec![],
             clip: None,
@@ -226,6 +239,96 @@ fn fold_button(ui: &mut egui::Ui, collapse: bool) -> egui::Response {
 }
 
 /// `id` and every node below it.
+/// One named marker in the collection, for the sidebar's marker list.
+struct ListedMarker<'a> {
+    id: &'a str,
+    frame: u64,
+    glyph: &'static str,
+    color: Color32,
+    text: String,
+    event: bool,
+}
+
+/// The sidebar's Markers tab: every event (then writes, resets, device changes and RNG
+/// lines) in the collection, alphabetically, with a filter on the marker and node text.
+/// Returns the node and frame to show when a row is clicked.
+fn marker_list(ui: &mut egui::Ui, col: &Collection, filter: &mut String, at: Option<(&str, u64)>) -> Option<(String, u64)> {
+    let mut all: Vec<ListedMarker> = vec![];
+    for (id, r) in &col.replays {
+        for l in &r.lines {
+            let (glyph, color, text, event) = match &l.command {
+                Command::Event { text, .. } => ("⚑", Color32::from_rgb(240, 210, 90), text.clone(), true),
+                Command::Write { region, address, bytes } => {
+                    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+                    ("✏", Color32::from_rgb(200, 120, 220), format!("{region} 0x{address:X} = {}", hex.join(" ")), false)
+                }
+                Command::Reset => ("⟲", Color32::from_rgb(230, 90, 80), "Reset".to_string(), false),
+                Command::Device { port, device } => ("◆", Color32::from_rgb(120, 200, 230), format!("P{} device {device}", port + 1), false),
+                Command::Rng { name, count } => ("🎲", Color32::from_gray(200), format!("RNG {name} {count}"), false),
+                _ => continue,
+            };
+            all.push(ListedMarker { id, frame: l.frame, glyph, color, text, event });
+        }
+    }
+    all.sort_by_cached_key(|m| (!m.event, m.text.to_lowercase(), col.replays[m.id].title().to_lowercase(), m.frame));
+    let mut pick = None;
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 22.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if !filter.is_empty() && ui.small_button("✖").on_hover_text("Clear the filter").clicked() {
+            filter.clear();
+        }
+        let w = ui.available_width();
+        ui.add(egui::TextEdit::singleline(filter).id_salt("marker_filter").hint_text("Filter: marker or node").desired_width(w));
+    });
+    let needle = filter.trim().to_lowercase();
+    let shown: Vec<&ListedMarker> = all
+        .iter()
+        .filter(|m| needle.is_empty() || m.text.to_lowercase().contains(&needle) || col.replays[m.id].title().to_lowercase().contains(&needle))
+        .collect();
+    let what = if needle.is_empty() { "markers" } else { "matching markers" };
+    ui.label(RichText::new(format!("{} {what}", shown.len())).weak().small());
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let mut was_event = true;
+        for m in shown {
+            if was_event && !m.event {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Writes and other lines").weak().small());
+                was_event = false;
+            }
+            let title = col.replays[m.id].title();
+            let here = at == Some((m.id, m.frame));
+            let path: Vec<&str> = col.chain(m.id).unwrap_or_default().iter().map(|i| col.replays[*i].title()).collect();
+            // Second line: the node, with its parent in front when another node has the same title.
+            let twin = col.replays.iter().any(|(k, r)| k != m.id && r.title() == title);
+            let place = match (twin, path.len()) {
+                (true, n) if n >= 2 => format!("frame {} · {} › {title}", m.frame, path[n - 2]),
+                _ => format!("frame {} · {title}", m.frame),
+            };
+            let resp = ui
+                .vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let r = ui
+                        .horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label(RichText::new(m.glyph).color(m.color));
+                            ui.add(egui::Button::selectable(here, RichText::new(&m.text).color(if m.event { Color32::from_gray(225) } else { m.color })).truncate())
+                        })
+                        .inner;
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        ui.add(egui::Label::new(RichText::new(place).weak().small()).truncate());
+                    });
+                    r
+                })
+                .inner;
+            ui.add_space(3.0);
+            if resp.on_hover_text(format!("{}\nframe {} of \"{title}\"\nclick to show it", path.join(" › "), m.frame)).clicked() {
+                pick = Some((m.id.to_string(), m.frame));
+            }
+        }
+    });
+    pick
+}
+
 fn subtree(col: &Collection, id: &str) -> Vec<String> {
     let mut out = vec![id.to_string()];
     let mut i = 0;
@@ -250,6 +353,34 @@ fn first_change(a: &emucov::format::Replay, b: &emucov::format::Replay) -> Optio
         (Some(l), _) | (_, Some(l)) => Some(l.frame),
         _ => None,
     }
+}
+
+/// Toggle for indenting every tree level: three bars stepping down to the right, drawn
+/// on a highlighted background while every level is indented.
+fn nest_button(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+    let p = ui.painter();
+    if on {
+        p.rect_filled(rect, 3.0, ui.visuals().selection.bg_fill.gamma_multiply(0.6));
+    } else if resp.hovered() {
+        p.rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let c = if resp.hovered() || on { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+    let stroke = egui::Stroke::new(1.2, c);
+    let o = rect.min;
+    // A tree guide: a vertical line with elbows into three rows, each one step further in.
+    for (i, y) in [5.0, 10.0, 15.0].into_iter().enumerate() {
+        let x = 4.0 + i as f32 * 3.5;
+        p.line_segment([o + egui::vec2(x + 3.0, y), o + egui::vec2(16.5, y)], stroke);
+        if i > 0 {
+            let px = 4.0 + (i - 1) as f32 * 3.5;
+            p.line_segment([o + egui::vec2(px + 1.0, y - 5.0 + 1.5), o + egui::vec2(px + 1.0, y)], stroke);
+            p.line_segment([o + egui::vec2(px + 1.0, y), o + egui::vec2(x + 2.0, y)], stroke);
+        } else {
+            p.line_segment([o + egui::vec2(x, y), o + egui::vec2(x + 2.0, y)], stroke);
+        }
+    }
+    resp
 }
 
 fn abs_path(root: &Path, p: &Path) -> PathBuf {
@@ -993,6 +1124,93 @@ impl App {
 
     // ---- nodes ----
 
+    /// A node can be joined into its parent when it is the parent's only child.
+    fn can_join(&self, id: &str) -> bool {
+        let Some(col) = &self.col else { return false };
+        col.replays.get(id).and_then(|r| r.parent()).is_some_and(|p| col.children(Some(p)).len() == 1)
+    }
+
+    /// The reverse of a split: appends `id` to its parent, which keeps its id and title and
+    /// grows by `id`'s frames. The same frames run with the same inputs, so no state changes:
+    /// the parent takes `id`'s end hash, and `id`'s children move up to the parent.
+    /// Opens the confirmation, which can leave a marker where the parent used to end.
+    fn join_with_parent(&mut self, id: &str) {
+        let title = self.col.as_ref().and_then(|c| c.replays.get(id)).map(|r| r.title().to_string());
+        if let Some(t) = title {
+            self.join_dialog = Some((id.to_string(), true, t));
+        }
+    }
+
+    fn try_join(&mut self, id: &str, marker: Option<&str>) -> Result<()> {
+        if !self.can_join(id) {
+            return Err(anyhow!("only a node whose parent has no other children can be joined"));
+        }
+        let col = self.col.as_ref().unwrap();
+        let child = col.replays[id].clone();
+        let pid = child.parent().unwrap().to_string();
+        let kids: Vec<String> = col.children(Some(id)).into_iter().map(String::from).collect();
+        let mut p = col.replays[&pid].clone();
+        let (pf, cf) = (p.frames()?, child.frames()?);
+        // Every input is released when a node starts, so release what the parent still
+        // holds at its end; then the child's own lines follow, shifted by the parent's length.
+        let mut held: BTreeMap<InputKey, i16> = BTreeMap::new();
+        for l in &p.lines {
+            if let Command::Input { key, value, impulse: false } = &l.command {
+                held.insert(*key, *value);
+            }
+        }
+        p.set("frames", &(pf + cf).to_string());
+        for (key, v) in held {
+            if v != 0 {
+                p.insert_line(pf, &emucov::format::input_text(key, 0))?;
+            }
+        }
+        if let Some(m) = marker.map(str::trim).filter(|m| !m.is_empty()) {
+            p.insert_line(pf, &format!("[EVENT] {m}"))?;
+        }
+        for l in &child.lines {
+            let t = child.line_command_text(l.line_no).ok_or_else(|| anyhow!("line {} of the child", l.line_no))?;
+            p.insert_line(pf + l.frame, &t)?;
+        }
+        // Hashes: the child's start hash becomes a checkpoint at the join, its end hash the new end.
+        p.remove_all("end-hash");
+        if let Some(h) = child.get("end-hash") {
+            p.set("end-hash", h);
+        }
+        if let Some(h) = child.get("start-hash") {
+            p.add("checkpoint", &format!("{pf} {h}"));
+        }
+        for (f, h) in child.checkpoints()? {
+            p.add("checkpoint", &format!("{} {h}", pf + f));
+        }
+        let mut ids: Vec<&str> = vec![pid.as_str(), id];
+        ids.extend(kids.iter().map(String::as_str));
+        self.remember("Join with parent", &ids);
+        let here = if self.selected.as_deref() == Some(id) { self.pb.as_ref().and_then(|b| b.shown()).map(|f| f + pf) } else { None };
+        let col = self.col.as_mut().unwrap();
+        col.replays.insert(pid.clone(), p);
+        col.replays.remove(id);
+        for k in &kids {
+            col.replays.get_mut(k).unwrap().set("parent", &pid);
+            self.edited.insert(k.clone());
+        }
+        self.edited.insert(pid.clone());
+        self.edited.insert(id.to_string());
+        if self.hoist.as_deref() == Some(id) {
+            self.hoist = Some(pid.clone());
+        }
+        self.roll.invalidate();
+        self.info(format!("Joined into its parent at frame {pf}."));
+        if self.selected.as_deref() == Some(id) || self.selected.as_deref() == Some(pid.as_str()) {
+            self.select(&pid);
+            if let Some(f) = here {
+                self.seek(f);
+                self.roll.follow_to(f);
+            }
+        }
+        Ok(())
+    }
+
     /// Deletes `id` and everything below it (`ids`, from `subtree`), as one undo step.
     fn delete_nodes(&mut self, id: &str, ids: Vec<String>) {
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
@@ -1236,6 +1454,46 @@ impl App {
                 self.delete_dialog = None;
             }
         }
+        let pending = self.join_dialog.take().and_then(|d| {
+            let col = self.col.as_ref()?;
+            let r = col.replays.get(&d.0)?;
+            let p = col.replays.get(r.parent()?)?;
+            Some((d, r.title().to_string(), p.title().to_string(), p.frames().unwrap_or(0), r.frames().unwrap_or(0)))
+        });
+        if let Some(((id, mut mark, mut text), title, ptitle, pf, cf)) = pending {
+            let mut open = true;
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new("Join with parent").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+                ui.label(RichText::new(format!("Join \"{title}\" into \"{ptitle}\"?")).strong());
+                ui.label(format!("\"{ptitle}\" keeps its name and grows from {pf} to {} frames, with the same inputs. Undo splits them again.", pf + cf));
+                ui.add_space(6.0);
+                ui.checkbox(&mut mark, format!("Leave a marker at frame {pf}, where the split was"));
+                let edit = ui.add_enabled(mark, egui::TextEdit::singleline(&mut text).id_salt("join_marker").desired_width(320.0).hint_text("what happens here"));
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    confirm = true;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Join").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+            if confirm {
+                if let Err(e) = self.try_join(&id, mark.then_some(text.as_str())) {
+                    self.error(e);
+                }
+            } else if !cancel && open {
+                self.join_dialog = Some((id, mark, text));
+            }
+        }
         if let Some(mut d) = self.node_dialog.take() {
             let mut open = true;
             let mut apply = false;
@@ -1431,6 +1689,10 @@ impl App {
                 if ui.add_enabled(sel.is_some(), egui::Button::new("Properties…")).clicked() {
                     self.open_node_dialog(sel.as_deref().unwrap());
                 }
+                let joinable = sel.as_deref().is_some_and(|s| self.can_join(s));
+                if ui.add_enabled(joinable, egui::Button::new("Join with parent")).on_hover_text(JOIN_TIP).on_disabled_hover_text("Only for a node whose parent has no other children").clicked() {
+                    self.join_with_parent(&sel.clone().unwrap());
+                }
                 ui.separator();
                 if ui.add_enabled(sel.is_some(), egui::Button::new("Delete…")).on_hover_text("Delete this node and everything below it").clicked() {
                     self.delete_dialog = sel.clone();
@@ -1486,6 +1748,27 @@ impl App {
                 ui.label(RichText::new(format!("{n} {}", s.label())).color(status_color(s)).small());
             }
         });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (on, name) in [(false, "Nodes"), (true, "Markers")] {
+                if ui.selectable_label(self.markers_tab == on, name).clicked() {
+                    self.markers_tab = on;
+                }
+            }
+        });
+        ui.separator();
+        if self.markers_tab {
+            let shown = self.selected.as_deref().zip(self.pb.as_ref().and_then(|b| b.shown()));
+            if let Some((id, f)) = marker_list(ui, col, &mut self.marker_filter, shown) {
+                if self.selected.as_deref() != Some(id.as_str()) {
+                    self.select(&id);
+                }
+                self.seek(f);
+                self.roll.follow_to(f);
+            }
+            return;
+        }
         // Breadcrumbs while the tree is focused on one node.
         let mut new_hoist: Option<Option<String>> = None;
         let hoist: Option<&str> = self.hoist.as_deref().and_then(|h| col.replays.get_key_value(h)).map(|(k, _)| k.as_str());
@@ -1534,6 +1817,11 @@ impl App {
         let mut fold: Option<bool> = None;
         ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 22.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            let tip = if self.indent_all { "Indenting every level. Click to keep only children in their parent's column" } else { "Only children stay in their parent's column. Click to indent every level" };
+            if nest_button(ui, self.indent_all).on_hover_text(tip).clicked() {
+                self.indent_all = !self.indent_all;
+            }
+            ui.add_space(2.0);
             if fold_button(ui, false).on_hover_text("Expand all").clicked() {
                 fold = Some(false);
             }
@@ -1603,7 +1891,8 @@ impl App {
             indent: usize,
             chained: bool,
         }
-        fn walk<'a>(col: &'a Collection, id: &'a str, indent: usize, chained: bool, closed: &HashSet<String>, keep: Option<&HashSet<&str>>, rows: &mut Vec<Row<'a>>) {
+        #[allow(clippy::too_many_arguments)]
+        fn walk<'a>(col: &'a Collection, id: &'a str, indent: usize, chained: bool, closed: &HashSet<String>, keep: Option<&HashSet<&str>>, indent_all: bool, rows: &mut Vec<Row<'a>>) {
             if keep.is_some_and(|k| !k.contains(id)) {
                 return;
             }
@@ -1612,9 +1901,9 @@ impl App {
                 return;
             }
             let kids = col.children(Some(id));
-            let only = kids.len() == 1;
+            let only = kids.len() == 1 && !indent_all;
             for k in kids {
-                walk(col, k, if only { indent } else { indent + 1 }, only, closed, keep, rows);
+                walk(col, k, if only { indent } else { indent + 1 }, only, closed, keep, indent_all, rows);
             }
         }
         let mut rows = vec![];
@@ -1623,7 +1912,7 @@ impl App {
             None => col.children(None),
         };
         for r in roots {
-            walk(col, r, 0, false, &self.tree_closed, filtering.then_some(&shown), &mut rows);
+            walk(col, r, 0, false, &self.tree_closed, filtering.then_some(&shown), self.indent_all, &mut rows);
         }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for Row { id, indent, chained } in rows {
@@ -1703,6 +1992,10 @@ impl App {
                         if ui.button("Properties…").clicked() {
                             context = Some((id.to_string(), "props"));
                         }
+                        let joinable = r.parent().is_some_and(|p| col.children(Some(p)).len() == 1);
+                        if ui.add_enabled(joinable, egui::Button::new("Join with parent")).on_hover_text(JOIN_TIP).on_disabled_hover_text("Only for a node whose parent has no other children").clicked() {
+                            context = Some((id.to_string(), "join"));
+                        }
                         if ui.button("Delete…").on_hover_text("Delete this node and everything below it").clicked() {
                             context = Some((id.to_string(), "delete"));
                         }
@@ -1776,6 +2069,7 @@ impl App {
             }
             Some((_, "unhoist")) => self.hoist = None,
             Some((id, "delete")) => self.delete_dialog = Some(id),
+            Some((id, "join")) => self.join_with_parent(&id),
             Some((id, _)) => self.open_node_dialog(&id),
             None => {}
         }

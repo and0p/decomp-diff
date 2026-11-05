@@ -1,0 +1,316 @@
+# Plan: the local database
+
+Status: proposal. This file covers the first item under "Future directions" in
+SPEC.md (section 11): a local store for everything derived from playing a
+collection. It uses the words defined in SPEC.md's "Terminology" section:
+segment, snapshot, diff, child segment, save and macro.
+
+## What it holds
+
+Everything here can be rebuilt by playing the collection, so none of it goes into
+version control. Each author or collaborator fills it on their own machine
+("hydrates" it). Here is what it holds:
+
+- **Snapshots**, so the GUI and CLI can start a segment, or seek inside one, without
+  playing every parent first.
+- **Diffs**, so RAM at more frames can be rebuilt cheaply.
+- **Previews**: PNGs of each segment's start and of each marker's frame.
+- **Coverage**: blocks and instructions for each segment.
+- **Cross references** from code to segments. An agent decompiling a routine can ask
+  "which segment first runs this block, at which frame, and where is the nearest
+  snapshot before it?", then load that snapshot and trace from there.
+
+Saves (SRAM, memory cards, cartridge saves) that a root segment starts from stay
+in `blobs/` (SPEC section 4), which is in version control. A save at the end of a
+segment is derived, so it goes in the database. A tool can export it to `blobs/` when
+someone wants to start a new root segment from it.
+
+**The database is optional.** Without one, the tools work as they do today: they
+play from power-on, or from the nearest snapshot in memory. Everything below speeds
+things up, and nothing depends on it.
+
+## Storage: SQLite (decided)
+
+There is no server. Everything lives in one `.emucov/cache.db` per collection,
+replacing today's `.emucov/coverage.sqlite` and `.emucov/states/` folder.
+
+- **No setup for collaborators.** It's a file inside the collection's `.emucov/`
+  folder, so it can't point at the wrong collection, and deleting the folder resets
+  it.
+- **Agents can read it directly.** Python's standard library, the `sqlite3` command
+  line tool, and every language's drivers can open it. An `emucov sql "<query>"`
+  command and an MCP tool can come later. In WAL mode, the GUI, a hydrate run and an
+  agent can all read while one of them writes.
+- **No pile of small files.** Pages, previews and diffs are rows. SQLite reads and
+  writes blobs under about 100 KB faster than separate files do. Pages are small (64 KB at most), so
+  everything fits in the database, with no separate blob folder.
+- **Sharing a filled cache** is a `cache pack` / `unpack` bundle, so a collaborator
+  doesn't have to replay everything.
+
+DuckDB can attach the file later for heavy coverage analytics, with no second copy of
+the data.
+
+## How rows are keyed: content keys, not segment ids
+
+What a segment produces depends on three things: the state it starts from, its own
+lines, and the setup (ROM, core and core options, which `Session` already hashes
+into a setup id). So derived rows are keyed by a **content key**:
+
+```
+content key = blake3(setup id, start-hash, normalized body of the segment)
+```
+
+The normalized body is the frame count and the lines, without the title, tags or
+comments. This key has some useful properties:
+
+- **Renaming, retagging or moving a segment invalidates nothing.**
+- **An edit invalidates exactly what changed.** The edited segment gets a new key,
+  and its child segments get new keys too, because their start-hash changes. No
+  dirty tracking is needed.
+- **Identical segments are stored once,** for example when two collaborators record
+  the same menu path.
+- **Undo is free.** Undoing brings back the old key, and the old rows are still
+  there.
+
+A small `segments_now` table maps the collection's current segment ids to content
+keys. It's rebuilt whenever the collection is opened, and queries join through it.
+
+## Snapshots, pages and diffs
+
+**Pages are stored once, by hash, in the database.** A snapshot (the core's
+serialized state) is cut into pages of `page_kb` (set per collection). If `page_kb`
+is missing, or is at least the snapshot's size, page and snapshot are 1:1: the whole
+snapshot is one page, which suits the NES and its few-KB states. Each page is hashed with blake3 and
+stored once in a `pages` table, compressed with zstd. A snapshot itself is just a
+**manifest**: the list of its page hashes plus a few header fields. An 8 MB N64
+snapshot is 128 pages, so its manifest is about 4 KB. Code, static data and
+textures are the same from one snapshot to the next, so most pages are shared
+across thousands of snapshots, and each new snapshot only adds the pages that
+actually changed.
+
+**Diffs come almost for free on top of pages.** A diff is a manifest that names the
+snapshot it follows, and stores only the pages that changed since then, with no
+copy of the unchanged ones.
+- Each changed page can also be stored as a zstd patch against the previous version
+  of the same page (zstd's `--patch-from` mode), instead of as the whole page. A page
+  where a few counters moved becomes a few hundred bytes.
+- Rebuilding a frame means taking the segment's start snapshot, applying the diffs
+  in order, and loading the result into the core.
+- A full manifest is written every few diffs, so a rebuild never has to walk a long
+  chain.
+
+**What gets captured is set per collection:**
+
+- **The start of every segment** gets a snapshot. The end of a segment is only its
+  `end-hash`, since its child segments start from exactly that state, and snapshots
+  are keyed by state hash, so it is stored once however many children it has. A
+  segment with no children doesn't get an end snapshot. Reaching its end means
+  playing it from its start.
+- **A diff every N frames** inside long segments (`diff_every`). This caps how far
+  a seek has to play.
+- **A diff at each marker** (`diff_at_markers`), so the moments authors care about
+  load instantly.
+- **Excluded ranges** (`exclude`): ranges such as framebuffers, audio buffers and
+  display lists that change every frame and say nothing about game logic. They're
+  zeroed before hashing pages, so they don't create new pages. Their contents are
+  regenerated on the next frame after a load.
+- **Traced windows**: per-frame history for a short stretch, such as the 10
+  seconds before a block first runs. These are recorded on request, never during
+  hydration.
+
+## Tables (first draft)
+
+| Table | Holds |
+|---|---|
+| `setups` | setup id, ROM sha256, core name and version, core options |
+| `contents` | content key, setup, start hash, end hash, frames, when it was played |
+| `segments_now` | segment id → content key, for the collection as it is now |
+| `pages` | page hash → zstd bytes, or a zstd patch plus the hash of the page it patches |
+| `snapshots` | state hash → setup, manifest (page hashes), size |
+| `diffs` | content key, frame, base (a snapshot or the previous diff), manifest of changed pages |
+| `images` | content key, frame, role (`start`, `marker`, `screenshot`), PNG |
+| `coverage` | content key, region, covered ranges (today's table, re-keyed) |
+| `first_hits` | content key, ROM offset, first frame it ran, CPU address, bank or overlay |
+| `code` | ROM offset → instruction, block id, function (from the symbol map and the sweep) |
+| `runs` | when hydrate or play runs happened (today's table) |
+
+**Cross references.** The coverage connector already reports which ROM bytes ran.
+Hydration also records the frame each offset *first* ran within a segment. That
+gives `first_hits`, and with `diffs` an agent can ask:
+
+```sql
+-- Where does block 0x1C3A0 first run, and what's the nearest stored frame before it?
+SELECT s.segment_id, h.frame,
+       (SELECT max(frame) FROM diffs d WHERE d.content = h.content AND d.frame <= h.frame) AS from_frame
+FROM first_hits h JOIN segments_now s ON s.content = h.content
+WHERE h.rom_offset = 0x1C3A0
+ORDER BY h.frame LIMIT 5;
+```
+
+A `from_frame` of NULL means the segment's start snapshot. CLI wrappers will cover
+the common questions:
+
+- `emucov where <symbol|offset>` lists the segments and frames that first run it.
+- `emucov snapshot <segment> <frame> --out f.state` writes a snapshot to start a
+  trace from.
+- `emucov sql` runs anything else.
+
+## The cache config
+
+Each collection sets thresholds in a `[cache]` section of `collection.toml`, so
+everyone hydrating it gets the same layout. `.emucov/local.toml` can override any
+value on one machine. Later the tool can ship presets per system, in sparse and
+aggressive variants. A collection names a preset and overrides single values:
+
+```toml
+[cache]
+preset = "n64-sparse"          # shipped defaults; the values below override it
+diff_every = 18000             # frames between diffs inside a segment; 0 = none
+diff_at_markers = true
+exclude = ["RDRAM:0x00300000-0x003FFFFF"]   # e.g. framebuffers
+page_kb = 64                   # missing, or >= snapshot size = 1:1 (one page per snapshot)
+previews = "thumb"             # thumb (1/4 size) | full | off
+preview_at = ["start", "marker"]
+budget_gb = 20                 # cache gc trims unused content past this
+```
+
+| Preset | Pages | Diffs inside segments | Previews |
+|---|---|---|---|
+| `nes-aggressive` | 1:1 | every 60 frames and at markers | full |
+| `nes-sparse` | 1:1 | at markers | thumb |
+| `n64-aggressive` | 64 KB | every 1,800 frames and at markers | thumb |
+| `n64-sparse` | 64 KB | every 18,000 frames and at markers | thumb |
+
+**Choosing values.** There's no profiling command for now. Choosing values is up to
+the author, who weighs:
+
+- **Snapshot size.** Small states (NES) go 1:1. Large states (N64) get pages, so
+  unchanged memory is shared.
+- **Seek distance.** The time to play `diff_every` frames headless is the longest a
+  seek can take.
+- **Memory that churns every frame.** Framebuffers, audio and display lists go in
+  `exclude`.
+- **Disk.** The estimates below give a sense of scale.
+
+## Size, for a feel
+
+**N64, sparse.** This is the ceiling case: 8 MB RDRAM with the Expansion Pak, and
+paths up to 90 minutes long (324,000 frames at 60 Hz). Take a tree of 500 segments
+averaging 2 minutes, with 30 hours of play in total. These are estimates, and
+real numbers depend on the game and core:
+
+- **Snapshots and diffs:** compressed with zstd, the first snapshot is about 1–3 MB.
+  Later snapshots and diffs only add the pages that changed. If a 5-minute gap
+  changes a third of RDRAM after exclusions, that's about 0.5–1 MB each. Add 500
+  segment starts and about 360 interval diffs, and the total is likely 0.4–1 GB.
+- **Previews:** thumbnails (160×120) are about 15 KB each. 500 starts plus 2,000
+  markers come to about 40 MB.
+- **Coverage and first hits:** stored as covered ranges, not one byte per ROM byte.
+  This is tens of KB per segment, or tens of MB in all.
+- **Total:** about 0.5–1.5 GB.
+
+**N64, aggressive.** A diff every 30 seconds comes to roughly 5–15 GB. Per-frame
+history for a whole 90-minute path isn't practical even with excluded ranges, so it
+is recorded only for traced windows.
+
+**NES:** a tree of 1,000 segments of 1,000 frames each is in the low hundreds of MB
+even with the aggressive preset.
+
+**Seek time is the trade-off of sparse settings.** A seek plays forward from the
+nearest stored frame. With a diff every 5 minutes, that's at most 18,000 frames,
+about 30–60 seconds on a fast N64 core running headless. The GUI's progress bar
+already covers it. An author who finds it slow can lower `diff_every`.
+
+**N64 coverage needs one more piece.** N64 code runs from RDRAM after the cart DMAs
+it there, and overlays reuse the same addresses. So the connector has to track PI
+DMA to turn an executed RDRAM address back into a ROM offset (or an overlay and an
+address). That's a design item for the N64 connector.
+
+## The GUI: memory first, then the database
+
+The GUI already keeps snapshots in memory: one every 10 frames for the current
+segment, with no eviction (gui/README, "How seeking works now"). It also already
+starts a segment from its parent's stored end state when that parent is clean. With
+the database, these become three levels, checked in order:
+
+1. **An in-memory LRU of decoded snapshots**, capped by a `max_memory` setting (for
+   example 512 MB, in local settings). This holds the dense every-10-frames
+   snapshots near the playhead, plus recently used starts. The plan in gui/README
+   ("a configurable save-state cache") becomes this cache.
+2. **The database.** On a memory miss, the GUI rebuilds the nearest stored frame
+   from pages and diffs, and keeps the decoded result in memory.
+3. **Playing.** The GUI plays forward from whichever of the two is nearest, and
+   only from power-on if neither has anything.
+
+When a collection is hydrated, selecting a segment loads its start snapshot. It
+never plays the parent segments.
+
+## Hydrating
+
+Hydration fills the database. It can be started from the CLI
+(`emucov hydrate`) or from the GUI, and in both:
+
+- **It can cover part of the tree:** the whole tree, **this segment**, or **this
+  segment and all its child segments**. Partial hydration is normal. What's missing
+  is filled in later, or played when needed.
+- **It can be paused, resumed or stopped at any time.** Each finished segment is
+  committed on its own, so stopping loses at most the segment in progress.
+- **It can be watched live.** The GUI shows the segment being hydrated in the
+  emulator view with its piano roll, and the tree marks each segment as it finishes.
+  The CLI prints progress.
+- **"Hydrate and clean"** also re-plays dirty segments. For each one, if it matches
+  its recorded hashes it becomes clean. If it doesn't, hydration records which
+  checkpoint or end hash failed and moves on to the rest of the tree, rather than
+  accepting the new hashes. The author reviews the mismatches afterwards.
+- **Only missing content is played.** Content keys that are already stored are
+  skipped. Separate subtrees can run in parallel processes, since each core runs in
+  its own process.
+
+`emucov cache gc` drops content that no current segment uses, oldest first, until
+the store is under `budget_gb`. Then it drops pages that no snapshot or diff refers
+to.
+
+## Phases
+
+1. **Snapshots, pages and previews.** Add `cache.db` with `setups`, `contents`,
+   `segments_now`, `pages`, `snapshots` and start/marker `images`. Move
+   `.emucov/states/` into it. Add the GUI's memory LRU with `max_memory`, and
+   hydration of a segment or subtree with pause and stop.
+2. **Coverage.** Move the coverage tables into `cache.db`, keyed by content, so a
+   split or join simply re-records them. Add `first_hits` and `code`, plus
+   `emucov where`.
+3. **Diffs.** Add `diffs` with `diff_every`, `diff_at_markers` and `exclude`, then
+   the presets, a RAM view in the GUI, and the
+   watched-address lanes from the Tetris notes.
+4. **Agents.** Add `emucov sql`, an MCP server with the common queries, and
+   `cache pack` / `unpack`.
+
+## Decided
+
+- **One baseline core per collection, and a version change is only a warning.** A
+  collection is anchored to the core named in `collection.toml`. Emulator cores are
+  stable, and a new version is very unlikely to change how a game plays. So the setup
+  id that keys the cache covers the ROM, the core's name and its options, but not its
+  version. When the running core's version differs from the recorded one, the tools
+  warn and carry on. The state hashes still catch any real difference. A snapshot
+  that fails to load falls back to playing. Comparison cores (decomps wrapped as
+  libretro cores, or other emulators) never load our snapshots. They play the same
+  inputs from power-on and work out for themselves what a snapshot of memory means
+  to them.
+- **Snapshot layout is checked per core, not designed for up front.** Pages only
+  dedup if memory sits at the same offset in every snapshot. Most cores write a
+  fixed-size, fixed-layout state, and Mupen64Plus-Next (N64) does. The cores that
+  would break it are ones that compress their states or write variable-length chunks.
+  NES states are 1:1, so this doesn't matter there. When a large-state core is added,
+  the check is simple: the snapshot size stays constant and nearby snapshots share
+  most pages. If a core ever fails it, the fallback is content-defined chunking.
+- **The N64 core doesn't matter for now.** The tool is developed against the NES.
+  The N64 numbers here are for scale only, and the RDRAM size (4 or 8 MB) follows the
+  game.
+
+## Open questions
+
+- **N64 page size.** 64 KB is a guess for the N64 presets. Smaller pages dedup better
+  but make longer manifests. Try 16, 64 and 256 KB on a real game once pages exist.
+- **How often to write a full manifest** in a chain of diffs. I'd suggest every 8
+  diffs.

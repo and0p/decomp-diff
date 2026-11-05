@@ -1,20 +1,33 @@
 # Tetris
 
-A minimal collection for trying the GUI on a commercial game: one trunk node
-that boots Tetris (USA) and starts an A-type game at level 0.
+A collection for trying the GUI on a commercial game: Tetris (USA) menus for both
+game types, and a lost game of each.
 
 The ROM is not included. Put your own dump at `build/tetris_usa.nes`
 (sha256 `ddb876c3…53082`, checked against `collection.toml`). `build/` is
 gitignored.
 
-## The trunk: "Start a game: A-type, level 0" (760 frames)
+## The tree
 
-| Frame | What happens |
-|---|---|
-| 0–559 | Legal screen (it can't be skipped) |
-| 580 | START on the title screen |
-| 640 | START on game type (A-type, music 1) |
-| 700 | START on level select (level 0); the first piece is falling by 760 |
+- Boot to main menu (640 frames; the legal screen can't be skipped; events mark the title screen and the menu)
+  - Cycle through game types; Cycle through music options
+  - **Select A-Type** (events: game type chosen, A-type menu entered)
+    - Cycle through levels
+    - Start A-Type Game at Level 0 › Lose Game immediately and return to menu
+  - **Select B-Type** (event: game type chosen)
+    - Cycle through levels and heights (the level grid, A, then the height grid)
+    - Start B-Type Game at Level 0, Height 0 › Lose Game immediately and return to menu
+    - Start B-Type Game at Level 3, Height 3 › Lose Game immediately and return to menu
+
+Each "Start …" node ends as the game begins, so other ways of playing that game can go
+beside "Lose Game". The lost games carry events for the last piece you can move, the piece
+that ends the game, the start of the game-over curtain, and the return to the menu
+(checkpoints mark where the old nodes were joined). In the B-type games those frames come
+from RAM: `$48` (play state) is 8 on the frame a piece spawns and 10 (0x0A) during the
+curtain, and `$58` counts curtain rows.
+
+In the B-type menu, A moves from the level grid to the height grid. B on the height grid
+goes back to the game type screen, not to the level grid.
 
 ## Run it
 
@@ -24,4 +37,42 @@ cd examples/tetris
 ../../gui/target/release/emucov-gui .
 ```
 
-There are no symbols, so coverage reports raw executed bytes only.
+There are no symbols, so coverage reports can't name functions or blocks.
+
+## Why small input changes change the pieces
+
+Traced with `player/examples/ramtrace.rs`, which plays a node's chain from power-on and
+prints RAM bytes per frame:
+
+```sh
+cd player && cargo run --release --example ramtrace -- ../examples/tetris <node id> 17,18,19,BF 20
+```
+
+- `$17-$18` is Tetris's random number (a 16-bit shift register). It steps **once every
+  frame** from power-on: on the legal screen, in the menus, and in play. Its value at any
+  frame doesn't depend on menu input timing.
+- A new piece is picked from the random number **at the frame the piece spawns**
+  (`$19` is the piece that just spawned, `$BF` the next one). A piece spawns when the
+  previous one locks, so its timing depends on every input that changed when pieces
+  landed: soft drop, moves and rotations, and also the frame the game started. Gravity
+  counts from the game start, so starting one frame later can change a lock frame many
+  pieces later.
+- Picking a piece sometimes steps the random number again (a re-roll when it would repeat
+  the last piece). After that, the random number itself differs between the two runs.
+
+An experiment: pressing START for a B-type game (level 3, height 2) one frame later
+leaves the random number and the first several pieces identical. The pieces
+first differ about 400 frames into the game, and the random number differs from about
+530 frames in.
+
+What this means for collections:
+
+- Any input change before a spawn can change every later piece. That changes the RAM
+  hash, so everything below turns dirty. This is correct, but it can surprise.
+- A node can pin the sequence with `[WRITE] RAM 0x17 <hi> <lo>` (or the spawn bytes)
+  at a known frame. That makes its gameplay independent of upstream timing, at the cost
+  of being a poke.
+- Ideas for emucov: per-collection watched addresses (here the random number and the
+  next piece) drawn as a lane in the piano roll, and after an edit, a marker at the first
+  frame a watched value differs from the last run. A game-specific `[RNG]` command
+  (reserved in SPEC.md) could set the random number by name.

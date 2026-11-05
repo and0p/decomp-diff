@@ -1,9 +1,0 @@
-emucov-replay 1
-id: 0b237ee9-e04a-4343-bd2a-c9d587f30f41
-parent: 67e76b36-b8eb-47a8-bc3d-72c14a678d95
-title: Arrive at menu
-frames: 56
-start-frame: 584
-start-hash: blake3-bae9d27952778f1ffdc663151b5bb875b66528b02d5e066aeed3e2f64610622a
-end-hash: blake3-62de0f1ee7eb843745094bc7858e00a13d75cb24efc5b0ce4fcf89e2d7006634
----
