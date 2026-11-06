@@ -1,8 +1,8 @@
 # decomp-dj replay format, version 1
 
-This document defines the files that make up a **replay collection**: a tree of
+This document defines the files that make up a **replay project**: a tree of
 plain-text input replays that drive a libretro core from power-on (or from a
-saved starting point) into every situation a game can reach. A collection is
+saved starting point) into every situation a game can reach. A project is
 what people share. Everything else (save states, coverage databases,
 screenshots) is derived locally by playing it.
 
@@ -13,11 +13,13 @@ marked **(reserved)**, which files may carry but the tools do not act on yet.
 ## Terminology
 
 These are the working terms (open to change). The file format and the tools still
-use the older words in places ("replay" for segment, "save state" for snapshot).
+use the older words in places ("replay" for segment, "save state" for snapshot,
+"collection" for project).
 The GUI and the docs already say "segment" where they used to say "node".
 
 | Term | Meaning |
 |---|---|
+| **Project** | One game's folder: `config.toml`, the segments in `segments/`, blobs and `unreachable.txt`. It is what people share and keep in version control. Local data lives in its `.local/` folder. (Formerly "collection".) |
 | **Segment** | One replay file: inputs by frame, metadata, hashes and a parent link. It is one entry in the GUI's sidebar tree. (Formerly "replay" in this spec and "node" in the GUI.) |
 | **Root segment** | A segment with no parent. It starts from power-on, or from a save or snapshot blob. (Formerly "trunk".) |
 | **Child segment / children** | Segments that start where their parent ends. A segment with no children is a leaf. |
@@ -26,10 +28,10 @@ The GUI and the docs already say "segment" where they used to say "node".
 | **Save** | Only the game's own saves: SRAM, memory cards and cartridge save chips. Never an emulator save state. |
 | **Marker** | A named point in a segment: an `[EVENT]`, or another line the GUI shows in the marker lane (writes, resets, device changes). |
 | **Macro** | Future: anything an author can script, for example RNG manipulation or pokes, kept locally and referred to by name. |
-| **Hydrate** | Play a collection (or part of it) to fill the local database with snapshots, diffs, previews and coverage. |
+| **Hydrate** | Play a project (or part of it) to fill the local database with snapshots, diffs, previews and coverage. |
 | **Content key** | A hash of a segment's setup, start state and inputs. Derived data in the local database is filed under it (see CACHE_PLAN.md). |
-| **Baseline** | The collection's reference core (the original emulator) and the results it produces from the inputs. Also called the oracle. There is one per collection, and it rarely changes. |
-| **Comparison core** | Any other core played against the baseline with the same inputs, usually a decomp built as a libretro core, but possibly another emulator. Working name; "candidate" is another option. A collection can list more than one. |
+| **Baseline** | The project's reference core (the original emulator) and the results it produces from the inputs. Also called the oracle. There is one per project, and it rarely changes. |
+| **Comparison core** | Any other core played against the baseline with the same inputs, usually a decomp built as a libretro core, but possibly another emulator. Working name; "candidate" is another option. A project can list more than one. |
 | **Coverage** | An instruction or block counts as covered when at least one clean segment executed it. Dirty segments don't count. Shown **green**, the same green as a clean segment. |
 | **Uncovered** | In the ROM, not executed by any clean segment, and not marked unreachable. This is where the next segments should go. Shown in the default text color. |
 | **Parity** | A comparison core matched the baseline every time the baseline executed an instruction or block. Shown **purple**. If parity hasn't been checked, a covered block stays green. |
@@ -40,30 +42,32 @@ Colors in summary: green = covered, purple = parity, red = no parity, blue =
 unreachable, default = uncovered. These are the same in the GUI, reports and any
 export.
 
-## 1. Collection layout
+## 1. Project layout
 
 ```
-my-collection/
-  collection.toml        pinned setup: ROM hash, core build, core options, hash rules
-  replays/
-    7f3c…e1.replay       one file per replay, named by its id
-    0a9b…44.replay
+my-project/
+  config.toml            pinned setup: ROM hash, core build, core options, hash rules
+  segments/
+    7f3c…e1.segment      one file per segment, named by its id
+    0a9b…44.segment
   blobs/
-    blake3-<hex>         SRAM and save-state blobs, named by content hash
+    9a1c…7e.srm          SRAM and other blobs, named by content hash
   symbols/               optional: symbol maps for rolling coverage up into functions
   unreachable.txt        optional: ROM ranges no input can reach, left out of coverage
-  .local/                local only, never committed (local.toml, cache.db, screenshots)
+  .local/                local only, never committed
+    local.toml           local settings
+    cache.db             the local DB
 ```
 
-Replays are stored **flat**, named by id. The tree lives in each file's
+Segments are stored **flat**, named by id. The tree lives in each file's
 `parent` header, and tools present it as a tree. This keeps paths short, makes
 re-parenting a one-line change, and never creates folders for empty leaves.
 
-Nothing in a collection is game data, except blobs a collection author chooses
+Nothing in a project is game data, except blobs a project author chooses
 to include (SRAM and save states). Whether those are fine to distribute is the
 author's call.
 
-## 2. collection.toml
+## 2. config.toml
 
 ```toml
 format = 1
@@ -98,9 +102,9 @@ file = "symbols/thwaite.dbg"
 format = "ca65-dbg"
 ```
 
-**One pinned setup per collection.** State hashes are only meaningful for
+**One pinned setup per project.** State hashes are only meaningful for
 one core build, one ROM, and one set of core options. A different build is a
-different collection (or a re-validation of this one, see section 8).
+different project (or a re-validation of this one, see section 8).
 
 ## 3. Replay files
 
@@ -116,9 +120,9 @@ parent: none
 title: Boot to title screen
 frames: 240
 start-frame: 0
-sram: blake3-9a1c…
-start-hash: blake3-2f4d…
-end-hash: blake3-71ee…
+sram: 9a1c…
+start-hash: 2f4d…
+end-hash: 71ee…
 ---
 # frame  command
 60  P1 JOYPAD START 1
@@ -131,7 +135,7 @@ end-hash: blake3-71ee…
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `dj-replay 1` | yes | First line. Magic and format version. |
-| `id` | yes | Lowercase UUID. Never changes once published. The file name is `<id>.replay`. |
+| `id` | yes | Lowercase UUID. Never changes once published. The file name is `<id>.segment`. |
 | `parent` | yes | Id of the replay that must play immediately before this one, or `none` for a trunk. |
 | `title` | no | One line for humans and agents. |
 | `frames` | yes | Length in frames. The replay ends after this many frames even if the last input is earlier, so no trailing "wait" lines are needed. |
@@ -203,7 +207,7 @@ for games that read the precise angle.
 Sets the device plugged into a port (`retro_set_controller_port_device`).
 The device names are those in the input table, or a number for a
 core-specific subclass (`RETRO_DEVICE_SUBCLASS(base, id)` = `((id + 1) << 8) | base`;
-Mesen's SNES mouse is `770`). Power-on devices come from `collection.toml`,
+Mesen's SNES mouse is `770`). Power-on devices come from `config.toml`,
 and a `[DEVICE]` change stays in effect for the rest of the replay and for
 all of its descendants.
 
@@ -239,7 +243,7 @@ two overlap. Regions:
 
 A replay with any `[WRITE]` line is **poked**: it reaches a state real play
 may not. Tools count its coverage separately and tag it `poked`, so a
-collection can always say how much coverage comes from play alone.
+project can always say how much coverage comes from play alone.
 
 ### 3.6 Events
 
@@ -259,7 +263,7 @@ and group lines that share a frame.
 | Command | Meaning |
 | --- | --- |
 | `[RESET]` | Soft reset (`retro_reset`). |
-| `[RNG] <name> <n>` | Advance a named RNG `n` times. Game-specific, defined by the collection. |
+| `[RNG] <name> <n>` | Advance a named RNG `n` times. Game-specific, defined by the project. |
 | `[SCREENSHOT]` | Ask tools to keep this frame's video output. |
 
 Players must reject unknown bracketed commands rather than silently skip them,
@@ -267,8 +271,11 @@ because skipping a state-changing command would make every hash after it wrong.
 
 ## 4. Blobs
 
-`blobs/` holds SRAM and save-state files, each named by its content hash:
-`blake3-<64 hex>`. Many replays share one blob (for example a blank save).
+`blobs/` holds SRAM and save-state files, each named by its content hash (section 6)
+and an extension for its kind: `<hash>.srm` for SRAM (libretro's own name for save
+RAM files, so other emulators can open them) and `<hash>.state` for a core state.
+The header field that names a blob (`sram` or `save`) says which it is. Many segments
+share one blob (for example a blank save).
 A blob is the exact byte layout the pinned core uses: `retro_serialize`
 output for `save`, and the `RETRO_MEMORY_SAVE_RAM` contents for `sram`.
 
@@ -277,7 +284,7 @@ output for `save`, and the `RETRO_MEMORY_SAVE_RAM` contents for `sram`.
 To play replay `R`:
 
 1. Walk `parent` links from `R` up to its trunk.
-2. Load the ROM, apply core options and port devices from `collection.toml`.
+2. Load the ROM, apply core options and port devices from `config.toml`.
 3. If the trunk has `save`, `retro_unserialize` it. If it has `sram`, copy it
    into save RAM.
 4. For each replay from the trunk down to `R`: check `start-hash` if present,
@@ -298,8 +305,10 @@ state; the player only releases all inputs and sets port devices for the child
 ## 6. State hashes
 
 A state hash identifies "where the game is" without shipping memory.
-It is `blake3-` plus the hex BLAKE3 digest of, for each region in
-`[hash].regions` in order:
+Every hash in the format (state hashes, checkpoints and blob names) is the first 32
+hex digits (128 bits) of a BLAKE3 digest, with no prefix: the format version pins the
+algorithm, so changing it would be a new version. A state hash is the digest of, for
+each region in `[hash].regions` in order:
 
 ```
 region name (ASCII) | 0x00 | size as u64 little-endian | region bytes
@@ -320,7 +329,7 @@ that run their logic once per vertical blank (most 8- and 16-bit games) have
 one logic tick per frame. Others (most N64 games, and any game that lags) run
 logic at their own rate, so "frame 812" does not mean "tick 812".
 
-A collection can declare what counts as one logic tick:
+A project can declare what counts as one logic tick:
 
 ```toml
 [tick]
@@ -381,7 +390,7 @@ been played, and says how many were dirty or not played yet. Each segment also
 records the frame at which each ROM byte first ran in it, which answers "which
 segment reaches this code, and when".
 
-`unreachable.txt` at the collection root lists ROM ranges that no input can
+`unreachable.txt` at the project root lists ROM ranges that no input can
 reach (dead code, debug paths). It is version controlled. One range per line,
 `0x8000-0x80FF` or a single `0x8123`, optionally prefixed by a region
 (`PRG:0x8000-0x80FF`), with `#` comments. Instructions and blocks inside them
@@ -502,15 +511,15 @@ past its last body line.
   the frames after an unplayed edit as stale on the ruler until they run again, and
   dim the picture while it shows a frame from before the latest edit.
 - **Backups without version control.** `dj backup <dir>` (and File > Back up… in
-  the GUI) writes the collection's shared files to a ZIP: `collection.toml`, `replays/`,
+  the GUI) writes the project's shared files to a ZIP: `config.toml`, `segments/`,
   `blobs/`, `symbols/` and `unreachable.txt`, never `.local/` (the database can be
   rebuilt by hydrating) and never the ROM. `dj restore <zip> <dir>` puts them back,
-  replacing `replays/` whole so deleted segments come back and new ones go. Useful
+  replacing `segments/` whole so deleted segments come back and new ones go. Useful
   before a big agent-driven edit or an experiment, for authors who don't use git.
   Possible extras: an automatic backup before risky commands (a bulk clean, a large
   agent edit), named backups under `.local/backups/` with a limit on how many are
   kept, and a `diff` between a backup and the current files listed by segment title.
-- **Local database.** Everything derived from playing a collection goes into a local
+- **Local database.** Everything derived from playing a project goes into a local
   store that isn't in version control: save states, RAM snapshots and diffs, PNG
   previews of segment starts, ends and markers, block and instruction coverage, and cross
   references from code to the replays and frames that run it. Authors and
@@ -522,22 +531,29 @@ past its last body line.
   them by name, as `[RNG]` (section 3.7) already reserves.
 - **Coverage in the GUI:** show coverage, and test for new coverage in real time
   while playing.
-- **Comparison cores in the collection.** The baseline stays fixed, but a collection
+- **Comparison cores in the project.** The baseline stays fixed, but a project
   can list several comparison cores (for example two decomps, or a decomp and
-  another emulator) in `collection.toml`, in version control, each with a name and
+  another emulator) in `config.toml`, in version control, each with a name and
   the core it uses. Parity is tracked per comparison core.
 - **Side-by-side comparison** with a second libretro instance, namely a decompilation
   built as a core. Its video output may or may not match. The same inputs drive both,
   and the GUI compares state hashes and video.
+- **Audio playback (GUI).** Play the core's audio while a segment plays, with a volume
+  slider and a mute button in the playback toolbar. When more than one core is running
+  (side-by-side comparison), an A|B toggle picks which core you hear.
+- **Project generator (CLI).** A command that sets up a new project in one go:
+  find or ask for the ROM, pick a matching core, write `config.toml`, `.gitignore`,
+  a README and an empty root segment, and optionally a symbol map. `dj init` covers the
+  bare minimum today; this could be an interactive mode of it or its own command.
 - **Run and check everything from the GUI:** play the whole tree (or the dirty segments),
   check every RAM hash, and list the segments that no longer match.
 - **Terminology.** Rename the format, the tools and the docs to the terms in the
   Terminology section (segment, snapshot, root segment, and so on).
 - **Shorter replay ids.** Replace UUIDs with something short enough to quote in docs
   and commit messages, for example 8 characters of base32 (40 bits). Tools must check
-  the new id against every id in the collection when generating one, and try again on
+  the new id against every id in the project when generating one, and try again on
   a collision. A tool that finds two files with the same id refuses to load the
-  collection. Existing UUIDs stay valid, and the CLI already accepts unique prefixes.
+  project. Existing UUIDs stay valid, and the CLI already accepts unique prefixes.
 - **Running without a database** must keep working the way the tools work today. The
   local database speeds things up, and nothing requires it. Partial hydration is
   normal (one segment, or a segment and its children), and hydration can be watched

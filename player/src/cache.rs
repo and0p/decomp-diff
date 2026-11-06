@@ -13,7 +13,7 @@ use crate::format::{Command, Replay};
 
 // ---- settings ------------------------------------------------------------------
 
-/// The `[cache]` table of collection.toml (and of .local/local.toml, which overrides it
+/// The `[cache]` table of config.toml (and of .local/local.toml, which overrides it
 /// value by value). Every field is optional; a preset fills in the rest.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CacheConfig {
@@ -89,7 +89,7 @@ fn preset(name: &str) -> Result<CacheConfig> {
 }
 
 impl CacheSettings {
-    /// collection.toml's `[cache]`, then local.toml's `[cache]` on top. With neither,
+    /// config.toml's `[cache]`, then local.toml's `[cache]` on top. With neither,
     /// the `nes-sparse` preset.
     pub fn resolve(collection: Option<&CacheConfig>, local: Option<&CacheConfig>) -> Result<CacheSettings> {
         let name = local.and_then(|c| c.preset.clone()).or_else(|| collection.and_then(|c| c.preset.clone())).unwrap_or_else(|| "nes-sparse".into());

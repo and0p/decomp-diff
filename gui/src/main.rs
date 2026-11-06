@@ -539,11 +539,11 @@ impl App {
         let (rom, core) = match (&local.rom, &local.core) {
             (Some(r), Some(c)) => (abs_path(&col.root, r), abs_path(&col.root, c)),
             (None, _) => {
-                self.core_error = Some("No ROM set for this collection on this machine. Use Emulation > Set ROM…".into());
+                self.core_error = Some("No ROM set for this project on this machine. Use Emulation > Set ROM…".into());
                 return;
             }
             (_, None) => {
-                self.core_error = Some("No libretro core set for this collection on this machine. Use Emulation > Set core…".into());
+                self.core_error = Some("No libretro core set for this project on this machine. Use Emulation > Set core…".into());
                 return;
             }
         };
@@ -1774,8 +1774,8 @@ impl App {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Open collection…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().set_title("Open a collection folder").pick_folder() {
+                if ui.button("Open project…").clicked() {
+                    if let Some(dir) = rfd::FileDialog::new().set_title("Open a project folder").pick_folder() {
                         self.open_collection(&dir);
                     }
                 }
@@ -1935,8 +1935,8 @@ impl App {
     fn tree(&mut self, ui: &mut egui::Ui) {
         let Some(col) = &self.col else {
             ui.add_space(8.0);
-            ui.label("No collection open.");
-            if ui.button("Open collection…").clicked() {
+            ui.label("No project open.");
+            if ui.button("Open project…").clicked() {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.open_collection(&dir);
                 }

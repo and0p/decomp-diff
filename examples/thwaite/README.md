@@ -1,6 +1,6 @@
 # Example: Thwaite
 
-A small replay collection for [Thwaite](https://github.com/pinobatch/thwaite-nes),
+A small replay project for [Thwaite](https://github.com/pinobatch/thwaite-nes),
 a free NES game by Damian Yerrick (GPL-3.0). It is the end-to-end test for
 decomp-dj: 12 replays that boot the game, go through every menu, play,
 pause, lose, use a SNES mouse, and include one poked replay.
@@ -36,7 +36,7 @@ determinism check: on a matching setup each line reads `ok`. Add
 `--from-scratch` to replay every chain from power-on instead of from cached
 parent states.
 
-`[tick]` in `collection.toml` counts executions of `doStateAction`, the
+`[tick]` in `config.toml` counts executions of `doStateAction`, the
 routine Thwaite runs once per game-logic step. Menus show 0 ticks, and the
 pause replay shows 130 ticks over 300 frames.
 

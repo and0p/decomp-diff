@@ -1,9 +1,0 @@
-dj-replay 1
-id: b9b253e3-aa18-4345-8fd3-e758082a2f4d
-parent: bf0e11e0-8659-4243-af95-eee8a70828a7
-title: B20.1 idle 2: wait 10f
-frames: 10
-start-frame: 338
-start-hash: blake3-6eeaeb1f6dd56c97d9994200f2101e2825b97ca2fa00f1e5d2e51b7cf82b80ce
-end-hash: blake3-75deae1b659780c92effd45c9fa04fdf786960ff7c8e9f58ccb0441163c8b505
----

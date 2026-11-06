@@ -1,0 +1,15 @@
+dj-replay 1
+id: adde56a6-8f0c-4f29-8550-e0dac8f6fef3
+parent: d0c14220-1332-4137-b40c-9a07aa53bde5
+title: Practice: open the menu
+frames: 200
+start-frame: 120
+start-hash: ee01259ea967323fb4c7d111921c5276
+end-hash: 7c9eb1a4ad69feb25adfafbee2193bf9
+---
+5 P1 JOYPAD DOWN 1
+8 P1 JOYPAD DOWN 0
+15 P1 JOYPAD DOWN 1
+18 P1 JOYPAD DOWN 0
+25 P1 JOYPAD START 1
+29 P1 JOYPAD START 0

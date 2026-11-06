@@ -26,7 +26,11 @@ make -C Libretro -j"$jobs"
 
 for f in Libretro/mesen_libretro.so Libretro/mesen_libretro.dylib Libretro/mesen_libretro.dll; do
   if [ -f "$f" ]; then
-    cp "$f" "$out/"
+    # Copy to a new file and move it into place. Overwriting the old file in place
+    # keeps its inode, and macOS then kills any process that loads it (Code Signature
+    # Invalid), because it cached the old file's signature.
+    cp "$f" "$out/.$(basename "$f").new"
+    mv -f "$out/.$(basename "$f").new" "$out/$(basename "$f")"
     echo "built $out/$(basename "$f")"
   fi
 done

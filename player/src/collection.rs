@@ -1,4 +1,4 @@
-//! A replay collection on disk: collection.toml, replays/, blobs/ (SPEC.md sections 1, 2, 4, 8).
+//! A project on disk: config.toml, segments/, blobs/ (SPEC.md sections 1, 2, 4, 8).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -82,7 +82,7 @@ pub struct LocalConfig {
     /// The GUI's in-memory snapshot cache limit, in MB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_memory_mb: Option<u64>,
-    /// Overrides collection.toml's [cache] on this machine.
+    /// Overrides config.toml's [cache] on this machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::cache::CacheConfig>,
 }
@@ -126,7 +126,26 @@ impl Collection {
                 }
             }
         }
-        let cfg_path = root.join("collection.toml");
+        // Before the layout change: collection.toml and replays/<id>.replay.
+        let (old_cfg, cfg_path) = (root.join("collection.toml"), root.join("config.toml"));
+        if old_cfg.is_file() && !cfg_path.exists() {
+            std::fs::rename(&old_cfg, &cfg_path).with_context(|| format!("moving {} to {}", old_cfg.display(), cfg_path.display()))?;
+        }
+        let (old_dir, dir) = (root.join("replays"), root.join("segments"));
+        if old_dir.is_dir() && !dir.exists() {
+            std::fs::rename(&old_dir, &dir).with_context(|| format!("moving {} to {}", old_dir.display(), dir.display()))?;
+        }
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("replay") {
+                    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+                    let new = path.with_extension(SEGMENT_EXT);
+                    std::fs::write(&new, crate::format::upgrade_text(&text))?;
+                    std::fs::remove_file(&path)?;
+                }
+            }
+        }
         let text = std::fs::read_to_string(&cfg_path).with_context(|| format!("reading {}", cfg_path.display()))?;
         let config: Config = toml::from_str(&text).with_context(|| format!("parsing {}", cfg_path.display()))?;
         if config.format != 1 {
@@ -134,17 +153,16 @@ impl Collection {
         }
         let mut replays = BTreeMap::new();
         let mut paths = HashMap::new();
-        let dir = root.join("replays");
         if dir.is_dir() {
             for entry in std::fs::read_dir(&dir)? {
                 let path = entry?.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("replay") {
+                if path.extension().and_then(|e| e.to_str()) != Some(SEGMENT_EXT) {
                     continue;
                 }
                 let r = Replay::load(&path)?;
                 let id = r.id()?.to_string();
                 if path.file_stem().and_then(|s| s.to_str()) != Some(id.as_str()) {
-                    bail!("{} has id {id}; the file must be named {id}.replay", path.display());
+                    bail!("{} has id {id}; the file must be named {id}.{SEGMENT_EXT}", path.display());
                 }
                 paths.insert(id.clone(), path);
                 replays.insert(id, r);
@@ -152,6 +170,7 @@ impl Collection {
         }
         let c = Collection { root: root.to_path_buf(), config, replays, paths };
         c.check_tree()?;
+        c.upgrade_blob_names()?;
         Ok(c)
     }
 
@@ -159,7 +178,7 @@ impl Collection {
         for (id, r) in &self.replays {
             if let Some(p) = r.parent() {
                 if !self.replays.contains_key(p) {
-                    bail!("replay {id} names parent {p}, which is not in replays/");
+                    bail!("replay {id} names parent {p}, which is not in segments/");
                 }
             }
             // Cycle check.
@@ -276,7 +295,7 @@ impl Collection {
     }
 
     pub fn save_replay(&mut self, id: &str) -> Result<()> {
-        let path = self.paths.get(id).cloned().unwrap_or_else(|| self.root.join("replays").join(format!("{id}.replay")));
+        let path = self.paths.get(id).cloned().unwrap_or_else(|| self.root.join("segments").join(format!("{id}.{SEGMENT_EXT}")));
         std::fs::create_dir_all(path.parent().unwrap())?;
         std::fs::write(&path, self.replays[id].to_text())?;
         self.paths.insert(id.to_string(), path);
@@ -294,12 +313,36 @@ impl Collection {
         Ok(())
     }
 
-    pub fn blob_path(&self, blob: &str) -> PathBuf {
-        self.root.join("blobs").join(blob)
+    /// `blobs/<hash>.srm` for the header field `sram`, `blobs/<hash>.state` for `save`.
+    pub fn blob_path(&self, blob: &str, field: &str) -> PathBuf {
+        self.root.join("blobs").join(format!("{blob}.{}", blob_ext(field)))
     }
 
-    pub fn read_blob(&self, blob: &str) -> Result<Vec<u8>> {
-        let data = std::fs::read(self.blob_path(blob)).with_context(|| format!("reading blob {blob}"))?;
+    /// Blobs used to be named `blake3-<64 hex>` with no extension. Renames the ones the
+    /// segments name to the current form.
+    fn upgrade_blob_names(&self) -> Result<()> {
+        for r in self.replays.values() {
+            for field in ["save", "sram"] {
+                let Some(blob) = r.get(field) else { continue };
+                let path = self.blob_path(blob, field);
+                if path.exists() {
+                    continue;
+                }
+                let Ok(entries) = std::fs::read_dir(self.root.join("blobs")) else { continue };
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("blake3-") && crate::format::normalize_hash(&name) == blob {
+                        std::fs::rename(e.path(), &path).with_context(|| format!("renaming blob {name}"))?;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn read_blob(&self, blob: &str, field: &str) -> Result<Vec<u8>> {
+        let data = std::fs::read(self.blob_path(blob, field)).with_context(|| format!("reading blob {blob}"))?;
         let actual = blob_id(&data);
         if actual != blob {
             bail!("blob {blob} has the wrong content (hashes to {actual})");
@@ -308,16 +351,24 @@ impl Collection {
     }
 
     #[allow(dead_code)]
-    pub fn write_blob(&self, data: &[u8]) -> Result<String> {
+    pub fn write_blob(&self, data: &[u8], field: &str) -> Result<String> {
         let id = blob_id(data);
         std::fs::create_dir_all(self.root.join("blobs"))?;
-        std::fs::write(self.blob_path(&id), data)?;
+        std::fs::write(self.blob_path(&id, field), data)?;
         Ok(id)
     }
 }
 
 pub fn blob_id(data: &[u8]) -> String {
-    format!("blake3-{}", blake3::hash(data).to_hex())
+    crate::format::hash_hex(&blake3::hash(data))
+}
+
+/// The extension of a segment file.
+pub const SEGMENT_EXT: &str = "segment";
+
+/// A blob's extension, from the header field that names it.
+pub fn blob_ext(field: &str) -> &'static str {
+    if field == "sram" { "srm" } else { "state" }
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {

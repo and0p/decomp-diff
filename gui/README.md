@@ -1,6 +1,6 @@
 # dj-gui
 
-A desktop viewer and editor for replay collections, built with egui. It loads one
+A desktop viewer and editor for replay projects, built with egui. It loads one
 libretro core and lets you browse the replay tree, play and seek with live video,
 and edit button inputs on a piano roll. See [QUICKSTART.md](../QUICKSTART.md#gui-prototype)
 for how to build, run and use it.
@@ -23,7 +23,7 @@ played in the GUI.
   the local database (`.local/cache.db`) when a stored one is nearer. It sets
   the held inputs again, because input state is not part of a save state, then
   runs the core forward and draws only the last frame. How many snapshots the
-  database has depends on the collection's `[cache]` settings (QUICKSTART.md);
+  database has depends on the project's `[cache]` settings (QUICKSTART.md);
   with `diff_every = 60`, a seek anywhere is near instant.
 - Selecting a segment starts from its parent's end snapshot in the database when the
   parent is clean, so deep segments open without replaying the chain. The GUI also
@@ -64,7 +64,7 @@ Every edit records the affected segments' full text before the change as one und
 (`remember` in `src/main.rs`): note edits, cut and paste, frame lines, renames, segment
 properties, accepting an end hash, new segments, splits and branches. Undo puts those segments
 back (removing segments the step created) and records the reverse step for redo. The history
-holds 200 steps and is cleared when a collection is opened or reloaded.
+holds 200 steps and is cleared when a project is opened or reloaded.
 
 After an undo on the segment being shown, playback drops its save states from the first
 changed frame on and redraws where you are. If the step changed the segment's length or
@@ -89,7 +89,7 @@ the children up to the grandparent, which turns everything below dirty. Neither 
 ## Marker list (implemented)
 
 The left sidebar has two tabs, **Segments** (the tree) and **Markers**. Markers lists every
-event in the collection alphabetically, then RAM writes, resets, device changes and RNG
+event in the project alphabetically, then RAM writes, resets, device changes and RNG
 lines. Each row shows the frame and the segment (with its parent when another segment has the
 same title), and the filter matches marker text and segment titles. Clicking a row selects
 the segment and seeks to the frame. This lets markers do the job of tiny segments that only

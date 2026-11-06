@@ -1,10 +1,10 @@
 # Tetris
 
-A collection for trying the GUI on a commercial game: Tetris (USA) menus for both
+A project for trying the GUI on a commercial game: Tetris (USA) menus for both
 game types, and a lost game of each.
 
 The ROM is not included. Put your own dump at `build/tetris_usa.nes`
-(sha256 `ddb876c3…53082`, checked against `collection.toml`). `build/` is
+(sha256 `ddb876c3…53082`, checked against `config.toml`). `build/` is
 gitignored.
 
 ## The tree
@@ -65,14 +65,14 @@ leaves the random number and the first several pieces identical. The pieces
 first differ about 400 frames into the game, and the random number differs from about
 530 frames in.
 
-What this means for collections:
+What this means for projects:
 
 - Any input change before a spawn can change every later piece. That changes the RAM
   hash, so everything below turns dirty. This is correct, but it can surprise.
 - A node can pin the sequence with `[WRITE] RAM 0x17 <hi> <lo>` (or the spawn bytes)
   at a known frame. That makes its gameplay independent of upstream timing, at the cost
   of being a poke.
-- Ideas for decomp-dj: per-collection watched addresses (here the random number and the
+- Ideas for decomp-dj: per-project watched addresses (here the random number and the
   next piece) drawn as a lane in the piano roll, and after an edit, a marker at the first
   frame a watched value differs from the last run. A game-specific `[RNG]` command
   (reserved in SPEC.md) could set the random number by name.

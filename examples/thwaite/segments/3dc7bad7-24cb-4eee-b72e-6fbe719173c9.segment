@@ -1,0 +1,13 @@
+dj-replay 1
+id: 3dc7bad7-24cb-4eee-b72e-6fbe719173c9
+parent: d0c14220-1332-4137-b40c-9a07aa53bde5
+title: 2 Players: start a game
+frames: 600
+start-frame: 120
+start-hash: ee01259ea967323fb4c7d111921c5276
+end-hash: cd1cd4abd64f6a1a158dcf6379d2db2a
+---
+5 P1 JOYPAD DOWN 1
+8 P1 JOYPAD DOWN 0
+15 P1 JOYPAD START 1
+19 P1 JOYPAD START 0

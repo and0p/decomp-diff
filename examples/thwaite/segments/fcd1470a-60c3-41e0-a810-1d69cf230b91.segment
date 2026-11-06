@@ -1,0 +1,13 @@
+dj-replay 1
+id: fcd1470a-60c3-41e0-a810-1d69cf230b91
+parent: adde56a6-8f0c-4f29-8550-e0dac8f6fef3
+title: Practice: cancel back to the title
+frames: 120
+start-frame: 320
+start-hash: 7c9eb1a4ad69feb25adfafbee2193bf9
+end-hash: b6fffd4ceb32ebec951f9ebc7e3cbc13
+---
+5 P1 JOYPAD RIGHT 1
+17 P1 JOYPAD RIGHT 0
+45 P1 JOYPAD A 1
+49 P1 JOYPAD A 0

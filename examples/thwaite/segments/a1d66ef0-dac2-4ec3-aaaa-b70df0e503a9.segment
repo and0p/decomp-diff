@@ -1,0 +1,45 @@
+dj-replay 1
+id: a1d66ef0-dac2-4ec3-aaaa-b70df0e503a9
+parent: d0c14220-1332-4137-b40c-9a07aa53bde5
+title: Mouse in port 2: click 1 Player
+frames: 400
+start-frame: 120
+start-hash: ee01259ea967323fb4c7d111921c5276
+end-hash: c87655854d04a91cc0ed9cd34f58a3ba
+---
+# Mesen reads mouse motion and buttons from libretro port 1 whichever port the mouse is in.
+0 [DEVICE] P2 770
+0 [EVENT] Plug a SNES mouse into port 2
+10 P1 MOUSE Y 1
+11 P1 MOUSE Y 1
+12 P1 MOUSE Y 1
+13 P1 MOUSE Y 1
+14 P1 MOUSE Y 1
+15 P1 MOUSE Y 1
+16 P1 MOUSE Y 1
+17 P1 MOUSE Y 1
+18 P1 MOUSE Y 1
+19 P1 MOUSE Y 1
+20 P1 MOUSE Y 1
+21 P1 MOUSE Y 1
+22 P1 MOUSE Y 1
+23 P1 MOUSE Y 1
+24 P1 MOUSE Y 1
+25 P1 MOUSE Y 1
+26 P1 MOUSE Y 1
+27 P1 MOUSE Y 1
+28 P1 MOUSE Y 1
+29 P1 MOUSE Y 1
+30 P1 MOUSE Y 1
+31 P1 MOUSE Y 1
+32 P1 MOUSE Y 1
+33 P1 MOUSE Y 1
+34 P1 MOUSE Y 1
+35 P1 MOUSE Y 1
+36 P1 MOUSE Y 1
+37 P1 MOUSE Y 1
+38 P1 MOUSE Y 1
+39 P1 MOUSE Y 1
+60 [SCREENSHOT]
+70 P1 MOUSE LEFT 1
+74 P1 MOUSE LEFT 0

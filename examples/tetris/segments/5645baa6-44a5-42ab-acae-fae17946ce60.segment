@@ -1,0 +1,15 @@
+dj-replay 1
+id: 5645baa6-44a5-42ab-acae-fae17946ce60
+parent: none
+title: Boot to main menu
+frames: 640
+start-frame: 0
+start-hash: ca66ab9fe2af9439a6e36932460d42c6
+checkpoint: 580 9b80a65703df446a6f1eef2d6297f4b5
+end-hash: 62de0f1ee7eb843745094bc7858e00a1
+checkpoint: 584 bae9d27952778f1ffdc663151b5bb875
+---
+523 [EVENT] Legal screen ending, turning into title screen
+580 P1 JOYPAD START 1
+581 P1 JOYPAD START 0
+584 [EVENT] Arrive at menu

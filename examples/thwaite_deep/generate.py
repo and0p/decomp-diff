@@ -1,12 +1,12 @@
 # Generates this collection: three boot roots with very deep chains of short idle nodes.
-# Usage: python3 generate.py <collection dir>   (reads ../thwaite/collection.toml next to it)
+# Usage: python3 generate.py <project dir>   (reads ../thwaite/config.toml next to it)
 import os, random, sys, uuid, shutil
 out = sys.argv[1]
 rnd = random.Random(7)
-os.makedirs(f"{out}/replays", exist_ok=True)
-src = open(f"{out}/../thwaite/collection.toml").read()
+os.makedirs(f"{out}/segments", exist_ok=True)
+src = open(f"{out}/../thwaite/config.toml").read()
 src = src.replace('name = "Thwaite"', 'name = "Thwaite (deep tree)"').replace('file = "build/thwaite.dbg"', 'file = "../thwaite/build/thwaite.dbg"')
-open(f"{out}/collection.toml", "w").write(src)
+open(f"{out}/config.toml", "w").write(src)
 open(f"{out}/.gitignore", "w").write(".local/\n")
 count = 0
 def node(parent, title, frames, lines=()):
@@ -14,7 +14,7 @@ def node(parent, title, frames, lines=()):
     count += 1
     i = str(uuid.UUID(int=rnd.getrandbits(128), version=4))
     body = "\n".join(lines)
-    open(f"{out}/replays/{i}.replay", "w").write(
+    open(f"{out}/segments/{i}.segment", "w").write(
         f"dj-replay 1\nid: {i}\nparent: {parent or 'none'}\ntitle: {title}\nframes: {frames}\n---\n" + (body + "\n" if body else ""))
     return i
 def tap(btn, at=2):

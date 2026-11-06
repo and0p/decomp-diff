@@ -1,4 +1,4 @@
-//! Parser and writer for `.replay` files (SPEC.md section 3).
+//! Parser and writer for `.segment` files (SPEC.md section 3).
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
@@ -8,6 +8,77 @@ use std::path::Path;
 pub const MAGIC: &str = "dj-replay 1";
 /// The first line before the rename to decomp-dj. Still read; files are written with MAGIC.
 const OLD_MAGIC: &str = "emucov-replay 1";
+
+/// Hashes are the first 32 hex digits of a BLAKE3 digest (SPEC.md section 6).
+pub const HASH_HEX: usize = 32;
+
+/// A BLAKE3 digest as the format writes it.
+pub fn hash_hex(h: &blake3::Hash) -> String {
+    h.to_hex()[..HASH_HEX].to_string()
+}
+
+/// Reads a hash in the current form or the older `blake3-<64 hex>` one.
+pub fn normalize_hash(v: &str) -> String {
+    let v = v.trim();
+    let v = v.strip_prefix("blake3-").unwrap_or(v);
+    if v.len() > HASH_HEX && v.bytes().all(|b| b.is_ascii_hexdigit()) {
+        v[..HASH_HEX].to_string()
+    } else {
+        v.to_string()
+    }
+}
+
+/// Header fields whose values are hashes (`checkpoint` holds `<frame> <hash>`).
+const HASH_FIELDS: [&str; 4] = ["start-hash", "end-hash", "save", "sram"];
+
+fn normalize_field(k: &str, v: &str) -> String {
+    if HASH_FIELDS.contains(&k) {
+        return normalize_hash(v);
+    }
+    if k == "checkpoint" {
+        if let Some((f, h)) = v.split_once(char::is_whitespace) {
+            return format!("{} {}", f.trim(), normalize_hash(h));
+        }
+    }
+    v.to_string()
+}
+
+/// Rewrites a file from before the rename into the current form: the first line and
+/// the hashes in the header. Everything else stays byte for byte.
+pub fn upgrade_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_header = true;
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        let (body, nl) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        let (body, cr) = match body.strip_suffix('\r') {
+            Some(b) => (b, "\r"),
+            None => (body, ""),
+        };
+        let new = if i == 0 && body.trim() == OLD_MAGIC {
+            MAGIC.to_string()
+        } else if in_header && body.trim() == "---" {
+            in_header = false;
+            body.to_string()
+        } else if in_header && i > 0 {
+            match body.split_once(':') {
+                Some((k, v)) if !body.trim_start().starts_with('#') => {
+                    let nv = normalize_field(k.trim(), v.trim());
+                    if nv == v.trim() { body.to_string() } else { format!("{}: {nv}", k.trim()) }
+                }
+                _ => body.to_string(),
+            }
+        } else {
+            body.to_string()
+        };
+        out.push_str(&new);
+        out.push_str(cr);
+        out.push_str(nl);
+    }
+    out
+}
 
 // libretro device ids (libretro.h).
 pub const DEVICE_NONE: u32 = 0;
@@ -101,7 +172,7 @@ impl Replay {
                     continue;
                 }
                 let (k, v) = t.split_once(':').ok_or_else(|| anyhow!("line {line_no}: expected `key: value`"))?;
-                header.push(HeaderLine::Field(k.trim().to_string(), v.trim().to_string()));
+                header.push(HeaderLine::Field(k.trim().to_string(), normalize_field(k.trim(), v.trim())));
             } else {
                 body_text.push(l.to_string());
                 let t = l.trim();
@@ -802,7 +873,7 @@ frames: 100
 
     #[test]
     fn splits_and_edits_lines() {
-        let text = "dj-replay 1\nid: a\nparent: none\nframes: 100\nend-hash: blake3-x\ncheckpoint: 20 blake3-c20\ncheckpoint: 80 blake3-c80\n---\n# note\n0 P1 JOYPAD A 1\n10 P1 JOYPAD RIGHT 1\n30 [EVENT] middle\n60 P1 JOYPAD RIGHT 0\n70 [WRITE] RAM 0x10 01 02\n";
+        let text = "dj-replay 1\nid: a\nparent: none\nframes: 100\nend-hash: x\ncheckpoint: 20 c20\ncheckpoint: 80 c80\n---\n# note\n0 P1 JOYPAD A 1\n10 P1 JOYPAD RIGHT 1\n30 [EVENT] middle\n60 P1 JOYPAD RIGHT 0\n70 [WRITE] RAM 0x10 01 02\n";
         let r = Replay::parse(text).unwrap();
         let (up, down) = r.split_at(50, "b").unwrap();
         assert_eq!(up.id().unwrap(), "b");
@@ -810,12 +881,12 @@ frames: 100
         assert_eq!(down.id().unwrap(), "a");
         assert_eq!(up.frames().unwrap(), 50);
         assert_eq!(up.get("end-hash"), None);
-        assert_eq!(up.checkpoints().unwrap(), vec![(20, "blake3-c20".to_string())]);
+        assert_eq!(up.checkpoints().unwrap(), vec![(20, "c20".to_string())]);
         assert_eq!(up.lines.len(), 3);
         assert_eq!(down.parent(), Some("b"));
         assert_eq!(down.frames().unwrap(), 50);
-        assert_eq!(down.get("end-hash"), Some("blake3-x"));
-        assert_eq!(down.checkpoints().unwrap(), vec![(30, "blake3-c80".to_string())]);
+        assert_eq!(down.get("end-hash"), Some("x"));
+        assert_eq!(down.checkpoints().unwrap(), vec![(30, "c80".to_string())]);
         // A and RIGHT were held across the split, so they are pressed again at 0.
         let k = |id| InputKey { port: 0, device: DEVICE_JOYPAD, index: 0, id };
         assert_eq!(down.binary_spans(k(8)), vec![(0, 50)]);
@@ -858,5 +929,18 @@ frames: 100
         assert!(Replay::parse(&unordered).is_err());
         let unknown = SAMPLE.replace("[RESETX]", "").replace("9 [DEVICE] P2 MOUSE", "9 [TELEPORT] P2");
         assert!(Replay::parse(&unknown).is_err());
+    }
+
+    #[test]
+    fn upgrades_old_files() {
+        let h64 = "2f4d".repeat(16);
+        let old = format!("emucov-replay 1\r\nid: a\nparent: none\nframes: 10\nend-hash: blake3-{h64}\ncheckpoint: 5 blake3-{h64}\n# end-hash: blake3-keep\n---\n# blake3-{h64}\n");
+        let new = upgrade_text(&old);
+        let h32 = &h64[..32];
+        assert_eq!(new, format!("dj-replay 1\r\nid: a\nparent: none\nframes: 10\nend-hash: {h32}\ncheckpoint: 5 {h32}\n# end-hash: blake3-keep\n---\n# blake3-{h64}\n"));
+        // The parser reads the old form the same way.
+        let r = Replay::parse(&old).unwrap();
+        assert_eq!(r.get("end-hash"), Some(h32));
+        assert_eq!(r.checkpoints().unwrap(), vec![(5, h32.to_string())]);
     }
 }

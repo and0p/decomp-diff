@@ -2,7 +2,7 @@
 
 A stress test for the tree view: 570 short segments, nested up to 152 levels deep.
 Nothing here plays the game. Every segment sits at Thwaite's main menu, mostly
-with no input at all, so the whole collection plays in under 20 seconds.
+with no input at all, so the whole project plays in under 20 seconds.
 
 It uses the ROM and symbols from `../thwaite`, so build those first (see that
 folder's README).
@@ -31,6 +31,6 @@ All hashes are recorded, so `run` should report every segment clean.
 
 ## Regenerate
 
-`python3 generate.py .` rewrites `replays/` from a fixed random seed (it does
-not delete old files, so empty `replays/` first). Then record the hashes with
+`python3 generate.py .` rewrites `segments/` from a fixed random seed (it does
+not delete old files, so empty `segments/` first). Then record the hashes with
 `run . --accept`.

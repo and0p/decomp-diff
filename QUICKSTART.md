@@ -4,11 +4,11 @@ What is here so far (first plan, steps 1 to 4, plus a GUI prototype):
 
 | Path | What it is |
 | --- | --- |
-| [SPEC.md](SPEC.md) | The replay collection format, v1 draft |
+| [SPEC.md](SPEC.md) | The replay project format, v1 draft |
 | [player/](player/) | `dj`, the headless player (Rust): plays replay trees on any libretro core, checks state hashes, records and reports coverage |
 | [gui/](gui/) | `dj-gui`, a desktop viewer and editor (Rust, egui): replay tree, live preview, piano roll |
 | [connectors/](connectors/) | Per-core coverage patches. [mesen](connectors/mesen/) (NES) is the first |
-| [examples/thwaite/](examples/thwaite/) | A 12-replay collection for a free NES game, used as the end-to-end test |
+| [examples/thwaite/](examples/thwaite/) | A 12-replay project for a free NES game, used as the end-to-end test |
 
 ## Build
 
@@ -36,9 +36,9 @@ dj cache stats <dir> | dj cache gc <dir>                     # size, or drop wha
 
 Every command that plays takes `--no-db` to run without the local database.
 
-- `--rom` and `--core` are remembered per collection in `.local/local.toml`, which is never committed.
+- `--rom` and `--core` are remembered per project in `.local/local.toml`, which is never committed.
 - Ids can be shortened to any unique prefix.
-- `init` records **every** core option's current value in `collection.toml`, so the setup is pinned.
+- `init` records **every** core option's current value in `config.toml`, so the setup is pinned.
 - `run` exits with an error when a replay's hashes differ from the recorded ones. `--accept` writes the new hashes instead.
 - `run --from-scratch` replays every chain from power-on instead of from cached parent states, which checks that save states round-trip exactly.
 
@@ -49,11 +49,12 @@ Every command that plays takes `--no-db` to run without the local database.
 - **Snapshots** of the core state at frame 0, every `diff_every` frames, at markers, and at the end of segments with children. Each is split into pages that are stored once by hash and compressed with zstd.
 - **Previews** (PNG) at the start and at markers, coverage flags, and the frame each ROM byte first ran in each segment (for `where`).
 - `hydrate` plays only the segments whose content isn't stored yet; running it again is nearly instant. `SEGMENT --children` limits it to a subtree. `--clean` re-checks dirty segments: one that still ends with its recorded end hash and checkpoints gets its new start hash written to its file (it is clean again); the others are listed as mismatches. `--force` plays even what is stored.
-- `report` reads the database, not the files: it counts only clean segments that have been hydrated, and lists how many were dirty or not played yet. Address ranges in `unreachable.txt` at the collection root (`0x8000-0x80FF # comment`, optionally `PRG:` first) are left out of the totals.
+- `report` reads the database, not the files: it counts only clean segments that have been hydrated, and lists how many were dirty or not played yet. Address ranges in `unreachable.txt` at the project root (`0x8000-0x80FF # comment`, optionally `PRG:` first) are left out of the totals.
 - `cache gc` deletes contents that no current segment uses, then unused snapshots and pages, and compacts the file.
-- The local folder used to be called `.emucov/`. The tools move it to `.local/` the first time they open a collection (and change `.emucov/` to `.local/` in the collection's `.gitignore`). Its old `coverage.sqlite` and `states/` from before the database are no longer used and can be deleted.
+- The local folder used to be called `.emucov/`. The tools move it to `.local/` the first time they open a project (and change `.emucov/` to `.local/` in the project's `.gitignore`). Its old `coverage.sqlite` and `states/` from before the database are no longer used and can be deleted.
+- Projects from before the layout change move over the same way when the tools open them: `collection.toml` becomes `config.toml`, `replays/<id>.replay` becomes `segments/<id>.segment`, hashes lose their `blake3-` prefix and keep their first 32 hex digits, and blobs are renamed to `<hash>.srm` or `<hash>.state`.
 
-Settings go in `collection.toml` (shared) or `.local/local.toml` (this machine, wins):
+Settings go in `config.toml` (shared) or `.local/local.toml` (this machine, wins):
 
 ```toml
 [cache]
@@ -70,12 +71,12 @@ previews = "thumb"      # none, thumb (half size) or full
 
 ```sh
 cd gui && cargo build --release
-target/release/dj-gui ../examples/thwaite       # or File > Open collection…
+target/release/dj-gui ../examples/thwaite       # or File > Open project…
 ```
 
-The ROM and core come from the collection's `.local/local.toml` (written by the CLI's `--rom`/`--core`), or set them with Emulation > Set ROM… / Set core….
+The ROM and core come from the project's `.local/local.toml` (written by the CLI's `--rom`/`--core`), or set them with Emulation > Set ROM… / Set core….
 
-- Left: two tabs, **Segments** and **Markers**. Markers lists every event in the collection alphabetically (then writes and other lines) with the frame and segment; its filter matches marker text and segment titles, and clicking a row goes to that segment and frame.
+- Left: two tabs, **Segments** and **Markers**. Markers lists every event in the project alphabetically (then writes and other lines) with the frame and segment; its filter matches marker text and segment titles, and clicking a row goes to that segment and frame.
 - Segments: the replay tree. Dots show clean (green), dirty (orange) and unverified (gray); anything under a dirty replay is dirty too. Edited replays are yellow italics until saved. Click a segment to go to it; double-click to play it; Enter (or F2) renames the selected segment in place (Enter or clicking away keeps the new name, Escape cancels). The filter box at the top matches titles, id prefixes and tags, and shows each match with the path down to it (the path is dimmed).
   - Indentation only steps in where a segment has more than one child. An only child stays in its parent's column, joined to it by a short line, so a long chain of segments stays one column however deep it goes.
   - The third icon (a stepped tree) switches to indenting every level, which reads better for small trees; click it again to keep only children in line. The two icons before it collapse or expand every segment. Collapse all keeps the focused segment open, so its children still show.

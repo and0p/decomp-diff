@@ -2,12 +2,12 @@
 
 Status: mostly implemented (see "What's built" at the end). This file covers the first item under "Future directions" in
 SPEC.md (section 11): a local store for everything derived from playing a
-collection. It uses the words defined in SPEC.md's "Terminology" section:
+project. It uses the words defined in SPEC.md's "Terminology" section:
 segment, snapshot, diff, child segment, save and macro.
 
 ## What it holds
 
-Everything here can be rebuilt by playing the collection, so none of it goes into
+Everything here can be rebuilt by playing the project, so none of it goes into
 version control. Each author or collaborator fills it on their own machine
 ("hydrates" it). Here is what it holds:
 
@@ -31,11 +31,11 @@ things up, and nothing depends on it.
 
 ## Storage: SQLite (decided)
 
-There is no server. Everything lives in one `.local/cache.db` per collection,
+There is no server. Everything lives in one `.local/cache.db` per project,
 replacing today's `.local/coverage.sqlite` and `.local/states/` folder.
 
-- **No setup for collaborators.** It's a file inside the collection's `.local/`
-  folder, so it can't point at the wrong collection, and deleting the folder resets
+- **No setup for collaborators.** It's a file inside the project's `.local/`
+  folder, so it can't point at the wrong project, and deleting the folder resets
   it.
 - **Agents can read it directly.** Python's standard library, the `sqlite3` command
   line tool, and every language's drivers can open it. A `dj sql "<query>"`
@@ -72,13 +72,13 @@ comments. This key has some useful properties:
 - **Undo is free.** Undoing brings back the old key, and the old rows are still
   there.
 
-A small `segments_now` table maps the collection's current segment ids to content
-keys. It's rebuilt whenever the collection is opened, and queries join through it.
+A small `segments_now` table maps the project's current segment ids to content
+keys. It's rebuilt whenever the project is opened, and queries join through it.
 
 ## Snapshots, pages and diffs
 
 **Pages are stored once, by hash, in the database.** A snapshot (the core's
-serialized state) is cut into pages of `page_kb` (set per collection). If `page_kb`
+serialized state) is cut into pages of `page_kb` (set per project). If `page_kb`
 is missing, or is at least the snapshot's size, page and snapshot are 1:1: the whole
 snapshot is one page, which suits the NES and its few-KB states. Each page is hashed with blake3 and
 stored once in a `pages` table, compressed with zstd. A snapshot itself is just a
@@ -99,7 +99,7 @@ copy of the unchanged ones.
 - A full manifest is written every few diffs, so a rebuild never has to walk a long
   chain.
 
-**What gets captured is set per collection:**
+**What gets captured is set per project:**
 
 - **The start of every segment** gets a snapshot. The end of a segment is only its
   `end-hash`, since its child segments start from exactly that state, and snapshots
@@ -124,14 +124,14 @@ copy of the unchanged ones.
 |---|---|
 | `setups` | setup id, ROM sha256, core name and version, core options |
 | `contents` | content key, setup, start hash, end hash, frames, when it was played |
-| `segments_now` | segment id → content key, for the collection as it is now |
+| `segments_now` | segment id → content key, for the project as it is now |
 | `pages` | page hash → zstd bytes, or a zstd patch plus the hash of the page it patches |
 | `snapshots` | state hash → setup, manifest (page hashes), size |
 | `diffs` | content key, frame, base (a snapshot or the previous diff), manifest of changed pages |
 | `images` | content key, frame, role (`start`, `marker`, `screenshot`), PNG |
 | `coverage` | content key, region, covered ranges (today's table, re-keyed) |
 | `coverage_sum` | function or block → how many current clean segments cover it, and the first one (a cache, see "Coverage") |
-| `unreachable` | ROM ranges loaded from the collection's `unreachable.txt`, with their comments |
+| `unreachable` | ROM ranges loaded from the project's `unreachable.txt`, with their comments |
 | `parity` | comparison core, content key, block → result (`match`, `differs`), first differing frame, evidence |
 | `first_hits` | content key, ROM offset, first frame it ran, CPU address, bank or overlay |
 | `code` | ROM offset → instruction, block id, function (from the symbol map and the sweep) |
@@ -160,10 +160,10 @@ the common questions:
 
 ## The cache config
 
-Each collection sets thresholds in a `[cache]` section of `collection.toml`, so
+Each project sets thresholds in a `[cache]` section of `config.toml`, so
 everyone hydrating it gets the same layout. `.local/local.toml` can override any
 value on one machine. Later the tool can ship presets per system, in sparse and
-aggressive variants. A collection names a preset and overrides single values:
+aggressive variants. A project names a preset and overrides single values:
 
 ```toml
 [cache]
@@ -245,7 +245,7 @@ the database, these become three levels, checked in order:
 3. **Playing.** The GUI plays forward from whichever of the two is nearest, and
    only from power-on if neither has anything.
 
-When a collection is hydrated, selecting a segment loads its start snapshot. It
+When a project is hydrated, selecting a segment loads its start snapshot. It
 never plays the parent segments.
 
 ## Hydrating
@@ -294,13 +294,13 @@ to.
 Coverage uses the terms in SPEC.md: covered, uncovered, unreachable, parity and no
 parity.
 
-**Stored per content key, never per collection.** When a segment is played, the
+**Stored per content key, never per project.** When a segment is played, the
 connector reports the ROM bytes it executed during that segment's own frames (not
 its parents'). These are saved as covered ranges in `coverage`, with the first frame
 of each in `first_hits`. A segment's coverage is a fact about its content, so it
 never goes stale. A dirty or edited segment simply has a different content key.
 
-**The collection's coverage is worked out from the segments as they are now.** A
+**The project's coverage is worked out from the segments as they are now.** A
 block is covered if any segment in `segments_now` that is currently **clean** has it
 in its ranges. Dirty segments don't count, because their hashes say they no longer
 play as recorded. Unplayed segments don't count either. Status:
@@ -332,8 +332,8 @@ all give the same numbers.
 
 ## Decided
 
-- **One baseline core per collection, and a version change is a warning.** A
-  collection is anchored to the core named in `collection.toml`. Emulator cores are
+- **One baseline core per project, and a version change is a warning.** A
+  project is anchored to the core named in `config.toml`. Emulator cores are
   stable, and a new version is very unlikely to change how a game plays. When the
   running core's version differs from the recorded one, the tools warn and carry on.
   The state hashes still catch any real difference. Comparison cores (decomps wrapped

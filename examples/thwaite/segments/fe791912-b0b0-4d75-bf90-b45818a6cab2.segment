@@ -1,0 +1,15 @@
+dj-replay 1
+id: fe791912-b0b0-4d75-bf90-b45818a6cab2
+parent: 6c8def1e-b392-451f-ad90-3c701be961ca
+title: Pause and resume
+frames: 300
+start-frame: 820
+start-hash: 9e3bcaeec25c47d872140e0eabc37691
+end-hash: 67a3ba727e19f9ce0938811caf332634
+---
+30 P1 JOYPAD START 1
+30 [EVENT] Pause
+34 P1 JOYPAD START 0
+200 P1 JOYPAD START 1
+200 [EVENT] Resume
+204 P1 JOYPAD START 0

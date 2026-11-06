@@ -63,7 +63,7 @@ pub fn devices_at_start(col: &Collection, id: &str) -> Result<BTreeMap<u32, u32>
     let mut devs = BTreeMap::new();
     for p in &col.config.ports {
         if p.port == 0 {
-            bail!("collection.toml ports start at 1");
+            bail!("config.toml ports start at 1");
         }
         devs.insert(p.port - 1, device_from_name(&p.device)?);
     }
@@ -205,7 +205,7 @@ impl Session {
             h.update(&(bytes.len() as u64).to_le_bytes());
             h.update(&bytes);
         }
-        Ok(format!("blake3-{}", h.finalize().to_hex()))
+        Ok(crate::format::hash_hex(&h.finalize()))
     }
 
     /// Puts the core at the start of trunk `r`.
@@ -213,11 +213,11 @@ impl Session {
         let boot = self.boot_state.clone();
         self.core.unserialize(&boot)?;
         if let Some(save) = r.get("save") {
-            let data = col.read_blob(save)?;
+            let data = col.read_blob(save, "save")?;
             self.core.unserialize(&data).with_context(|| format!("loading save blob {save}"))?;
         }
         if let Some(sram) = r.get("sram") {
-            let data = col.read_blob(sram)?;
+            let data = col.read_blob(sram, "sram")?;
             let mem = self.core.memory(crate::libretro::MEMORY_SAVE_RAM).ok_or_else(|| anyhow!("core exposes no save RAM"))?;
             if data.len() != mem.len() {
                 eprintln!("warning: SRAM blob is {} bytes but the core's save RAM is {}", data.len(), mem.len());

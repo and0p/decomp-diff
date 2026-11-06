@@ -211,15 +211,15 @@ fn open_session(col: &Collection, local: &Local) -> Result<Session> {
 }
 
 fn init(dir: &Path, name: &str, rom: &Path, core_path: &Path, core_build: Option<String>, options: &[String], symbols: Option<&Path>) -> Result<()> {
-    if dir.join("collection.toml").exists() {
-        bail!("{} already has a collection.toml", dir.display());
+    if dir.join("config.toml").exists() || dir.join("collection.toml").exists() {
+        bail!("{} already has a project", dir.display());
     }
     let mut overrides = BTreeMap::new();
     for o in options {
         let (k, v) = o.split_once('=').ok_or_else(|| anyhow!("--option takes KEY=VALUE"))?;
         overrides.insert(k.to_string(), v.to_string());
     }
-    std::fs::create_dir_all(dir.join("replays"))?;
+    std::fs::create_dir_all(dir.join("segments"))?;
     std::fs::create_dir_all(dir.join("blobs"))?;
     let work = dir.join(".local");
     let (lib_name, lib_version, effective, regions) = {
@@ -255,10 +255,10 @@ fn init(dir: &Path, name: &str, rom: &Path, core_path: &Path, core_build: Option
         symbols: syms,
         cache: None,
     };
-    std::fs::write(dir.join("collection.toml"), toml::to_string_pretty(&config)?)?;
+    std::fs::write(dir.join("config.toml"), toml::to_string_pretty(&config)?)?;
     let col = Collection::open(dir)?;
     col.save_local(&LocalConfig { rom: Some(std::fs::canonicalize(rom)?), core: Some(std::fs::canonicalize(core_path)?), ..Default::default() })?;
-    println!("created {}", dir.join("collection.toml").display());
+    println!("created {}", dir.join("config.toml").display());
     Ok(())
 }
 

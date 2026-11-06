@@ -1,9 +1,0 @@
-dj-replay 1
-id: 3e01aaa6-9949-4ac4-882c-c78ef88ede10
-parent: 8185797c-dedb-4109-a181-77ffd75d6769
-title: A40 idle 6: wait 16f
-frames: 16
-start-frame: 606
-start-hash: blake3-b92752a103f23a84df2fd70b7bc233f8c1a557b88cf947f2c4889da00e8da619
-end-hash: blake3-d2aa9a66f09873b4a91797c8caa4d7961d6ace559e0339b726e1edd8b721e6ca
----

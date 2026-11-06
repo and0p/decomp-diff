@@ -1,0 +1,14 @@
+dj-replay 1
+id: 593fb2b6-aa55-4ae7-a932-f242a9727a8d
+parent: 5645baa6-44a5-42ab-acae-fae17946ce60
+title: Select B-Type
+frames: 60
+start-frame: 640
+start-hash: 62de0f1ee7eb843745094bc7858e00a1
+end-hash: c222beb5599e575cbe81304fe847c040
+---
+0 P1 JOYPAD RIGHT 1
+7 P1 JOYPAD RIGHT 0
+10 [EVENT] Game type: START (B-type)
+10 P1 JOYPAD START 1
+15 P1 JOYPAD START 0

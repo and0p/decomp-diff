@@ -30,4 +30,4 @@ cp "$build/thwaite-nes/thwaite.nes" "$build/thwaite-nes/thwaite.dbg" "$build/"
 
 echo "built $build/thwaite.nes"
 if command -v sha256sum >/dev/null; then sha256sum "$build/thwaite.nes"; else shasum -a 256 "$build/thwaite.nes"; fi
-echo "collection.toml expects ee51cd9562f28195ba015d9857c6c4fc9bf67cdfb213e95f655e586b92195173"
+echo "config.toml expects ee51cd9562f28195ba015d9857c6c4fc9bf67cdfb213e95f655e586b92195173"
