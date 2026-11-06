@@ -7,7 +7,7 @@ os.makedirs(f"{out}/replays", exist_ok=True)
 src = open(f"{out}/../thwaite/collection.toml").read()
 src = src.replace('name = "Thwaite"', 'name = "Thwaite (deep tree)"').replace('file = "build/thwaite.dbg"', 'file = "../thwaite/build/thwaite.dbg"')
 open(f"{out}/collection.toml", "w").write(src)
-open(f"{out}/.gitignore", "w").write(".emucov/\n")
+open(f"{out}/.gitignore", "w").write(".local/\n")
 count = 0
 def node(parent, title, frames, lines=()):
     global count
@@ -15,7 +15,7 @@ def node(parent, title, frames, lines=()):
     i = str(uuid.UUID(int=rnd.getrandbits(128), version=4))
     body = "\n".join(lines)
     open(f"{out}/replays/{i}.replay", "w").write(
-        f"emucov-replay 1\nid: {i}\nparent: {parent or 'none'}\ntitle: {title}\nframes: {frames}\n---\n" + (body + "\n" if body else ""))
+        f"dj-replay 1\nid: {i}\nparent: {parent or 'none'}\ntitle: {title}\nframes: {frames}\n---\n" + (body + "\n" if body else ""))
     return i
 def tap(btn, at=2):
     return [f"{at} P1 JOYPAD {btn} 1", f"{at + 3} P1 JOYPAD {btn} 0"]

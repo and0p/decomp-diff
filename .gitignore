@@ -2,6 +2,6 @@
 target/
 # Cores and other build products
 build/
-.emucov/
+.local/
 .DS_Store
 scratchpad.md

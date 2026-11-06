@@ -1,4 +1,4 @@
-# emucov-gui
+# dj-gui
 
 A desktop viewer and editor for replay collections, built with egui. It loads one
 libretro core and lets you browse the replay tree, play and seek with live video,
@@ -10,7 +10,7 @@ for how to build, run and use it.
 | `src/main.rs` | The app: menus, replay tree, preview, playback and seeking, applying edits |
 | `src/roll.rs` | The piano roll: building rows from a replay, drawing, scrolling, zoom, drag to edit |
 
-The emulation itself goes through the `emucov` library in [player/](../player/)
+The emulation itself goes through the `decomp_dj` library in [player/](../player/)
 (`Session::enter_replay`, `restore_inputs`, `step`, `snapshot`), so the GUI and the
 CLI play replays the same way. Every recorded Thwaite end hash matches when it is
 played in the GUI.
@@ -20,7 +20,7 @@ played in the GUI.
 - Video frames are not cached. While a replay plays, the GUI keeps a save state
   in memory at the start of every 10th frame (`SNAP_EVERY` in `src/main.rs`).
 - A seek uses the nearest snapshot at or before the target: from memory, or from
-  the local database (`.emucov/cache.db`) when a stored one is nearer. It sets
+  the local database (`.local/cache.db`) when a stored one is nearer. It sets
   the held inputs again, because input state is not part of a save state, then
   runs the core forward and draws only the last frame. How many snapshots the
   database has depends on the collection's `[cache]` settings (QUICKSTART.md);
@@ -37,7 +37,7 @@ played in the GUI.
   applied once the load finishes.
 - An edit drops the save states after the edited frame and redraws the current frame.
 - **Memory limit.** In-memory snapshots stay under Emulation > Snapshot memory
-  (`max_memory_mb` in `.emucov/local.toml`, 512 MB by default). Past it, the
+  (`max_memory_mb` in `.local/local.toml`, 512 MB by default). Past it, the
   snapshots farthest from the playhead go first; frame 0 always stays, and
   anchors every 300 frames stay while they fit. An NES state is a few tens of KB,
   so NES never reaches it; it matters for cores with large states.
@@ -45,7 +45,7 @@ played in the GUI.
 ## Hydrating
 
 Emulation > Hydrate all (or right-click > Hydrate this segment / this and below)
-runs the shared `emucov::hydrate::Hydrator` in the same 25 ms slices, showing
+runs the shared `decomp_dj::hydrate::Hydrator` in the same 25 ms slices, showing
 every 4th frame. Selecting, seeking and playing wait until it ends; Pause and
 Stop are in the status bar. Afterwards the selected segment is loaded again.
 

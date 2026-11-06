@@ -538,6 +538,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "decomp-dj"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "libloading",
+ "png 0.17.16",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -563,6 +581,18 @@ dependencies = [
  "block2 0.6.2",
  "libc",
  "objc2 0.6.5",
+]
+
+[[package]]
+name = "dj-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "decomp-dj",
+ "eframe",
+ "egui",
+ "rfd",
+ "uuid",
 ]
 
 [[package]]
@@ -730,36 +760,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e73ce90f54750be8672c02be0743fe47530e6f251e066f0ee2869b59eb297af5"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "emucov"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "libloading",
- "png 0.17.16",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "toml",
- "uuid",
- "zstd",
-]
-
-[[package]]
-name = "emucov-gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "eframe",
- "egui",
- "emucov",
- "rfd",
- "uuid",
 ]
 
 [[package]]

@@ -113,6 +113,19 @@ impl Status {
 
 impl Collection {
     pub fn open(root: &Path) -> Result<Collection> {
+        // The local folder used to be `.emucov`; move it to `.local` the first time.
+        let (old, new) = (root.join(".emucov"), root.join(".local"));
+        if old.is_dir() && !new.exists() {
+            std::fs::rename(&old, &new).with_context(|| format!("moving {} to {}", old.display(), new.display()))?;
+            // Keep it ignored: a collection's .gitignore that names .emucov/ gets .local/ instead.
+            let gi = root.join(".gitignore");
+            if let Ok(text) = std::fs::read_to_string(&gi) {
+                if text.lines().any(|l| l.trim() == ".emucov/" || l.trim() == ".emucov") && !text.lines().any(|l| l.trim().trim_end_matches('/') == ".local") {
+                    let fixed: Vec<String> = text.lines().map(|l| if l.trim().trim_end_matches('/') == ".emucov" { ".local/".to_string() } else { l.to_string() }).collect();
+                    std::fs::write(&gi, fixed.join("\n") + "\n")?;
+                }
+            }
+        }
         let cfg_path = root.join("collection.toml");
         let text = std::fs::read_to_string(&cfg_path).with_context(|| format!("reading {}", cfg_path.display()))?;
         let config: Config = toml::from_str(&text).with_context(|| format!("parsing {}", cfg_path.display()))?;
@@ -167,7 +180,7 @@ impl Collection {
     }
 
     pub fn local_dir(&self) -> PathBuf {
-        self.root.join(".emucov")
+        self.root.join(".local")
     }
 
     pub fn load_local(&self) -> Result<LocalConfig> {
@@ -183,7 +196,7 @@ impl Collection {
         std::fs::write(self.local_dir().join("local.toml"), toml::to_string_pretty(local)?)?;
         let gi = self.root.join(".gitignore");
         if !gi.exists() {
-            std::fs::write(gi, ".emucov/\n")?;
+            std::fs::write(gi, ".local/\n")?;
         }
         Ok(())
     }

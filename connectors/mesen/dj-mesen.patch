@@ -6,8 +6,8 @@ index da52796..b484244 100644
  #include <random>
  #include <assert.h>
  #include "CPU.h"
-+#ifdef EMUCOV
-+#include "EmuCoverage.h"
++#ifdef DECOMP_DJ
++#include "DjCoverage.h"
 +#endif
  #include "PPU.h"
  #include "APU.h"
@@ -16,24 +16,24 @@ index da52796..b484244 100644
  	ProcessPendingDma(addr);
  
  	StartCpuCycle(true);
-+#ifdef EMUCOV
++#ifdef DECOMP_DJ
 +	if(operationType == MemoryOperationType::ExecOpCode || operationType == MemoryOperationType::ExecOperand) {
-+		EmuCoverage::OnExec(_console->GetMapper(), addr, operationType == MemoryOperationType::ExecOpCode);
++		DjCoverage::OnExec(_console->GetMapper(), addr, operationType == MemoryOperationType::ExecOpCode);
 +	}
 +#endif
  	uint8_t value = _memoryManager->Read(addr, operationType);
  	EndCpuCycle(true);
  	return value;
-diff --git a/Core/EmuCoverage.cpp b/Core/EmuCoverage.cpp
+diff --git a/Core/DjCoverage.cpp b/Core/DjCoverage.cpp
 new file mode 100644
 index 0000000..6da552f
 --- /dev/null
-+++ b/Core/EmuCoverage.cpp
++++ b/Core/DjCoverage.cpp
 @@ -0,0 +1,105 @@
 +#include "stdafx.h"
 +#include <cstring>
 +#include <vector>
-+#include "EmuCoverage.h"
++#include "DjCoverage.h"
 +#include "BaseMapper.h"
 +#include "DebuggerTypes.h"
 +
@@ -70,7 +70,7 @@ index 0000000..6da552f
 +	}
 +}
 +
-+void EmuCoverage::OnExec(BaseMapper* mapper, uint16_t addr, bool opcode)
++void DjCoverage::OnExec(BaseMapper* mapper, uint16_t addr, bool opcode)
 +{
 +	if(mapper != _mapper) {
 +		Attach(mapper);
@@ -84,17 +84,17 @@ index 0000000..6da552f
 +	if(region < 0 || (size_t)info.Address >= _flags[region].size()) {
 +		return;
 +	}
-+	_flags[region][info.Address] |= opcode ? EMUCOV_FLAG_OPCODE : EMUCOV_FLAG_OPERAND;
++	_flags[region][info.Address] |= opcode ? DJ_FLAG_OPCODE : DJ_FLAG_OPERAND;
 +	if(opcode && region == _tickRegion && info.Address == _tickOffset) {
 +		_tickCount++;
 +	}
 +}
 +
 +extern "C" {
-+	static unsigned emucov_api_version(void) { return 1; }
-+	static size_t emucov_region_count(void) { return RegCount; }
++	static unsigned dj_api_version(void) { return 1; }
++	static size_t dj_region_count(void) { return RegCount; }
 +
-+	static bool emucov_get_region(size_t index, struct emucov_region* out)
++	static bool dj_get_region(size_t index, struct dj_region* out)
 +	{
 +		if(index >= RegCount || !out) {
 +			return false;
@@ -105,7 +105,7 @@ index 0000000..6da552f
 +		return true;
 +	}
 +
-+	static void emucov_clear(void)
++	static void dj_clear(void)
 +	{
 +		for(auto& f : _flags) {
 +			std::fill(f.begin(), f.end(), 0);
@@ -113,39 +113,39 @@ index 0000000..6da552f
 +		_tickCount = 0;
 +	}
 +
-+	// region: index as in emucov_get_region, or -1 to disable tick counting.
-+	static void emucov_set_tick_exec(int region, int64_t offset)
++	// region: index as in dj_get_region, or -1 to disable tick counting.
++	static void dj_set_tick_exec(int region, int64_t offset)
 +	{
 +		_tickRegion = region;
 +		_tickOffset = offset;
 +		_tickCount = 0;
 +	}
 +
-+	static uint64_t emucov_get_tick_count(void) { return _tickCount; }
++	static uint64_t dj_get_tick_count(void) { return _tickCount; }
 +}
 +
-+void* EmuCoverage::GetProcAddress(const char* sym)
++void* DjCoverage::GetProcAddress(const char* sym)
 +{
 +	if(!sym) return nullptr;
-+	if(!strcmp(sym, "emucov_api_version")) return (void*)&emucov_api_version;
-+	if(!strcmp(sym, "emucov_region_count")) return (void*)&emucov_region_count;
-+	if(!strcmp(sym, "emucov_get_region")) return (void*)&emucov_get_region;
-+	if(!strcmp(sym, "emucov_clear")) return (void*)&emucov_clear;
-+	if(!strcmp(sym, "emucov_set_tick_exec")) return (void*)&emucov_set_tick_exec;
-+	if(!strcmp(sym, "emucov_get_tick_count")) return (void*)&emucov_get_tick_count;
++	if(!strcmp(sym, "dj_api_version")) return (void*)&dj_api_version;
++	if(!strcmp(sym, "dj_region_count")) return (void*)&dj_region_count;
++	if(!strcmp(sym, "dj_get_region")) return (void*)&dj_get_region;
++	if(!strcmp(sym, "dj_clear")) return (void*)&dj_clear;
++	if(!strcmp(sym, "dj_set_tick_exec")) return (void*)&dj_set_tick_exec;
++	if(!strcmp(sym, "dj_get_tick_count")) return (void*)&dj_get_tick_count;
 +	return nullptr;
 +}
-diff --git a/Core/EmuCoverage.h b/Core/EmuCoverage.h
+diff --git a/Core/DjCoverage.h b/Core/DjCoverage.h
 new file mode 100644
 index 0000000..6271d67
 --- /dev/null
-+++ b/Core/EmuCoverage.h
++++ b/Core/DjCoverage.h
 @@ -0,0 +1,27 @@
 +// emu_coverage connector for Mesen (libretro core).
 +// Records which bytes of each code region the CPU executed, keyed by offset
 +// into the region (PRG ROM offset, not CPU address), and counts "logic ticks"
 +// (executions of one chosen location). Exposed to frontends through
-+// RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK as emucov_* functions.
++// RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK as dj_* functions.
 +#pragma once
 +#include <stdint.h>
 +#include <stddef.h>
@@ -153,17 +153,17 @@ index 0000000..6271d67
 +class BaseMapper;
 +
 +// Flag bits stored per byte.
-+#define EMUCOV_FLAG_OPCODE  0x01  // executed as the first byte of an instruction
-+#define EMUCOV_FLAG_OPERAND 0x02  // executed as an operand byte
++#define DJ_FLAG_OPCODE  0x01  // executed as the first byte of an instruction
++#define DJ_FLAG_OPERAND 0x02  // executed as an operand byte
 +
-+struct emucov_region
++struct dj_region
 +{
 +	const char* name;     // "RAM", "PRG", "WRAM", "SRAM"
-+	uint8_t* flags;       // one byte of EMUCOV_FLAG_* per byte of the region
++	uint8_t* flags;       // one byte of DJ_FLAG_* per byte of the region
 +	size_t size;
 +};
 +
-+namespace EmuCoverage
++namespace DjCoverage
 +{
 +	void OnExec(BaseMapper* mapper, uint16_t addr, bool opcode);
 +	void* GetProcAddress(const char* sym);
@@ -177,7 +177,7 @@ index 02db726..54fc77f 100644
  
  CFLAGS   += -D LIBRETRO $(fpic) $(LTO)
 -CXXFLAGS += -D LIBRETRO $(fpic) -std=c++11 $(LTO)
-+CXXFLAGS += -D LIBRETRO -D EMUCOV $(fpic) -std=c++11 $(LTO)
++CXXFLAGS += -D LIBRETRO -D DECOMP_DJ $(fpic) -std=c++11 $(LTO)
  LDFLAGS  += $(LTO)
  
  all: $(TARGET)
@@ -189,7 +189,7 @@ index a25e446..04ff8aa 100644
                 $(CORE_DIR)/Console.cpp \
                 $(CORE_DIR)/ControlManager.cpp \
                 $(CORE_DIR)/CPU.cpp \
-+               $(CORE_DIR)/EmuCoverage.cpp \
++               $(CORE_DIR)/DjCoverage.cpp \
                 $(CORE_DIR)/CrossFeedFilter.cpp \
                 $(CORE_DIR)/DefaultVideoFilter.cpp \
                 $(CORE_DIR)/RawVideoFilter.cpp \
@@ -201,8 +201,8 @@ index 48fa641..71b17ae 100644
  #include "LibretroKeyManager.h"
  #include "LibretroMessageManager.h"
  #include "libretro.h"
-+#ifdef EMUCOV
-+#include "../Core/EmuCoverage.h"
++#ifdef DECOMP_DJ
++#include "../Core/DjCoverage.h"
 +#endif
  #include "libretro_core_options.h"
  #include "../Core/Console.h"
@@ -211,12 +211,12 @@ index 48fa641..71b17ae 100644
  		bool option_categories = false;
  		env_cb = env;
  
-+#ifdef EMUCOV
++#ifdef DECOMP_DJ
 +		{
-+			static struct retro_get_proc_address_interface emucovProcs = {
-+				[](const char* sym) -> retro_proc_address_t { return (retro_proc_address_t)EmuCoverage::GetProcAddress(sym); }
++			static struct retro_get_proc_address_interface djProcs = {
++				[](const char* sym) -> retro_proc_address_t { return (retro_proc_address_t)DjCoverage::GetProcAddress(sym); }
 +			};
-+			env_cb(RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK, &emucovProcs);
++			env_cb(RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK, &djProcs);
 +		}
 +#endif
 +

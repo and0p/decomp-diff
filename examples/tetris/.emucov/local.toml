@@ -1,0 +1,2 @@
+rom = "/Users/andrew/Source/emu_coverage/examples/tetris/build/tetris_usa.nes"
+core = "/Users/andrew/Source/emu_coverage/build/cores/mesen_libretro.dylib"

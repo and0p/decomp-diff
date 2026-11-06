@@ -1,5 +1,5 @@
 //! A minimal headless libretro frontend: loads a core, feeds it input, reads memory,
-//! saves and loads states, captures video frames, and talks to an emu_coverage connector.
+//! saves and loads states, captures video frames, and talks to a decomp-dj coverage connector.
 //!
 //! libretro cores keep global state and call back into plain C functions, so only
 //! one `Core` may exist per process. The callbacks reach the frontend's state
@@ -119,7 +119,7 @@ struct MemoryMap {
 }
 
 #[repr(C)]
-struct EmucovRegionC {
+struct DjRegionC {
     name: *const c_char,
     flags: *mut u8,
     size: usize,
@@ -389,7 +389,7 @@ struct Api {
 
 pub struct Connector {
     region_count: unsafe extern "C" fn() -> usize,
-    get_region: unsafe extern "C" fn(usize, *mut EmucovRegionC) -> bool,
+    get_region: unsafe extern "C" fn(usize, *mut DjRegionC) -> bool,
     clear: unsafe extern "C" fn(),
     set_tick_exec: unsafe extern "C" fn(i32, i64),
     get_tick_count: unsafe extern "C" fn() -> u64,
@@ -493,17 +493,17 @@ impl Core {
                     let c = CString::new(name).unwrap();
                     gpa(c.as_ptr())
                 };
-                let version: unsafe extern "C" fn() -> u32 = std::mem::transmute(get("emucov_api_version")?);
+                let version: unsafe extern "C" fn() -> u32 = std::mem::transmute(get("dj_api_version")?);
                 if version() != 1 {
                     eprintln!("warning: coverage connector API version {} is not supported", version());
                     return None;
                 }
                 Some(Connector {
-                    region_count: std::mem::transmute(get("emucov_region_count")?),
-                    get_region: std::mem::transmute(get("emucov_get_region")?),
-                    clear: std::mem::transmute(get("emucov_clear")?),
-                    set_tick_exec: std::mem::transmute(get("emucov_set_tick_exec")?),
-                    get_tick_count: std::mem::transmute(get("emucov_get_tick_count")?),
+                    region_count: std::mem::transmute(get("dj_region_count")?),
+                    get_region: std::mem::transmute(get("dj_get_region")?),
+                    clear: std::mem::transmute(get("dj_clear")?),
+                    set_tick_exec: std::mem::transmute(get("dj_set_tick_exec")?),
+                    get_tick_count: std::mem::transmute(get("dj_get_tick_count")?),
                 })
             });
 
@@ -651,7 +651,7 @@ impl Core {
         let mut out = vec![];
         unsafe {
             for i in 0..(c.region_count)() {
-                let mut r = EmucovRegionC { name: std::ptr::null(), flags: std::ptr::null_mut(), size: 0 };
+                let mut r = DjRegionC { name: std::ptr::null(), flags: std::ptr::null_mut(), size: 0 };
                 if !(c.get_region)(i, &mut r) {
                     continue;
                 }
@@ -667,7 +667,7 @@ impl Core {
     pub fn coverage_slice(&mut self, i: usize) -> Option<&[u8]> {
         let c = self.connector.as_ref()?;
         unsafe {
-            let mut r = EmucovRegionC { name: std::ptr::null(), flags: std::ptr::null_mut(), size: 0 };
+            let mut r = DjRegionC { name: std::ptr::null(), flags: std::ptr::null_mut(), size: 0 };
             if !(c.get_region)(i as _, &mut r) || r.flags.is_null() {
                 return None;
             }
@@ -679,7 +679,7 @@ impl Core {
         let Some(c) = &self.connector else { return None };
         unsafe {
             for i in 0..(c.region_count)() {
-                let mut r = EmucovRegionC { name: std::ptr::null(), flags: std::ptr::null_mut(), size: 0 };
+                let mut r = DjRegionC { name: std::ptr::null(), flags: std::ptr::null_mut(), size: 0 };
                 if (c.get_region)(i, &mut r) && !r.name.is_null() && CStr::from_ptr(r.name).to_string_lossy() == name {
                     return Some(i);
                 }

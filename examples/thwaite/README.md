@@ -2,7 +2,7 @@
 
 A small replay collection for [Thwaite](https://github.com/pinobatch/thwaite-nes),
 a free NES game by Damian Yerrick (GPL-3.0). It is the end-to-end test for
-emu_coverage: 12 replays that boot the game, go through every menu, play,
+decomp-dj: 12 replays that boot the game, go through every menu, play,
 pause, lose, use a SNES mouse, and include one poked replay.
 
 ```
@@ -26,7 +26,7 @@ Boot, skip the legal screen
 ./build-rom.sh                                   # ROM + symbols into build/
 ../../connectors/mesen/build.sh                  # core with the coverage connector
 cd ../../player && cargo build --release && cd -
-E=../../player/target/release/emucov
+E=../../player/target/release/dj
 $E run . --rom build/thwaite.nes --core ../../build/cores/mesen_libretro.so   # .so/.dylib/.dll
 $E report . --gaps gaps.csv
 ```

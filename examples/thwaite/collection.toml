@@ -7,7 +7,7 @@ file = "thwaite.nes"
 
 [core]
 name = "mesen"
-build = "mesen@0102910c+emucov1"
+build = "mesen@0102910c+dj1"
 sha256 = ""
 
 [core.options]

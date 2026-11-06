@@ -1,17 +1,17 @@
-use emucov::{cache, coverage, libretro};
+use decomp_dj::{cache, coverage, libretro};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use emucov::collection::{sha256_file, Collection, Config, CoreConfig, HashConfig, LocalConfig, PortConfig, RomConfig, Status, SymbolsConfig};
-use emucov::format::Replay;
-use emucov::hydrate::Hydrator;
-use emucov::player::{PlayOptions, ReplayResult, Session};
+use decomp_dj::collection::{sha256_file, Collection, Config, CoreConfig, HashConfig, LocalConfig, PortConfig, RomConfig, Status, SymbolsConfig};
+use decomp_dj::format::Replay;
+use decomp_dj::hydrate::Hydrator;
+use decomp_dj::player::{PlayOptions, ReplayResult, Session};
 
 #[derive(Parser)]
-#[command(name = "emucov", version, about = "Play libretro input-replay trees, check state hashes, and measure ROM code coverage")]
+#[command(name = "dj", version, about = "Play libretro input-replay trees, check state hashes, and measure ROM code coverage")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -19,13 +19,13 @@ struct Cli {
 
 #[derive(clap::Args, Clone)]
 struct Local {
-    /// ROM file (default: the one saved in .emucov/local.toml)
+    /// ROM file (default: the one saved in .local/local.toml)
     #[arg(long, global = true)]
     rom: Option<PathBuf>,
-    /// libretro core library (default: the one saved in .emucov/local.toml)
+    /// libretro core library (default: the one saved in .local/local.toml)
     #[arg(long, global = true)]
     core: Option<PathBuf>,
-    /// Run without the local database (.emucov/cache.db), playing everything from power-on
+    /// Run without the local database (.local/cache.db), playing everything from power-on
     #[arg(long, global = true)]
     no_db: bool,
 }
@@ -93,7 +93,7 @@ enum Cmd {
         /// Write the hashes this run produced into the replay files
         #[arg(long)]
         accept: bool,
-        /// Save each segment's last frame to .emucov/screenshots/
+        /// Save each segment's last frame to .local/screenshots/
         #[arg(long)]
         screenshots: bool,
     },
@@ -221,7 +221,7 @@ fn init(dir: &Path, name: &str, rom: &Path, core_path: &Path, core_build: Option
     }
     std::fs::create_dir_all(dir.join("replays"))?;
     std::fs::create_dir_all(dir.join("blobs"))?;
-    let work = dir.join(".emucov");
+    let work = dir.join(".local");
     let (lib_name, lib_version, effective, regions) = {
         let mut core = libretro::Core::load(core_path, &work, &overrides)?;
         core.load_game(rom)?;
@@ -493,13 +493,13 @@ fn hydrate(dir: &Path, local: &Local, segment: Option<String>, children: bool, c
 }
 
 fn latest_setup(conn: &rusqlite::Connection) -> Result<String> {
-    conn.query_row("SELECT setup FROM contents ORDER BY played_at DESC LIMIT 1", [], |r| r.get(0)).context("the local database is empty; run `emucov hydrate` first")
+    conn.query_row("SELECT setup FROM contents ORDER BY played_at DESC LIMIT 1", [], |r| r.get(0)).context("the local database is empty; run `dj hydrate` first")
 }
 
 fn where_cmd(dir: &Path, what: &str, local: &Local) -> Result<()> {
     let col = Collection::open(dir)?;
     let conn = cache::Cache::open_readonly(&col)?;
-    let (region, offset) = if let Ok(ro) = emucov::player::parse_region_offset(what) {
+    let (region, offset) = if let Ok(ro) = decomp_dj::player::parse_region_offset(what) {
         ro
     } else if let Some(h) = what.strip_prefix("0x") {
         ("PRG".to_string(), u64::from_str_radix(h, 16)?)
@@ -509,8 +509,8 @@ fn where_cmd(dir: &Path, what: &str, local: &Local) -> Result<()> {
         for sym in &col.config.symbols {
             let path = col.root.join(&sym.file);
             let funcs = match sym.format.as_str() {
-                "ca65-dbg" => emucov::analysis::load_ca65_dbg(&path, sym.rom_header.unwrap_or(16))?,
-                "csv" => emucov::analysis::load_csv(&path)?,
+                "ca65-dbg" => decomp_dj::analysis::load_ca65_dbg(&path, sym.rom_header.unwrap_or(16))?,
+                "csv" => decomp_dj::analysis::load_csv(&path)?,
                 _ => continue,
             };
             if let Some(f) = funcs.iter().find(|f| f.name == what) {
@@ -650,7 +650,7 @@ fn cache_stats(dir: &Path) -> Result<()> {
     }
     if let Some(b) = settings.budget_bytes {
         if size > b {
-            println!("  over the {} budget; run `emucov cache gc`", human(b as i64));
+            println!("  over the {} budget; run `dj cache gc`", human(b as i64));
         }
     }
     Ok(())

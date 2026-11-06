@@ -1,4 +1,4 @@
-//! emucov-gui: browse a replay collection, play replays with live video, and
+//! dj-gui: browse a replay collection, play replays with live video, and
 //! edit button inputs on a piano roll.
 //!
 //! Layout: menu bar on top, replay tree on the left, emulator preview in the
@@ -6,10 +6,10 @@
 
 use anyhow::{anyhow, Result};
 use eframe::egui::{self, Color32, RichText};
-use emucov::collection::{Collection, LocalConfig, Status};
-use emucov::format::{Command, InputKey};
-use emucov::hydrate::Hydrator;
-use emucov::player::{trunk_start_frame, Session};
+use decomp_dj::collection::{Collection, LocalConfig, Status};
+use decomp_dj::format::{Command, InputKey};
+use decomp_dj::hydrate::Hydrator;
+use decomp_dj::player::{trunk_start_frame, Session};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -21,11 +21,11 @@ const SNAP_EVERY: u64 = 10;
 fn main() -> eframe::Result {
     let start = std::env::args().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 860.0]).with_min_inner_size([800.0, 560.0]).with_title("emucov"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 860.0]).with_min_inner_size([800.0, 560.0]).with_title("decomp-dj"),
         ..Default::default()
     };
     eframe::run_native(
-        "emucov",
+        "decomp-dj",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
@@ -147,7 +147,7 @@ const JOB_SLICE: std::time::Duration = std::time::Duration::from_millis(25);
 /// (None: the segment did not exist), and where the user was.
 struct UndoStep {
     label: String,
-    segments: Vec<(String, Option<emucov::format::Replay>)>,
+    segments: Vec<(String, Option<decomp_dj::format::Replay>)>,
     selected: Option<String>,
     frame: Option<u64>,
 }
@@ -387,7 +387,7 @@ fn subtree(col: &Collection, id: &str) -> Vec<String> {
 }
 
 /// The first frame where two versions of a segment's lines differ, if they do.
-fn first_change(a: &emucov::format::Replay, b: &emucov::format::Replay) -> Option<u64> {
+fn first_change(a: &decomp_dj::format::Replay, b: &decomp_dj::format::Replay) -> Option<u64> {
     let n = a.lines.len().min(b.lines.len());
     for i in 0..n {
         let (x, y) = (&a.lines[i], &b.lines[i]);
@@ -1244,8 +1244,8 @@ impl App {
         // first note). Some platforms only report Ctrl/Cmd+V when the clipboard holds text.
         let mut lines: Vec<(u64, String)> = vec![];
         for (k, sp) in &notes {
-            lines.push((sp.0 - base, emucov::format::input_text(*k, 1)));
-            lines.push((sp.1 - base, emucov::format::input_text(*k, 0)));
+            lines.push((sp.0 - base, decomp_dj::format::input_text(*k, 1)));
+            lines.push((sp.1 - base, decomp_dj::format::input_text(*k, 0)));
         }
         lines.sort();
         let text: Vec<String> = lines.into_iter().map(|(f, t)| format!("{f} {t}")).collect();
@@ -1348,7 +1348,7 @@ impl App {
         p.set("frames", &(pf + cf).to_string());
         for (key, v) in held {
             if v != 0 {
-                p.insert_line(pf, &emucov::format::input_text(key, 0))?;
+                p.insert_line(pf, &decomp_dj::format::input_text(key, 0))?;
             }
         }
         if let Some(m) = marker.map(str::trim).filter(|m| !m.is_empty()) {
@@ -1434,7 +1434,7 @@ impl App {
         let id = Self::new_id();
         self.remember("New segment", &[&id]);
         let Some(col) = &mut self.col else { return };
-        let r = emucov::format::Replay::new(&id, Some(parent), "New segment", 600);
+        let r = decomp_dj::format::Replay::new(&id, Some(parent), "New segment", 600);
         col.replays.insert(id.clone(), r);
         self.edited.insert(id.clone());
         self.tree_closed.remove(parent);
@@ -1495,7 +1495,7 @@ impl App {
         self.edited.insert(up_id.clone());
         self.roll.invalidate();
         if branch {
-            let r = emucov::format::Replay::new(&b, Some(&up_id), "New branch", 600);
+            let r = decomp_dj::format::Replay::new(&b, Some(&up_id), "New branch", 600);
             col.replays.insert(b.clone(), r);
             self.edited.insert(b.clone());
             self.info(format!("Split at frame {f}: the first {f} frames are a new parent segment, and a new branch starts beside the rest."));
@@ -2323,7 +2323,7 @@ impl App {
         self.stored_ids.clear();
         let (Some(col), Some(s)) = (&self.col, &self.session) else { return };
         let Some(c) = &s.cache else { return };
-        if let Ok(keys) = emucov::cache::current_keys(c.conn(), col, &c.setup) {
+        if let Ok(keys) = decomp_dj::cache::current_keys(c.conn(), col, &c.setup) {
             for (id, (key, _)) in keys {
                 if let Some(k) = key {
                     if c.content(&k).ok().flatten().is_some() {
@@ -2408,7 +2408,7 @@ impl App {
             if let Some(col) = &mut self.col {
                 for e in hy.h.events.iter().filter(|e| e.verdict == "cleaned") {
                     if let Some(p) = col.paths.get(&e.id).cloned() {
-                        if let Ok(r) = emucov::format::Replay::load(&p) {
+                        if let Ok(r) = decomp_dj::format::Replay::load(&p) {
                             col.replays.insert(e.id.clone(), r);
                         }
                     }
@@ -2881,8 +2881,8 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         let title = match &self.col {
-            Some(c) => format!("emucov: {}{}", c.config.name, if self.edited.is_empty() { "" } else { " *" }),
-            None => "emucov".into(),
+            Some(c) => format!("decomp-dj: {}{}", c.config.name, if self.edited.is_empty() { "" } else { " *" }),
+            None => "decomp-dj".into(),
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 

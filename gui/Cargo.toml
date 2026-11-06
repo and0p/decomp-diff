@@ -1,16 +1,16 @@
 [package]
-name = "emucov-gui"
+name = "dj-gui"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Desktop viewer and editor for emucov replay collections"
+description = "Desktop viewer and editor for decomp-dj replay collections"
 
 [[bin]]
-name = "emucov-gui"
+name = "dj-gui"
 path = "src/main.rs"
 
 [dependencies]
-emucov = { path = "../player" }
+decomp-dj = { path = "../player" }
 anyhow = "1"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "clipboard", "wayland", "x11"] }
 egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }

@@ -89,7 +89,7 @@ fn opcode_set(flags: &[u8]) -> Vec<bool> {
 pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>) -> Result<Report> {
     let setup: String = conn
         .query_row("SELECT setup FROM contents ORDER BY played_at DESC LIMIT 1", [], |r| r.get(0))
-        .context("nothing has been played into the local database yet; run `emucov hydrate` first")?;
+        .context("nothing has been played into the local database yet; run `dj hydrate` first")?;
     let keys = cache::current_keys(conn, col, &setup)?;
     let mut cov: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
     let mut ticks: HashMap<String, Option<i64>> = HashMap::new();
@@ -113,7 +113,7 @@ pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>) -> 
         ticks.insert(id.clone(), t.flatten());
     }
     if cov.is_empty() {
-        bail!("no segment has coverage recorded for its current content (was the core built with a coverage connector?); run `emucov hydrate`");
+        bail!("no segment has coverage recorded for its current content (was the core built with a coverage connector?); run `dj hydrate`");
     }
     let unreachable = cache::load_unreachable(col)?;
     let is_unreachable = |off: u64| unreachable.iter().any(|u| u.region == "PRG" && off >= u.start && off <= u.end);

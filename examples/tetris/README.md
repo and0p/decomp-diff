@@ -33,8 +33,8 @@ goes back to the game type screen, not to the level grid.
 
 ```sh
 cd examples/tetris
-../../player/target/release/emucov run . --rom build/tetris_usa.nes --core ../../build/cores/mesen_libretro.dylib
-../../gui/target/release/emucov-gui .
+../../player/target/release/dj run . --rom build/tetris_usa.nes --core ../../build/cores/mesen_libretro.dylib
+../../gui/target/release/dj-gui .
 ```
 
 There are no symbols, so coverage reports can't name functions or blocks.
@@ -72,7 +72,7 @@ What this means for collections:
 - A node can pin the sequence with `[WRITE] RAM 0x17 <hi> <lo>` (or the spawn bytes)
   at a known frame. That makes its gameplay independent of upstream timing, at the cost
   of being a poke.
-- Ideas for emucov: per-collection watched addresses (here the random number and the
+- Ideas for decomp-dj: per-collection watched addresses (here the random number and the
   next piece) drawn as a lane in the piano roll, and after an edit, a marker at the first
   frame a watched value differs from the last run. A game-specific `[RNG]` command
   (reserved in SPEC.md) could set the random number by name.

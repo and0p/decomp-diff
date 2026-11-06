@@ -22,9 +22,9 @@ folder's README).
 
 ```sh
 cd examples/thwaite_deep
-E=../../player/target/release/emucov
+E=../../player/target/release/dj
 $E run . --rom ../thwaite/build/thwaite.nes --core ../../build/cores/mesen_libretro.so
-../../gui/target/release/emucov-gui .
+../../gui/target/release/dj-gui .
 ```
 
 All hashes are recorded, so `run` should report every segment clean.

@@ -1,13 +1,13 @@
 # Mesen connector
 
 Patches the [libretro Mesen core](https://github.com/libretro/Mesen) (NES/Famicom)
-so it reports which code ran, for emu_coverage.
+so it reports which code ran, for decomp-dj.
 
 - **Pinned upstream:** `0102910c39ad1a62bc3f784466f3f67ca9eae335` (2026-04-20).
 - **Build:** `connectors/mesen/build.sh` clones that commit, applies
-  `emucov-mesen.patch`, and builds `mesen_libretro.{so,dylib,dll}` into `build/cores/`.
+  `dj-mesen.patch`, and builds `mesen_libretro.{so,dylib,dll}` into `build/cores/`.
 - **License:** Mesen is GPL-3.0, so this patch and the core built from it are
-  GPL-3.0 too. The emu_coverage player is a separate program that loads the
+  GPL-3.0 too. The decomp-dj player is a separate program that loads the
   core at run time, like any libretro frontend, and stays MIT.
 
 ## Why Mesen
@@ -21,7 +21,7 @@ debugger, so the patch adds a small hook instead of reusing it.
 
 ## What the patch does
 
-- `CPU::MemoryRead` calls `EmuCoverage::OnExec` for every opcode fetch and
+- `CPU::MemoryRead` calls `DjCoverage::OnExec` for every opcode fetch and
   operand fetch, and marks the byte's offset in its region.
 - `retro_set_environment` registers `RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK`,
   which exposes the functions below.

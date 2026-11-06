@@ -1,8 +1,8 @@
 //! Scratch tool: plays a node's chain from power-on and prints chosen RAM bytes per frame.
 //! Usage: ramtrace <collection> <id> <hexaddr,...> [every]
-use emucov::collection::Collection;
-use emucov::libretro::region_memory_id;
-use emucov::player::Session;
+use decomp_dj::collection::Collection;
+use decomp_dj::libretro::region_memory_id;
+use decomp_dj::player::Session;
 use std::path::Path;
 
 fn main() -> anyhow::Result<()> {

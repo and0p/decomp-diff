@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-pub const MAGIC: &str = "emucov-replay 1";
+pub const MAGIC: &str = "dj-replay 1";
+/// The first line before the rename to decomp-dj. Still read; files are written with MAGIC.
+const OLD_MAGIC: &str = "emucov-replay 1";
 
 // libretro device ids (libretro.h).
 pub const DEVICE_NONE: u32 = 0;
@@ -77,7 +79,7 @@ impl Replay {
     pub fn parse(text: &str) -> Result<Replay> {
         let mut it = text.lines().enumerate();
         let first = it.next().map(|(_, l)| l.trim()).unwrap_or("");
-        if first != MAGIC {
+        if first != MAGIC && first != OLD_MAGIC {
             bail!("first line must be `{MAGIC}`");
         }
         let mut header = vec![];
@@ -760,7 +762,7 @@ fn parse_input(rest: &str) -> Result<Command> {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "emucov-replay 1
+    const SAMPLE: &str = "dj-replay 1
 id: 3b8f0f2c-1d44-4c1e-9e55-0d7a3c1b2e90
 parent: none
 title: Boot
@@ -800,7 +802,7 @@ frames: 100
 
     #[test]
     fn splits_and_edits_lines() {
-        let text = "emucov-replay 1\nid: a\nparent: none\nframes: 100\nend-hash: blake3-x\ncheckpoint: 20 blake3-c20\ncheckpoint: 80 blake3-c80\n---\n# note\n0 P1 JOYPAD A 1\n10 P1 JOYPAD RIGHT 1\n30 [EVENT] middle\n60 P1 JOYPAD RIGHT 0\n70 [WRITE] RAM 0x10 01 02\n";
+        let text = "dj-replay 1\nid: a\nparent: none\nframes: 100\nend-hash: blake3-x\ncheckpoint: 20 blake3-c20\ncheckpoint: 80 blake3-c80\n---\n# note\n0 P1 JOYPAD A 1\n10 P1 JOYPAD RIGHT 1\n30 [EVENT] middle\n60 P1 JOYPAD RIGHT 0\n70 [WRITE] RAM 0x10 01 02\n";
         let r = Replay::parse(text).unwrap();
         let (up, down) = r.split_at(50, "b").unwrap();
         assert_eq!(up.id().unwrap(), "b");

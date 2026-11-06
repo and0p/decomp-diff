@@ -7,8 +7,8 @@
 //! long replays with many presses stay cheap to draw.
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind};
-use emucov::collection::Collection;
-use emucov::format::{self, Command, InputKey, DEVICE_JOYPAD, DEVICE_KEYBOARD, DEVICE_MOUSE};
+use decomp_dj::collection::Collection;
+use decomp_dj::format::{self, Command, InputKey, DEVICE_JOYPAD, DEVICE_KEYBOARD, DEVICE_MOUSE};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const LABEL_W: f32 = 132.0;

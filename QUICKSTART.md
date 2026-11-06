@@ -5,38 +5,38 @@ What is here so far (first plan, steps 1 to 4, plus a GUI prototype):
 | Path | What it is |
 | --- | --- |
 | [SPEC.md](SPEC.md) | The replay collection format, v1 draft |
-| [player/](player/) | `emucov`, the headless player (Rust): plays replay trees on any libretro core, checks state hashes, records and reports coverage |
-| [gui/](gui/) | `emucov-gui`, a desktop viewer and editor (Rust, egui): replay tree, live preview, piano roll |
+| [player/](player/) | `dj`, the headless player (Rust): plays replay trees on any libretro core, checks state hashes, records and reports coverage |
+| [gui/](gui/) | `dj-gui`, a desktop viewer and editor (Rust, egui): replay tree, live preview, piano roll |
 | [connectors/](connectors/) | Per-core coverage patches. [mesen](connectors/mesen/) (NES) is the first |
 | [examples/thwaite/](examples/thwaite/) | A 12-replay collection for a free NES game, used as the end-to-end test |
 
 ## Build
 
 ```sh
-cd player && cargo build --release        # Rust 1.75+; the binary is player/target/release/emucov
-cd gui && cargo build --release           # Rust 1.95+ (egui 0.37); the binary is gui/target/release/emucov-gui
+cd player && cargo build --release        # Rust 1.75+; the binary is player/target/release/dj
+cd gui && cargo build --release           # Rust 1.95+ (egui 0.37); the binary is gui/target/release/dj-gui
 connectors/mesen/build.sh                 # git, make, a C++11 compiler; output in build/cores/
 ```
 
 ## Commands
 
 ```sh
-emucov init  <dir> --name NAME --rom ROM --core CORE [--option KEY=VALUE]... [--symbols FILE]
-emucov new   <dir> [--parent ID] [--title TEXT] [--frames N]     # prints the new replay's path
-emucov status <dir>                                              # tree with clean / dirty / unverified marks
-emucov play  <dir> <id> [--screenshots DIR] [--shot 60,120] [--no-cache] [--accept]
-emucov run   <dir> [--from-scratch] [--accept] [--screenshots]   # play everything, check hashes, record coverage
-emucov hydrate <dir> [SEGMENT [--children]] [--clean] [--force]  # fill the local database
-emucov report <dir> [--json FILE] [--gaps FILE.csv]              # coverage of the current, clean segments
-emucov where <dir> PRG:0x1234 | 0x8123 | SYMBOL                 # which segments first run it, at which frame
-emucov snapshot <dir> SEGMENT FRAME --out FILE                   # the core state there, to start a trace from
-emucov sql   <dir> "SELECT ..."                                  # query the local database
-emucov cache stats <dir> | emucov cache gc <dir>                 # size, or drop what no segment uses
+dj init  <dir> --name NAME --rom ROM --core CORE [--option KEY=VALUE]... [--symbols FILE]
+dj new   <dir> [--parent ID] [--title TEXT] [--frames N]     # prints the new replay's path
+dj status <dir>                                              # tree with clean / dirty / unverified marks
+dj play  <dir> <id> [--screenshots DIR] [--shot 60,120] [--no-cache] [--accept]
+dj run   <dir> [--from-scratch] [--accept] [--screenshots]   # play everything, check hashes, record coverage
+dj hydrate <dir> [SEGMENT [--children]] [--clean] [--force]  # fill the local database
+dj report <dir> [--json FILE] [--gaps FILE.csv]              # coverage of the current, clean segments
+dj where <dir> PRG:0x1234 | 0x8123 | SYMBOL                  # which segments first run it, at which frame
+dj snapshot <dir> SEGMENT FRAME --out FILE                   # the core state there, to start a trace from
+dj sql   <dir> "SELECT ..."                                  # query the local database
+dj cache stats <dir> | dj cache gc <dir>                     # size, or drop what no segment uses
 ```
 
 Every command that plays takes `--no-db` to run without the local database.
 
-- `--rom` and `--core` are remembered per collection in `.emucov/local.toml`, which is never committed.
+- `--rom` and `--core` are remembered per collection in `.local/local.toml`, which is never committed.
 - Ids can be shortened to any unique prefix.
 - `init` records **every** core option's current value in `collection.toml`, so the setup is pinned.
 - `run` exits with an error when a replay's hashes differ from the recorded ones. `--accept` writes the new hashes instead.
@@ -44,16 +44,16 @@ Every command that plays takes `--no-db` to run without the local database.
 
 ### The local database
 
-`.emucov/cache.db` (SQLite, never committed) holds what playing produced, keyed by each segment's content (its setup, start state and lines), so an edit invalidates only that segment. The design is in [CACHE_PLAN.md](CACHE_PLAN.md).
+`.local/cache.db` (SQLite, never committed) holds what playing produced, keyed by each segment's content (its setup, start state and lines), so an edit invalidates only that segment. The design is in [CACHE_PLAN.md](CACHE_PLAN.md).
 
 - **Snapshots** of the core state at frame 0, every `diff_every` frames, at markers, and at the end of segments with children. Each is split into pages that are stored once by hash and compressed with zstd.
 - **Previews** (PNG) at the start and at markers, coverage flags, and the frame each ROM byte first ran in each segment (for `where`).
 - `hydrate` plays only the segments whose content isn't stored yet; running it again is nearly instant. `SEGMENT --children` limits it to a subtree. `--clean` re-checks dirty segments: one that still ends with its recorded end hash and checkpoints gets its new start hash written to its file (it is clean again); the others are listed as mismatches. `--force` plays even what is stored.
 - `report` reads the database, not the files: it counts only clean segments that have been hydrated, and lists how many were dirty or not played yet. Address ranges in `unreachable.txt` at the collection root (`0x8000-0x80FF # comment`, optionally `PRG:` first) are left out of the totals.
 - `cache gc` deletes contents that no current segment uses, then unused snapshots and pages, and compacts the file.
-- `.emucov/coverage.sqlite` and `.emucov/states/` from before the database are no longer used and can be deleted.
+- The local folder used to be called `.emucov/`. The tools move it to `.local/` the first time they open a collection (and change `.emucov/` to `.local/` in the collection's `.gitignore`). Its old `coverage.sqlite` and `states/` from before the database are no longer used and can be deleted.
 
-Settings go in `collection.toml` (shared) or `.emucov/local.toml` (this machine, wins):
+Settings go in `collection.toml` (shared) or `.local/local.toml` (this machine, wins):
 
 ```toml
 [cache]
@@ -64,16 +64,16 @@ diff_at_markers = true
 previews = "thumb"      # none, thumb (half size) or full
 ```
 
-`.emucov/local.toml` also takes `database = false` (play without it, like `--no-db`) and `max_memory_mb` (the GUI's in-memory snapshot limit).
+`.local/local.toml` also takes `database = false` (play without it, like `--no-db`) and `max_memory_mb` (the GUI's in-memory snapshot limit).
 
 ## GUI (prototype)
 
 ```sh
 cd gui && cargo build --release
-target/release/emucov-gui ../examples/thwaite       # or File > Open collection…
+target/release/dj-gui ../examples/thwaite       # or File > Open collection…
 ```
 
-The ROM and core come from the collection's `.emucov/local.toml` (written by the CLI's `--rom`/`--core`), or set them with Emulation > Set ROM… / Set core….
+The ROM and core come from the collection's `.local/local.toml` (written by the CLI's `--rom`/`--core`), or set them with Emulation > Set ROM… / Set core….
 
 - Left: two tabs, **Segments** and **Markers**. Markers lists every event in the collection alphabetically (then writes and other lines) with the frame and segment; its filter matches marker text and segment titles, and clicking a row goes to that segment and frame.
 - Segments: the replay tree. Dots show clean (green), dirty (orange) and unverified (gray); anything under a dirty replay is dirty too. Edited replays are yellow italics until saved. Click a segment to go to it; double-click to play it; Enter (or F2) renames the selected segment in place (Enter or clicking away keeps the new name, Escape cancels). The filter box at the top matches titles, id prefixes and tags, and shows each match with the path down to it (the path is dimmed).
@@ -102,7 +102,7 @@ The ROM and core come from the collection's `.emucov/local.toml` (written by the
 - Segment menu (and right-click in the tree): **Play to here** (right-click only: plays through to the end of that segment, on from the playhead if the current segment is on the way, otherwise from the first segment below where the two paths meet); **New child at end**; **Branch at playhead** (splits the segment right after the playhead and starts an empty second path beside the rest); **Split at playhead** (just the split); **Properties** (title and length). **Join with parent** (only for a segment with no siblings) merges it into its parent, which keeps its name and grows by its frames; the confirmation can leave a marker at the join, named after the child by default. **Delete…** removes the segment and everything below it, after a confirmation that says how many segments go; undo brings them back, and the files are removed on Save.
   - In a split, the second half keeps the segment's id, title and children; the first part becomes a new segment "(first N frames)" in its old place, and the second half becomes its child. The state hash at the cut becomes the first part's end hash and the second half's start hash; the second half keeps the old end hash and everything below it is assumed clean. Inputs held across the cut are pressed again at frame 0 of the second half.
 - Bottom edge: the status bar, with messages on the left and the core and unsaved count on the right. A long seek or segment load shows a progress bar there and the window stays usable.
-- The local database (Emulation menu): **Hydrate all**, **Hydrate and clean all** (only with nothing unsaved, since cleaning writes files), and right-click **Hydrate this segment** / **Hydrate this and below**. Hydration shows every 4th frame in the picture and a progress bar with **Pause** and **Stop** in the status bar; finished segments stay stored when you stop. Segments whose current content is stored show a blue **db** after their length. **Use the local database** turns it off (saved in `.emucov/local.toml`), and **Snapshot memory** sets how much memory the current segment's snapshots may use (512 MB by default).
+- The local database (Emulation menu): **Hydrate all**, **Hydrate and clean all** (only with nothing unsaved, since cleaning writes files), and right-click **Hydrate this segment** / **Hydrate this and below**. Hydration shows every 4th frame in the picture and a progress bar with **Pause** and **Stop** in the status bar; finished segments stay stored when you stop. Segments whose current content is stored show a blue **db** after their length. **Use the local database** turns it off (saved in `.local/local.toml`), and **Snapshot memory** sets how much memory the current segment's snapshots may use (512 MB by default).
 - An input or RAM write edit drops the segment's end hash and later checkpoints, so it and everything below turn unverified or dirty. Event edits don't. Play to the end and use Emulation > Accept end hash to record the new hashes, then File > Save (Ctrl/Cmd+S).
 
 ## Results on the Thwaite example

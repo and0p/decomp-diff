@@ -13,7 +13,7 @@ use crate::format::{Command, Replay};
 
 // ---- settings ------------------------------------------------------------------
 
-/// The `[cache]` table of collection.toml (and of .emucov/local.toml, which overrides it
+/// The `[cache]` table of collection.toml (and of .local/local.toml, which overrides it
 /// value by value). Every field is optional; a preset fills in the rest.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CacheConfig {
@@ -39,7 +39,7 @@ pub struct CacheConfig {
     /// Any of "start", "marker".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_at: Option<Vec<String>>,
-    /// `emucov cache gc` warns past this size.
+    /// `dj cache gc` warns past this size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_gb: Option<f64>,
 }
@@ -304,7 +304,7 @@ impl Cache {
     pub fn open_readonly(col: &Collection) -> Result<Connection> {
         let path = cache_path(col);
         if !path.exists() {
-            bail!("no local database yet ({}); run `emucov hydrate` first", path.display());
+            bail!("no local database yet ({}); run `dj hydrate` first", path.display());
         }
         let conn = Connection::open(&path)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
@@ -370,7 +370,7 @@ impl Cache {
         let mut out = Vec::with_capacity(size as usize);
         let mut st = self.conn.prepare_cached("SELECT size, data FROM pages WHERE hash = ?1")?;
         for h in manifest.chunks(32) {
-            let (n, z): (i64, Vec<u8>) = st.query_row([h], |r| Ok((r.get(0)?, r.get(1)?))).with_context(|| "a snapshot page is missing; run `emucov cache gc --repair`")?;
+            let (n, z): (i64, Vec<u8>) = st.query_row([h], |r| Ok((r.get(0)?, r.get(1)?))).with_context(|| "a snapshot page is missing; run `dj cache gc --repair`")?;
             out.extend_from_slice(&zstd::bulk::decompress(&z, n as usize)?);
         }
         if out.len() != size as usize {

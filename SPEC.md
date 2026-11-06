@@ -1,4 +1,4 @@
-# emu_coverage replay format, version 1
+# decomp-dj replay format, version 1
 
 This document defines the files that make up a **replay collection**: a tree of
 plain-text input replays that drive a libretro core from power-on (or from a
@@ -6,8 +6,8 @@ saved starting point) into every situation a game can reach. A collection is
 what people share. Everything else (save states, coverage databases,
 screenshots) is derived locally by playing it.
 
-Status: draft v1. The headless player (`emucov`) and the desktop editor
-(`emucov-gui`) in this repository implement everything here except items
+Status: draft v1. The headless player (`dj`) and the desktop editor
+(`dj-gui`) in this repository implement everything here except items
 marked **(reserved)**, which files may carry but the tools do not act on yet.
 
 ## Terminology
@@ -52,7 +52,7 @@ my-collection/
     blake3-<hex>         SRAM and save-state blobs, named by content hash
   symbols/               optional: symbol maps for rolling coverage up into functions
   unreachable.txt        optional: ROM ranges no input can reach, left out of coverage
-  .emucov/               local only, never committed (local.toml, cache.db, screenshots)
+  .local/                local only, never committed (local.toml, cache.db, screenshots)
 ```
 
 Replays are stored **flat**, named by id. The tree lives in each file's
@@ -76,7 +76,7 @@ file = "thwaite.nes"        # a hint for humans; the hash is what counts
 
 [core]
 name = "mesen"                      # libretro core name
-build = "mesen@0102910c+emucov1"    # free-form id of the exact build
+build = "mesen@0102910c+dj1"        # free-form id of the exact build
 sha256 = ""                         # optional: hash of the core library (per OS, so usually left empty)
 
 [core.options]                       # every option the core reads, pinned
@@ -110,7 +110,7 @@ comments everywhere. Blank lines are ignored. Tools that rewrite a file keep
 every comment, but may move comments in the body to the top of the body.
 
 ```
-emucov-replay 1
+dj-replay 1
 id: 3b8f0f2c-1d44-4c1e-9e55-0d7a3c1b2e90
 parent: none
 title: Boot to title screen
@@ -130,7 +130,7 @@ end-hash: blake3-71ee…
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `emucov-replay 1` | yes | First line. Magic and format version. |
+| `dj-replay 1` | yes | First line. Magic and format version. |
 | `id` | yes | Lowercase UUID. Never changes once published. The file name is `<id>.replay`. |
 | `parent` | yes | Id of the replay that must play immediately before this one, or `none` for a trunk. |
 | `title` | no | One line for humans and agents. |
@@ -374,7 +374,7 @@ For each replay, the player stores which ROM bytes ran as an instruction's
 first byte (opcode) and which ran as operands, during that replay's own frames
 only. Ancestors' frames are not counted again.
 
-It keeps this in the local database (`.emucov/cache.db`, see CACHE_PLAN.md)
+It keeps this in the local database (`.local/cache.db`, see CACHE_PLAN.md)
 keyed by the segment's **content key**, so the totals always describe the
 current files: a report counts only clean segments whose current content has
 been played, and says how many were dirty or not played yet. Each segment also
@@ -501,14 +501,14 @@ past its last body line.
   because the picture doesn't visibly change and may be far from the edit. Also: mark
   the frames after an unplayed edit as stale on the ruler until they run again, and
   dim the picture while it shows a frame from before the latest edit.
-- **Backups without version control.** `emucov backup <dir>` (and File > Back up… in
+- **Backups without version control.** `dj backup <dir>` (and File > Back up… in
   the GUI) writes the collection's shared files to a ZIP: `collection.toml`, `replays/`,
-  `blobs/`, `symbols/` and `unreachable.txt`, never `.emucov/` (the database can be
-  rebuilt by hydrating) and never the ROM. `emucov restore <zip> <dir>` puts them back,
+  `blobs/`, `symbols/` and `unreachable.txt`, never `.local/` (the database can be
+  rebuilt by hydrating) and never the ROM. `dj restore <zip> <dir>` puts them back,
   replacing `replays/` whole so deleted segments come back and new ones go. Useful
   before a big agent-driven edit or an experiment, for authors who don't use git.
   Possible extras: an automatic backup before risky commands (a bulk clean, a large
-  agent edit), named backups under `.emucov/backups/` with a limit on how many are
+  agent edit), named backups under `.local/backups/` with a limit on how many are
   kept, and a `diff` between a backup and the current files listed by segment title.
 - **Local database.** Everything derived from playing a collection goes into a local
   store that isn't in version control: save states, RAM snapshots and diffs, PNG
@@ -562,7 +562,7 @@ past its last body line.
 - **An MCP server** for agents doing decomp work. It would cover where a block first
   runs, the nearest snapshot to trace from, coverage and parity per function, and
   running a segment. The CLI gets the same abilities, including checking parity for
-  a single segment (`emucov parity <segment> --against <comparison core>`).
+  a single segment (`dj parity <segment> --against <comparison core>`).
 - **Open question: how parity is checked.** Nothing is decided yet. The options are:
   - **RAM while stepping.** Run both cores frame by frame and compare RAM (or the
     watched regions) after each frame. It's cheap, and it works with any core. A

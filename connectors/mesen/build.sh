@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the Mesen libretro core with the emu_coverage connector.
+# Builds the Mesen libretro core with the decomp-dj connector.
 # Usage: connectors/mesen/build.sh [output-dir]
 # Needs git, make and a C++11 compiler. On Windows, run it from MSYS2.
 set -euo pipefail
@@ -19,7 +19,7 @@ cd "$work"
 git fetch --depth 1 origin "$MESEN_COMMIT" 2>/dev/null || true
 git checkout -q --force "$MESEN_COMMIT"
 git clean -qfd Core Libretro
-git apply "$here/emucov-mesen.patch"
+git apply "$here/dj-mesen.patch"
 
 jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 make -C Libretro -j"$jobs"

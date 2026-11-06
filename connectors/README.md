@@ -6,14 +6,14 @@ functions through `RETRO_ENVIRONMENT_SET_PROC_ADDRESS_CALLBACK`, the libretro
 mechanism for core-defined extensions:
 
 ```c
-struct emucov_region { const char *name; uint8_t *flags; size_t size; };
+struct dj_region { const char *name; uint8_t *flags; size_t size; };
 
-unsigned emucov_api_version(void);                         /* 1 */
-size_t   emucov_region_count(void);
-bool     emucov_get_region(size_t index, struct emucov_region *out);
-void     emucov_clear(void);                               /* zero all flags and the tick count */
-void     emucov_set_tick_exec(int region, int64_t offset); /* -1 disables */
-uint64_t emucov_get_tick_count(void);
+unsigned dj_api_version(void);                         /* 1 */
+size_t   dj_region_count(void);
+bool     dj_get_region(size_t index, struct dj_region *out);
+void     dj_clear(void);                               /* zero all flags and the tick count */
+void     dj_set_tick_exec(int region, int64_t offset); /* -1 disables */
+uint64_t dj_get_tick_count(void);
 ```
 
 - `flags` has one byte per byte of the region: `0x01` executed as an opcode

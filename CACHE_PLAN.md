@@ -31,14 +31,14 @@ things up, and nothing depends on it.
 
 ## Storage: SQLite (decided)
 
-There is no server. Everything lives in one `.emucov/cache.db` per collection,
-replacing today's `.emucov/coverage.sqlite` and `.emucov/states/` folder.
+There is no server. Everything lives in one `.local/cache.db` per collection,
+replacing today's `.local/coverage.sqlite` and `.local/states/` folder.
 
-- **No setup for collaborators.** It's a file inside the collection's `.emucov/`
+- **No setup for collaborators.** It's a file inside the collection's `.local/`
   folder, so it can't point at the wrong collection, and deleting the folder resets
   it.
 - **Agents can read it directly.** Python's standard library, the `sqlite3` command
-  line tool, and every language's drivers can open it. An `emucov sql "<query>"`
+  line tool, and every language's drivers can open it. A `dj sql "<query>"`
   command and an MCP tool can come later. In WAL mode, the GUI, a hydrate run and an
   agent can all read while one of them writes.
 - **No pile of small files.** Pages, previews and diffs are rows. SQLite reads and
@@ -153,15 +153,15 @@ ORDER BY h.frame LIMIT 5;
 A `from_frame` of NULL means the segment's start snapshot. CLI wrappers will cover
 the common questions:
 
-- `emucov where <symbol|offset>` lists the segments and frames that first run it.
-- `emucov snapshot <segment> <frame> --out f.state` writes a snapshot to start a
+- `dj where <symbol|offset>` lists the segments and frames that first run it.
+- `dj snapshot <segment> <frame> --out f.state` writes a snapshot to start a
   trace from.
-- `emucov sql` runs anything else.
+- `dj sql` runs anything else.
 
 ## The cache config
 
 Each collection sets thresholds in a `[cache]` section of `collection.toml`, so
-everyone hydrating it gets the same layout. `.emucov/local.toml` can override any
+everyone hydrating it gets the same layout. `.local/local.toml` can override any
 value on one machine. Later the tool can ship presets per system, in sparse and
 aggressive variants. A collection names a preset and overrides single values:
 
@@ -251,7 +251,7 @@ never plays the parent segments.
 ## Hydrating
 
 Hydration fills the database. It can be started from the CLI
-(`emucov hydrate`) or from the GUI, and in both:
+(`dj hydrate`) or from the GUI, and in both:
 
 - **It can cover part of the tree:** the whole tree, **this segment**, or **this
   segment and all its child segments**. Partial hydration is normal. What's missing
@@ -269,7 +269,7 @@ Hydration fills the database. It can be started from the CLI
   skipped. Separate subtrees can run in parallel processes, since each core runs in
   its own process.
 
-`emucov cache gc` drops content that no current segment uses, oldest first, until
+`dj cache gc` drops content that no current segment uses, oldest first, until
 the store is under `budget_gb`. Then it drops pages that no snapshot or diff refers
 to.
 
@@ -277,16 +277,16 @@ to.
 
 1. **Snapshots, pages and previews.** Add `cache.db` with `setups`, `contents`,
    `segments_now`, `pages`, `snapshots` and start/marker `images`. Move
-   `.emucov/states/` into it. Add the GUI's memory LRU with `max_memory`, and
+   `.local/states/` into it. Add the GUI's memory LRU with `max_memory`, and
    hydration of a segment or subtree with pause and stop.
 2. **Coverage.** Move the coverage tables into `cache.db`, keyed by content, so a
    split or join simply re-records them. Add `first_hits`, `code`, `coverage_sum`
-   (clean segments only) and `unreachable.txt`, plus `emucov where`. The `parity`
+   (clean segments only) and `unreachable.txt`, plus `dj where`. The `parity`
    table comes with comparison cores, once it's decided how parity is checked.
 3. **Diffs.** Add `diffs` with `diff_every`, `diff_at_markers` and `exclude`, then
    the presets, a RAM view in the GUI, and the
    watched-address lanes from the Tetris notes.
-4. **Agents.** Add `emucov sql`, an MCP server with the common queries, and
+4. **Agents.** Add `dj sql`, an MCP server with the common queries, and
    `cache pack` / `unpack`.
 
 ## Coverage
@@ -371,14 +371,14 @@ and the GUI:
 
 - `cache.db` with `setups`, `contents`, `segment_runs`, `segments_now`, `pages`,
   `snapshots`, `frames`, `images`, `coverage`, `first_hits`, `unreachable`, `runs`
-  and `run_results`. `.emucov/states/` and `coverage.sqlite` are no longer used.
+  and `run_results`. `.local/states/` and `coverage.sqlite` are no longer used.
 - Content keys, snapshots split into hashed zstd pages (1:1 unless `page_kb` is
   set), snapshots at frame 0, every `diff_every` frames, at markers and at the end
   of segments with children; start and marker previews; the four presets.
 - Hydration of everything, a segment or a subtree, with `--clean` and `--force`
   on the CLI and pause, stop and live view in the GUI.
 - Coverage keyed by content (clean, hydrated segments only), `first_hits`,
-  `unreachable.txt`, and `emucov where`, `snapshot`, `sql`, `cache stats` and
+  `unreachable.txt`, and `dj where`, `snapshot`, `sql`, `cache stats` and
   `cache gc`. `--no-db` and `database = false`.
 - The GUI's memory limit (`max_memory_mb`) and seeking from stored snapshots.
 

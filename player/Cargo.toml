@@ -1,15 +1,16 @@
 [package]
-name = "emucov"
+name = "decomp-dj"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Plays libretro input-replay trees, checks state hashes, and records ROM code coverage"
 
 [lib]
+name = "decomp_dj"
 path = "src/lib.rs"
 
 [[bin]]
-name = "emucov"
+name = "dj"
 path = "src/main.rs"
 
 [dependencies]

@@ -94,7 +94,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Opens a session with the local database unless .emucov/local.toml says `database = false`.
+    /// Opens a session with the local database unless .local/local.toml says `database = false`.
     pub fn open(col: &Collection, rom: &Path, core_path: &Path) -> Result<Session> {
         let use_db = col.load_local()?.database.unwrap_or(true);
         Self::open_with(col, rom, core_path, use_db)
