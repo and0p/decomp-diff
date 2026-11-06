@@ -443,16 +443,16 @@ past its last body line.
 
 ## 11. Future directions (notes, not part of format v1)
 
-- **Sticky children (GUI).** Off by default; a toggle turns it on (where is still open,
-  perhaps at the bottom of the Segments tab). While it's on:
+- **Sticky segments (GUI).** Implemented, except the two sub-items on rewinding and
+  neighbours below. Always on; there is no setting.
   - The tree highlights the selected segment's whole chain, from it up through every
     parent to the root segment.
   - The GUI remembers the deepest segment the author has been in on that chain (the
     *tip*), and only the tip: the sticky path is always "the tip's ancestors", so it
     stays right through splits and joins. Example: from 1>2>7>12, going back to 2
-    keeps >7>12 as the sticky children. They stay highlighted as part of the chain,
+    keeps >7>12 as the sticky segments. They stay highlighted as part of the chain,
     but faded, because they are ahead of the playhead rather than behind it.
-  - **continue** follows the sticky children from any segment on the path, even where
+  - **continue** follows the sticky segments from any segment on the path, even where
     a segment has more than one child. Past the tip, it falls back to the normal rule
     (carry on only into an only child).
   - Selecting a segment on the path keeps the tip. Selecting one below the tip makes
@@ -460,18 +460,17 @@ past its last body line.
     tree such as 5>28>14) replaces the path with the new selection's chain, because it
     no longer leads to the old tip. Deleting the tip moves it to its nearest surviving
     ancestor.
-  - The transport's **child** button becomes a split button: its main part goes into
-    the sticky child, and a narrow down arrow at its side opens the list of all
-    children to pick another one. With sticky off (or no sticky child here), the main
-    part goes into an only child and opens the list when there are several, as it
-    does now.
-  - **Rewinding up the chain** (with sticky on or off). Stepping or seeking back past frame 0 goes into the
+  - The transport's **child** button is a split button: its main part goes into the
+    sticky segment below (or an only child), and the arrow at its side opens the list
+    of all children to pick another one. With several children and no sticky segment
+    below, the main part opens the list too.
+  - **Rewinding up the chain.** Stepping or seeking back past frame 0 goes into the
     parent's last frames (loading a snapshot of the parent, from memory or the local
-    database), and playing forward from there follows the sticky children back down. A
+    database), and playing forward from there follows the sticky segments back down. A
     possible next step is one timeline across the whole chain, with the segment
     boundaries drawn on the ruler.
   - **Neighbours on the piano roll.** Draw the end of the parent to the left of frame
-    0, and the start of the next (sticky or only) child to the right of the last frame,
+    0, and the start of the next (sticky or only) segment to the right of the last frame,
     faded and read-only, with the boundary marked on the ruler. Clicking or dragging
     in the faded part does nothing, so a misclick can't switch segments. Only an arrow
     key or a playback control (stepping, playing, the segment back and forward

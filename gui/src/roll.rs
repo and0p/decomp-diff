@@ -216,7 +216,7 @@ fn build_model(col: &Collection, id: &str, gen: u64, all_buttons: bool) -> Model
                     other.entry((key.port, key.device)).or_default().push(l.frame);
                 }
             }
-            Command::Device { port, device } => markers.push(Marker { frame: l.frame, glyph: "◆", color: Color32::from_rgb(120, 200, 230), text: format!("[DEVICE] P{} → {device}", port + 1), label: format!("P{} dev {device}", port + 1) }),
+            Command::Device { port, device } => markers.push(Marker { frame: l.frame, glyph: "◆", color: Color32::from_rgb(120, 200, 230), text: format!("[DEVICE] P{} = {device}", port + 1), label: format!("P{} dev {device}", port + 1) }),
             Command::Write { region, address, bytes } => {
                 let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
                 markers.push(Marker { frame: l.frame, glyph: "✏", color: Color32::from_rgb(200, 120, 220), text: format!("[WRITE] {region} 0x{address:X} {}", hex.join(" ")), label: format!("{region} {address:X}={}", hex.join(" ")) })

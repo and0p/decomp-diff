@@ -93,9 +93,13 @@ struct App {
     roll: roll::RollState,
     message: Option<(String, bool)>,
     /// Frames per tick multiplier; 0 means as fast as possible.
-    speed: u32,
+    /// Index into SPEEDS.
+    speed: usize,
     /// At the end of a segment with exactly one child, carry on into it.
     auto_continue: bool,
+    /// Sticky children: remember the deepest segment visited on the selected chain.
+    /// The deepest segment visited on the current chain (tracked even while sticky is off).
+    sticky_tip: Option<String>,
     /// "Play to": segments still to play through after the current one, and the last of them.
     route: Vec<String>,
     route_target: Option<String>,
@@ -135,6 +139,8 @@ enum Job {
 }
 
 /// Time spent on a job per screen refresh.
+/// Playback speeds: (factor, label); 0.0 is as fast as the core goes.
+const SPEEDS: [(f64, &str); 7] = [(0.25, "0.25×"), (0.5, "0.5×"), (1.0, "1×"), (2.0, "2×"), (4.0, "4×"), (8.0, "8×"), (0.0, "MAX")];
 const JOB_SLICE: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// One step of undo history: the affected segments as they were before the change
@@ -193,8 +199,9 @@ impl Default for App {
             edited: BTreeSet::new(),
             roll: roll::RollState::default(),
             message: None,
-            speed: 1,
+            speed: 2,
             auto_continue: true,
+            sticky_tip: None,
             route: vec![],
             route_target: None,
             node_dialog: None,
@@ -422,6 +429,60 @@ fn nest_button(ui: &mut egui::Ui, on: bool) -> egui::Response {
     resp
 }
 
+/// The list of children in the child button's menu (scrolls when long). The sticky child is marked.
+fn child_list(ui: &mut egui::Ui, kids: &[(String, String)], sticky: Option<&String>, pick: &mut Option<String>) {
+    ui.label(RichText::new(if kids.len() == 1 { "1 child segment".to_string() } else { format!("{} child segments", kids.len()) }).weak().small());
+    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+        for (k, t) in kids {
+            let is_sticky = sticky == Some(k);
+            let text = if is_sticky { RichText::new(format!("{t}  (where you were)")).strong() } else { RichText::new(t.as_str()) };
+            if ui.add(egui::Button::selectable(false, text).truncate()).on_hover_text(&k[..8.min(k.len())]).clicked() {
+                *pick = Some(k.clone());
+                ui.close();
+            }
+        }
+    });
+}
+
+/// Lines the marker buttons stop at: the same kinds as the marker list.
+fn is_marker(c: &Command) -> bool {
+    matches!(c, Command::Event { .. } | Command::Write { .. } | Command::Device { .. } | Command::Reset)
+}
+
+fn icon_color(ui: &egui::Ui, r: &egui::Response) -> Color32 {
+    if !r.enabled() {
+        ui.visuals().widgets.noninteractive.fg_stroke.color.gamma_multiply(0.5)
+    } else if r.hovered() {
+        ui.visuals().widgets.hovered.fg_stroke.color
+    } else {
+        ui.visuals().widgets.inactive.fg_stroke.color
+    }
+}
+
+/// Transport icon: one triangle and a mark beside it. Backward is the triangle with
+/// the mark on its right (◀▌), forward the mirror (▌▶). `dot` draws a dot as the mark
+/// (markers) instead of a bar (segments).
+fn paint_skip(ui: &egui::Ui, r: &egui::Response, forward: bool, dot: bool) {
+    let c = icon_color(ui, r);
+    let p = ui.painter();
+    let m = r.rect.center();
+    let dir = if forward { 1.0 } else { -1.0 };
+    // Triangle centred a little toward the direction of travel, mark on the other side.
+    let tx = m.x + 2.5 * dir;
+    let (h, w) = (5.0, 7.0);
+    p.add(egui::Shape::convex_polygon(
+        vec![egui::pos2(tx - w / 2.0 * dir, m.y - h), egui::pos2(tx + w / 2.0 * dir, m.y), egui::pos2(tx - w / 2.0 * dir, m.y + h)],
+        c,
+        egui::Stroke::NONE,
+    ));
+    let mx = m.x - 4.5 * dir;
+    if dot {
+        p.circle_filled(egui::pos2(mx, m.y), 2.4, c);
+    } else {
+        p.rect_filled(egui::Rect::from_center_size(egui::pos2(mx, m.y), egui::vec2(2.4, 2.0 * h)), 0.0, c);
+    }
+}
+
 fn abs_path(root: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
         p.to_path_buf()
@@ -478,11 +539,11 @@ impl App {
         let (rom, core) = match (&local.rom, &local.core) {
             (Some(r), Some(c)) => (abs_path(&col.root, r), abs_path(&col.root, c)),
             (None, _) => {
-                self.core_error = Some("No ROM set for this collection on this machine. Use Emulation → Set ROM…".into());
+                self.core_error = Some("No ROM set for this collection on this machine. Use Emulation > Set ROM…".into());
                 return;
             }
             (_, None) => {
-                self.core_error = Some("No libretro core set for this collection on this machine. Use Emulation → Set core…".into());
+                self.core_error = Some("No libretro core set for this collection on this machine. Use Emulation > Set core…".into());
                 return;
             }
         };
@@ -838,7 +899,8 @@ impl App {
             self.clock = 0.0;
             return;
         }
-        let res = if self.speed == 0 {
+        let speed = SPEEDS[self.speed].0;
+        let res = if speed == 0.0 {
             // As fast as the core goes, drawing once per screen refresh.
             let t0 = std::time::Instant::now();
             let mut r = Ok(());
@@ -851,12 +913,12 @@ impl App {
             }
             r
         } else {
-            let rate = self.fps * self.speed as f64;
+            let rate = self.fps * speed;
             self.clock += dt;
             let mut n = (self.clock * rate).floor() as u64;
             self.clock -= n as f64 / rate;
             // Never fall far behind; slow down instead.
-            let cap = 4 * self.speed as u64;
+            let cap = (4.0 * speed).ceil().max(1.0) as u64;
             if n > cap {
                 n = cap;
                 self.clock = 0.0;
@@ -932,14 +994,60 @@ impl App {
         self.info(format!("Playing to the end of \"{title}\" ({} segment(s) on the way)", self.route.len() + 1));
     }
 
-    /// The only child of the current segment, if neither has unsaved changes.
+    /// Where continue goes from the current segment: the sticky child, or else the only
+    /// child; None if either side has unsaved changes.
     fn next_node(&self) -> Option<String> {
         let (col, pb) = (self.col.as_ref()?, self.pb.as_ref()?);
-        let kids = col.children(Some(&pb.id));
-        if kids.len() != 1 || self.edited.contains(&pb.id) || self.edited.contains(kids[0]) {
+        let next = match self.sticky_child(&pb.id) {
+            Some(c) => c,
+            None => {
+                let kids = col.children(Some(&pb.id));
+                if kids.len() != 1 {
+                    return None;
+                }
+                kids[0].to_string()
+            }
+        };
+        if self.edited.contains(&pb.id) || self.edited.contains(&next) {
             return None;
         }
-        Some(kids[0].to_string())
+        Some(next)
+    }
+
+    /// The sticky tip, if it still exists.
+    fn tip(&self) -> Option<&str> {
+        let t = self.sticky_tip.as_deref()?;
+        self.col.as_ref()?.replays.contains_key(t).then_some(t)
+    }
+
+    /// The tip's chain from the root segment, when sticky is on.
+    fn sticky_path(&self) -> Vec<String> {
+        match (self.col.as_ref(), self.tip()) {
+            (Some(col), Some(t)) => col.chain(t).map(|c| c.into_iter().map(String::from).collect()).unwrap_or_default(),
+            _ => vec![],
+        }
+    }
+
+    /// The child of `id` on the way to the sticky tip (sticky on, `id` above the tip).
+    fn sticky_child(&self, id: &str) -> Option<String> {
+        let path = self.sticky_path();
+        let i = path.iter().position(|p| p == id)?;
+        path.get(i + 1).cloned()
+    }
+
+    /// Keeps the tip while the selection stays on its chain; anything else starts a new one.
+    fn update_sticky_tip(&mut self) {
+        let Some(sel) = self.selected.clone() else { return };
+        let Some(col) = &self.col else { return };
+        if !col.replays.contains_key(&sel) {
+            return;
+        }
+        // A deleted tip falls back to its nearest surviving ancestor: the selection is shown
+        // there, so starting from the selection is the same thing.
+        let keep = self.tip().is_some_and(|t| col.chain(t).is_ok_and(|c| c.contains(&sel.as_str())));
+        if !keep {
+            self.sticky_tip = Some(sel);
+        }
     }
 
     /// Moves from the end of the current segment straight into `child`, keeping the core's state.
@@ -1713,10 +1821,10 @@ impl App {
                 if ui.add_enabled(has, egui::Button::new(if self.playing { "Pause" } else { "Play" }).shortcut_text("Space")).clicked() {
                     self.toggle_play();
                 }
-                if ui.add_enabled(has, egui::Button::new("Step forward").shortcut_text("→")).clicked() {
+                if ui.add_enabled(has, egui::Button::new("Step forward").shortcut_text("Right arrow")).clicked() {
                     self.step_by(1);
                 }
-                if ui.add_enabled(has, egui::Button::new("Step back").shortcut_text("←")).clicked() {
+                if ui.add_enabled(has, egui::Button::new("Step back").shortcut_text("Left arrow")).clicked() {
                     self.step_by(-1);
                 }
                 if ui.add_enabled(has, egui::Button::new("Go to start").shortcut_text("Home")).clicked() {
@@ -2019,6 +2127,11 @@ impl App {
         for r in roots {
             walk(col, r, 0, false, &self.tree_closed, filtering.then_some(&shown), self.indent_all, &mut rows);
         }
+        let path = self.sticky_path();
+        let sel_chain: Vec<String> = match &self.selected {
+            Some(s) => col.chain(s).map(|c| c.into_iter().map(String::from).collect()).unwrap_or_default(),
+            _ => vec![],
+        };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for Row { id, indent, chained } in rows {
                 let depth = indent;
@@ -2063,7 +2176,19 @@ impl App {
                             }
                             out.response.response
                         }
-                        _ => ui.selectable_label(sel, title),
+                        _ => {
+                            // Sticky: the chain above the selection is highlighted, and the sticky
+                            // children below it are highlighted more faintly, with faded titles.
+                            let above = !sel && sel_chain.iter().any(|c| c == id);
+                            let ahead = !sel && !above && path.iter().any(|c| c == id);
+                            if above || ahead {
+                                let fill = ui.visuals().selection.bg_fill.gamma_multiply(if above { 0.4 } else { 0.18 });
+                                let title = if ahead { title.weak() } else { title };
+                                ui.add(egui::Button::new(title).fill(fill).stroke(egui::Stroke::NONE))
+                            } else {
+                                ui.selectable_label(sel, title)
+                            }
+                        }
                     };
                     let frames = r.frames().unwrap_or(0);
                     ui.label(RichText::new(format!("{frames}f")).weak().small());
@@ -2213,7 +2338,7 @@ impl App {
     fn start_hydrate(&mut self, scope: Option<(String, bool)>, clean: bool) {
         let Some(col) = &self.col else { return };
         if self.session.as_ref().is_none_or(|s| s.cache.is_none()) {
-            self.error("Hydration needs the local database (Emulation → Use the local database).");
+            self.error("Hydration needs the local database (Emulation > Use the local database).");
             return;
         }
         let what = match &scope {
@@ -2334,7 +2459,7 @@ impl App {
     fn transport(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let has = self.pb.is_some();
-            // Segment back and forward.
+            let idle = self.hydrating.is_none();
             let (parent, kids): (Option<String>, Vec<(String, String)>) = match (&self.col, &self.selected) {
                 (Some(col), Some(id)) if col.replays.contains_key(id) => (
                     col.replays[id].parent().map(String::from),
@@ -2342,65 +2467,55 @@ impl App {
                 ),
                 _ => (None, vec![]),
             };
-            let idle = self.hydrating.is_none();
-            if ui
-                .add_enabled(idle && parent.is_some(), egui::Button::new("⏪ parent"))
+            // Marker frames in this segment, before and after the frame shown.
+            let (prev_mk, next_mk) = match (&self.pb, &self.col) {
+                (Some(pb), Some(col)) => {
+                    let at = pb.shown().unwrap_or(0);
+                    let frames: Vec<u64> = col.replays.get(&pb.id).map(|r| r.lines.iter().filter(|l| is_marker(&l.command)).map(|l| l.frame).collect()).unwrap_or_default();
+                    (frames.iter().filter(|f| **f < at).max().copied(), frames.iter().filter(|f| **f > at && **f < pb.frames).min().copied())
+                }
+                _ => (None, None),
+            };
+            let icon = egui::vec2(30.0, ui.spacing().interact_size.y);
+
+            // Parent, previous marker.
+            let r = ui
+                .add_enabled(idle && parent.is_some(), egui::Button::new("").min_size(icon))
                 .on_hover_text(match &parent {
                     Some(p) => format!("Back to the end of the parent segment, \"{}\"", col_title(self.col.as_ref(), p)),
                     None => String::new(),
                 })
-                .on_disabled_hover_text("A root segment has no parent")
-                .clicked()
-            {
+                .on_disabled_hover_text("A root segment has no parent");
+            paint_skip(ui, &r, false, false);
+            if r.clicked() {
                 if let Some(p) = parent {
                     self.segment_back(&p);
                 }
             }
-            match kids.len() {
-                0 | 1 => {
-                    let tip = match kids.first() {
-                        Some((_, t)) => format!("Forward into the child segment, \"{t}\""),
-                        None => String::new(),
-                    };
-                    if ui.add_enabled(idle && kids.len() == 1, egui::Button::new("child ⏩")).on_hover_text(tip).on_disabled_hover_text("This segment has no children").clicked() {
-                        self.segment_forward(&kids[0].0);
-                    }
-                }
-                n => {
-                    let mut pick = None;
-                    ui.add_enabled_ui(idle, |ui| {
-                        ui.menu_button("child ⏩ ⏷", |ui| {
-                            ui.label(RichText::new(format!("{n} child segments")).weak().small());
-                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                                for (k, t) in &kids {
-                                    if ui.add(egui::Button::selectable(false, t.as_str()).truncate()).on_hover_text(&k[..8.min(k.len())]).clicked() {
-                                        pick = Some(k.clone());
-                                    }
-                                }
-                            });
-                        })
-                        .response
-                        .on_hover_text("Forward into a child segment");
-                    });
-                    if let Some(k) = pick {
-                        self.segment_forward(&k);
-                    }
+            let r = ui.add_enabled(has && prev_mk.is_some(), egui::Button::new("").min_size(icon)).on_hover_text("Previous marker in this segment").on_disabled_hover_text("No marker before the playhead in this segment");
+            paint_skip(ui, &r, false, true);
+            if r.clicked() {
+                if let Some(f) = prev_mk {
+                    self.playing = false;
+                    self.seek(f);
+                    self.roll.follow_to(f);
                 }
             }
             ui.separator();
+
             ui.add_enabled_ui(has, |ui| {
                 if ui.button("⏮").on_hover_text("Go to start (Home)").clicked() {
                     self.playing = false;
                     self.seek(0);
                     self.roll.follow_to(0);
                 }
-                if ui.button("⏴").on_hover_text("Step back (←)").clicked() {
+                if ui.button("⏴").on_hover_text("Step back (left arrow)").clicked() {
                     self.step_by(-1);
                 }
                 if ui.button(if self.playing { "⏸" } else { "▶" }).on_hover_text("Play / pause (Space)").clicked() {
                     self.toggle_play();
                 }
-                if ui.button("⏵").on_hover_text("Step forward (→)").clicked() {
+                if ui.button("⏵").on_hover_text("Step forward (right arrow)").clicked() {
                     self.step_by(1);
                 }
                 if ui.button("⏭").on_hover_text("Go to end (End)").clicked() {
@@ -2409,15 +2524,104 @@ impl App {
                     self.seek(e);
                     self.roll.follow_to(e);
                 }
-                ui.separator();
-                for (sp, label) in [(1, "1×"), (2, "2×"), (4, "4×"), (8, "8×"), (0, "MAX")] {
-                    if ui.selectable_label(self.speed == sp, label).on_hover_text("Playback speed").clicked() {
-                        self.speed = sp;
-                        self.clock = 0.0;
-                    }
+            });
+            ui.separator();
+
+            // Next marker, child (split button), continue.
+            let r = ui.add_enabled(has && next_mk.is_some(), egui::Button::new("").min_size(icon)).on_hover_text("Next marker in this segment").on_disabled_hover_text("No marker after the playhead in this segment");
+            paint_skip(ui, &r, true, true);
+            if r.clicked() {
+                if let Some(f) = next_mk {
+                    self.playing = false;
+                    self.seek(f);
+                    self.roll.follow_to(f);
                 }
-                ui.separator();
-                ui.checkbox(&mut self.auto_continue, "continue").on_hover_text("At the end of a segment with exactly one child, and no unsaved changes in either, keep playing into the child");
+            }
+            let sticky = self.selected.as_deref().and_then(|id| self.sticky_child(id));
+            // The main part goes to the sticky child, else the only child, else opens the list.
+            let main_target = sticky.clone().or_else(|| (kids.len() == 1).then(|| kids[0].0.clone()));
+            let title_of = |k: &str| kids.iter().find(|(c, _)| c == k).map(|(_, t)| t.clone()).unwrap_or_default();
+            let mut pick = None;
+            let on = idle && !kids.is_empty();
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let cr = ui.visuals().widgets.inactive.corner_radius;
+                let left = egui::CornerRadius { nw: cr.nw, sw: cr.sw, ne: 0, se: 0 };
+                let right = egui::CornerRadius { nw: 0, sw: 0, ne: cr.ne, se: cr.se };
+                let main = egui::Button::new("").min_size(icon).corner_radius(left);
+                let tip = match &main_target {
+                    Some(c) if sticky.is_some() => format!("Forward into \"{}\", where you were before", title_of(c)),
+                    Some(c) => format!("Forward into the child segment, \"{}\"", title_of(c)),
+                    None => format!("Forward into a child segment ({} children)", kids.len()),
+                };
+                let open_list;
+                if main_target.is_some() || !on {
+                    let r = ui.add_enabled(on, main).on_hover_text(tip).on_disabled_hover_text("This segment has no children");
+                    paint_skip(ui, &r, true, false);
+                    if r.clicked() {
+                        pick = main_target.clone();
+                    }
+                    open_list = None;
+                } else {
+                    // Several children and none sticky: the main part opens the list too.
+                    let resp = ui.add_enabled_ui(on, |ui| egui::containers::menu::MenuButton::from_button(main).ui(ui, |ui| child_list(ui, &kids, None, &mut pick))).inner.0;
+                    let resp = resp.on_hover_text(tip);
+                    paint_skip(ui, &resp, true, false);
+                    open_list = Some(());
+                }
+                let _ = open_list;
+                // The arrow: always there, so nothing moves; faint with a single child.
+                let arrow = egui::Button::new("").min_size(egui::vec2(16.0, icon.y)).corner_radius(right);
+                ui.add_space(1.0);
+                ui.add_enabled_ui(on, |ui| {
+                    let r = egui::containers::menu::MenuButton::from_button(arrow).ui(ui, |ui| child_list(ui, &kids, sticky.as_ref(), &mut pick)).0.on_hover_text("Pick a child segment");
+                    let c = icon_color(ui, &r);
+                    let c = if kids.len() > 1 { c } else { c.gamma_multiply(0.4) };
+                    let m = r.rect.center();
+                    ui.painter().add(egui::Shape::convex_polygon(vec![egui::pos2(m.x - 3.5, m.y - 2.0), egui::pos2(m.x + 3.5, m.y - 2.0), egui::pos2(m.x, m.y + 2.5)], c, egui::Stroke::NONE));
+                });
+            });
+            if let Some(k) = pick {
+                self.segment_forward(&k);
+            }
+            let tip = if self.auto_continue {
+                "Continue is on: at the end of a segment, playback carries on into the next one (the only child, or the child you came back up from), as long as neither has unsaved changes. Click to stop at the end of each segment instead."
+            } else {
+                "Continue is off: playback stops at the end of each segment. Click to carry on into the next one (the only child, or the child you came back up from) automatically."
+            };
+            if ui.add(egui::Button::selectable(self.auto_continue, "↪").min_size(egui::vec2(24.0, icon.y))).on_hover_text(tip).clicked() {
+                self.auto_continue = !self.auto_continue;
+            }
+            ui.separator();
+
+            // Speed.
+            ui.add_enabled_ui(has, |ui| {
+                let mut new = None;
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if ui.add_enabled(self.speed > 0, egui::Button::new("−")).on_hover_text("Slower").clicked() {
+                    new = Some(self.speed - 1);
+                }
+                ui.allocate_ui_with_layout(egui::vec2(76.0, icon.y), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("speed")
+                        .selected_text(SPEEDS[self.speed].1)
+                        .width(72.0)
+                        .show_ui(ui, |ui| {
+                            for (i, (_, label)) in SPEEDS.iter().enumerate() {
+                                if ui.selectable_label(self.speed == i, *label).clicked() {
+                                    new = Some(i);
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Playback speed");
+                });
+                if ui.add_enabled(self.speed + 1 < SPEEDS.len(), egui::Button::new("+")).on_hover_text("Faster").clicked() {
+                    new = Some(self.speed + 1);
+                }
+                if let Some(i) = new {
+                    self.speed = i;
+                    self.clock = 0.0;
+                }
             });
         });
         ui.horizontal(|ui| {
@@ -2679,6 +2883,7 @@ impl eframe::App for App {
         }
         let dt = ctx.input(|i| i.unstable_dt).min(0.1) as f64;
         self.work();
+        self.update_sticky_tip();
         if self.job.is_some() || self.hydrating.as_ref().is_some_and(|h| !h.paused) {
             ctx.request_repaint();
         }
