@@ -1305,7 +1305,6 @@ impl App {
             return;
         }
         self.roll.set_selection(pasted);
-        self.roll.mode = roll::Mode::Select;
         self.apply_edit("Paste", edits, at);
     }
 
@@ -2814,19 +2813,7 @@ impl App {
         if paste {
             self.paste();
         }
-        let (rename, draw, select) = ctx.input_mut(|i| {
-            (
-                i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::F2),
-                i.consume_key(Modifiers::NONE, Key::D),
-                i.consume_key(Modifiers::NONE, Key::S),
-            )
-        });
-        if draw {
-            self.roll.mode = roll::Mode::Draw;
-        }
-        if select {
-            self.roll.mode = roll::Mode::Select;
-        }
+        let rename = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::F2));
         if rename && self.node_dialog.is_none() && self.frame_dialog.is_none() && self.renaming.is_none() {
             if let (Some(id), Some(col)) = (&self.selected, &self.col) {
                 let title = col.replays[id].title().to_string();

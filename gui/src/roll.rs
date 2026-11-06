@@ -30,15 +30,6 @@ pub enum Action {
     Edit { edits: Vec<(InputKey, Vec<(u64, u64)>)>, from: u64 },
 }
 
-/// What a drag on the button rows does.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Drag to press or release frames.
-    Draw,
-    /// Select whole presses, move them, and drag their edges.
-    Select,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelOp {
     Replace,
@@ -52,13 +43,16 @@ type PressId = (InputKey, u64);
 /// A drag in select mode. Frame positions are fractional frames, so the
 /// view can scroll under a drag without losing its anchor.
 enum Gesture {
-    /// Moving the selected presses sideways. `click` is the press under the pointer,
-    /// which becomes the only selection if the pointer never moves.
-    Move { anchor: f32, delta: i64, click: Option<PressId> },
+    /// Moving the selected presses in time, and with Alt held, to other rows of the same
+    /// controller (`dr` rows down). `click` is the press under the pointer, which becomes
+    /// the only selection if the pointer never moves. `from` is that press's row.
+    Move { anchor: f32, delta: i64, click: Option<PressId>, from: (usize, usize), dr: i64 },
     /// Dragging one edge of one press.
     Resize { key: InputKey, span: (u64, u64), left: bool, to: u64 },
     /// Selecting by area: corners in (frame, content y).
-    Marquee { a: (f32, f32), b: (f32, f32), op: SelOp },
+    /// `cell` is the empty cell the drag began on (group, row, frame): a click that
+    /// doesn't move adds a press there.
+    Marquee { a: (f32, f32), b: (f32, f32), op: SelOp, cell: Option<(usize, usize, u64)> },
 }
 
 struct Row {
@@ -103,12 +97,21 @@ struct Model {
     markers: Vec<Marker>,
 }
 
+/// Making a new press: from a click on an empty cell. A plain click makes it as long as
+/// the last press made or resized; dragging sets its length.
 struct Drag {
     group: usize,
     row: usize,
     anchor: u64,
     current: u64,
-    press: bool,
+    moved: bool,
+}
+
+impl Drag {
+    fn span(&self, last_len: u64, frames: u64) -> (u64, u64) {
+        let (a, b) = if self.moved { (self.anchor.min(self.current), self.anchor.max(self.current) + 1) } else { (self.anchor, self.anchor + last_len.max(1)) };
+        (a, b.min(frames.max(a + 1)))
+    }
 }
 
 pub struct RollState {
@@ -127,8 +130,9 @@ pub struct RollState {
     gen: u64,
     model: Option<Model>,
     drag: Option<Drag>,
-    pub mode: Mode,
-    /// Selected presses (select mode).
+    /// Length of the last press made or resized, used for a new press made by a click.
+    last_len: u64,
+    /// Selected presses.
     sel: BTreeSet<PressId>,
     gesture: Option<Gesture>,
     scrubbing: bool,
@@ -137,7 +141,7 @@ pub struct RollState {
 
 impl Default for RollState {
     fn default() -> Self {
-        RollState { px_per_frame: 4.0, scroll_x: 0.0, scroll_y: 0.0, follow: true, all_buttons: false, labels: true, markers_open: false, open: HashMap::new(), gen: 0, model: None, drag: None, mode: Mode::Draw, sel: BTreeSet::new(), gesture: None, scrubbing: false, jump_to: None }
+        RollState { px_per_frame: 4.0, scroll_x: 0.0, scroll_y: 0.0, follow: true, all_buttons: false, labels: true, markers_open: false, open: HashMap::new(), gen: 0, model: None, drag: None, last_len: 4, sel: BTreeSet::new(), gesture: None, scrubbing: false, jump_to: None }
     }
 }
 
@@ -311,6 +315,7 @@ fn tick_step(px_per_frame: f32) -> u64 {
     72000
 }
 
+#[derive(Clone, Copy)]
 enum Item {
     Header(usize),
     Row(usize, usize),
@@ -386,11 +391,13 @@ impl RollState {
         // Toolbar.
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Inputs").strong());
-            ui.selectable_value(&mut self.mode, Mode::Draw, "Draw").on_hover_text("Drag in a button row to press or release frames (D)");
-            ui.selectable_value(&mut self.mode, Mode::Select, "Select").on_hover_text(
-                "Click a press to select it; Shift adds, Alt+Shift removes. Drag empty space to select an area. Drag presses sideways to move them, or drag an edge to resize. Delete removes. (S)",
+            info_icon(ui).on_hover_text(
+                "Click an empty cell to add a press as long as the last one made or resized.\n\
+                 Drag a press to move it in time, or its edge to resize it. Hold Alt while dragging (or press Alt+Up/Down) to move presses to the next button row.\n\
+                 Click selects, Shift+click adds or removes. Drag on empty space selects an area (with Shift: adds, with Shift+Alt: removes).\n\
+                 Right-click or Delete removes. Escape clears the selection.",
             );
-            if self.mode == Mode::Select && !self.sel.is_empty() {
+            if !self.sel.is_empty() {
                 ui.label(egui::RichText::new(format!("{} selected", self.sel.len())).small());
             }
             ui.separator();
@@ -707,7 +714,15 @@ impl RollState {
                     action = Some(Action::OpenFrame(boxes[bi].frame));
                 } else if p.y < rows_top && p.x >= tl_left {
                     self.scrubbing = true;
-                } else if self.mode == Mode::Select && p.x >= tl_left && !header_at(p) {
+                } else if p.x >= tl_left && !header_at(p) && hit(p).is_some() && mods.command {
+                    // Ctrl/Cmd+drag: select an area.
+                    let a = (ff_at(p.x), p.y - rows_top + self.scroll_y);
+                    self.gesture = Some(Gesture::Marquee { a, b: a, op, cell: None });
+                } else if p.x >= tl_left && !header_at(p) && hit(p).is_some() {
+                    let row_here = match hit(p).map(|ix| items[ix].2) {
+                        Some(Item::Row(gi, ri)) => Some((gi, ri)),
+                        _ => None,
+                    };
                     match press_at(p) {
                         Some((key, sp, Some(left))) => {
                             self.gesture = Some(Gesture::Resize { key, span: sp, left, to: if left { sp.0 } else { sp.1 } });
@@ -715,29 +730,30 @@ impl RollState {
                         Some((key, sp, None)) => {
                             let id = (key, sp.0);
                             let anchor = ff_at(p.x);
-                            match op {
-                                SelOp::Remove => {
-                                    self.sel.remove(&id);
-                                }
-                                SelOp::Add => {
+                            let from = row_here.unwrap_or((0, 0));
+                            if mods.shift {
+                                // Shift+click adds or removes this press.
+                                if !self.sel.remove(&id) {
                                     self.sel.insert(id);
-                                    self.gesture = Some(Gesture::Move { anchor, delta: 0, click: None });
+                                    self.gesture = Some(Gesture::Move { anchor, delta: 0, click: None, from, dr: 0 });
                                 }
-                                SelOp::Replace => {
-                                    // Pressing on an already selected press keeps the selection,
-                                    // so a group can be dragged; a plain click then selects just it.
-                                    let was = self.sel.contains(&id);
-                                    if !was {
-                                        self.sel.clear();
-                                        self.sel.insert(id);
-                                    }
-                                    self.gesture = Some(Gesture::Move { anchor, delta: 0, click: was.then_some(id) });
+                            } else {
+                                // Pressing on an already selected press keeps the selection,
+                                // so a group can be dragged; a plain click then selects just it.
+                                let was = self.sel.contains(&id);
+                                if !was {
+                                    self.sel.clear();
+                                    self.sel.insert(id);
                                 }
+                                self.gesture = Some(Gesture::Move { anchor, delta: 0, click: was.then_some(id), from, dr: 0 });
                             }
                         }
                         None => {
+                            // An empty cell: a drag selects an area; a click adds a press here.
+                            let f = frame_at(p.x);
+                            let cell = row_here.filter(|_| f < m.frames).map(|(gi, ri)| (gi, ri, f));
                             let a = (ff_at(p.x), p.y - rows_top + self.scroll_y);
-                            self.gesture = Some(Gesture::Marquee { a, b: a, op });
+                            self.gesture = Some(Gesture::Marquee { a, b: a, op, cell });
                         }
                     }
                 } else if let Some(ix) = hit(p) {
@@ -749,13 +765,6 @@ impl RollState {
                                 self.open.insert((g.port, g.device), !now);
                             } else {
                                 self.scrubbing = true;
-                            }
-                        }
-                        Item::Row(gi, ri) if p.x >= tl_left => {
-                            let f = frame_at(p.x);
-                            if f < m.frames {
-                                let on = m.groups[gi].rows[ri].spans.iter().any(|s| s.0 <= f && f < s.1);
-                                self.drag = Some(Drag { group: gi, row: ri, anchor: f, current: f, press: !on });
                             }
                         }
                         _ => {}
@@ -772,15 +781,28 @@ impl RollState {
             }
             if let Some(d) = &mut self.drag {
                 d.current = frame_at(p.x).min(m.frames.saturating_sub(1));
+                if d.current != d.anchor {
+                    d.moved = true;
+                }
             }
         }
         if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
             match &mut self.gesture {
-                Some(Gesture::Move { anchor, delta, .. }) => {
+                Some(Gesture::Move { anchor, delta, from, dr, .. }) => {
                     let spans = sel_spans(&self.sel);
                     let lo = -(spans.iter().map(|(_, sp)| sp.0).min().unwrap_or(0) as i64);
                     let hi = m.frames as i64 - spans.iter().map(|(_, sp)| sp.1).max().unwrap_or(0) as i64;
                     *delta = ((ff_at(p.x) - *anchor).round() as i64).clamp(lo, hi.max(lo));
+                    // Alt: transpose to the row under the pointer, within the same controller,
+                    // as far as every selected press can go. Letting go of Alt first keeps the
+                    // rows chosen; moving back to the first row with Alt held undoes them.
+                    if mods.alt {
+                        if let Some(Item::Row(g2, r2)) = hit(p).map(|ix| items[ix].2) {
+                            if g2 == from.0 {
+                                *dr = clamp_rows(m, &self.sel, r2 as i64 - from.1 as i64);
+                            }
+                        }
+                    }
                 }
                 Some(Gesture::Resize { span, left, to, .. }) => {
                     let f = ff_at(p.x).round().max(0.0) as u64;
@@ -795,40 +817,15 @@ impl RollState {
         if released || !down {
             if let Some(g) = self.gesture.take() {
                 match g {
-                    Gesture::Move { delta, click, .. } => {
-                        if delta == 0 {
+                    Gesture::Move { delta, click, dr, .. } => {
+                        if delta == 0 && dr == 0 {
                             if let Some(c) = click {
                                 self.sel.clear();
                                 self.sel.insert(c);
                             }
-                        } else {
-                            let moved = sel_spans(&self.sel);
-                            let keys: BTreeSet<InputKey> = moved.iter().map(|(k, _)| *k).collect();
-                            let mut edits = vec![];
-                            let mut from = u64::MAX;
-                            let mut new_sel = BTreeSet::new();
-                            for key in keys {
-                                let Some((gi, ri)) = row_of(m, key) else { continue };
-                                let mine: Vec<(u64, u64)> = moved.iter().filter(|(k, _)| *k == key).map(|(_, sp)| *sp).collect();
-                                let mut spans: Vec<(u64, u64)> = m.groups[gi].rows[ri].spans.iter().copied().filter(|sp| !mine.contains(sp)).collect();
-                                for sp in &mine {
-                                    let a = (sp.0 as i64 + delta) as u64;
-                                    spans.push((a, a + (sp.1 - sp.0)));
-                                    from = from.min(sp.0.min(a));
-                                }
-                                let spans = merge(spans);
-                                for sp in &mine {
-                                    let a = (sp.0 as i64 + delta) as u64;
-                                    if let Some(t) = span_at(&spans, a) {
-                                        new_sel.insert((key, t.0));
-                                    }
-                                }
-                                edits.push((key, spans));
-                            }
-                            if !edits.is_empty() {
-                                self.sel = new_sel;
-                                action = Some(Action::Edit { edits, from });
-                            }
+                        } else if let Some((edits, from, new_sel)) = move_presses(m, &self.sel, delta, dr) {
+                            self.sel = new_sel;
+                            action = Some(Action::Edit { edits, from });
                         }
                     }
                     Gesture::Resize { key, span, left, to } => {
@@ -838,6 +835,7 @@ impl RollState {
                             spans.push(new);
                             let spans = merge(spans);
                             let from = if left { span.0.min(to) } else { span.1.min(to) };
+                            self.last_len = new.1 - new.0;
                             self.sel.remove(&(key, span.0));
                             if let Some(t) = span_at(&spans, new.0) {
                                 self.sel.insert((key, t.0));
@@ -845,15 +843,28 @@ impl RollState {
                             action = Some(Action::Edit { edits: vec![(key, spans)], from });
                         }
                     }
-                    Gesture::Marquee { a, b, op } => {
+                    Gesture::Marquee { a, b, op, cell } => {
                         let tiny = ((a.0 - b.0) * ppf).abs() < 3.0 && (a.1 - b.1).abs() < 3.0;
                         let found = in_area(a, b);
-                        match op {
-                            SelOp::Replace => self.sel = if tiny { BTreeSet::new() } else { found.into_iter().collect() },
-                            SelOp::Add => self.sel.extend(found),
-                            SelOp::Remove => {
-                                for id in found {
-                                    self.sel.remove(&id);
+                        if let (true, Some((gi, ri, f))) = (tiny, cell) {
+                            let row = &m.groups[gi].rows[ri];
+                            let span = (f, (f + self.last_len.max(1)).min(m.frames.max(f + 1)));
+                            let mut spans = row.spans.clone();
+                            spans.push(span);
+                            let spans = merge(spans);
+                            self.sel.clear();
+                            if let Some(t) = span_at(&spans, f) {
+                                self.sel.insert((row.key, t.0));
+                            }
+                            action = Some(Action::Edit { edits: vec![(row.key, spans)], from: f });
+                        } else {
+                            match op {
+                                SelOp::Replace => self.sel = if tiny { BTreeSet::new() } else { found.into_iter().collect() },
+                                SelOp::Add => self.sel.extend(found),
+                                SelOp::Remove => {
+                                    for id in found {
+                                        self.sel.remove(&id);
+                                    }
                                 }
                             }
                         }
@@ -862,38 +873,53 @@ impl RollState {
             }
             self.scrubbing = false;
             if let Some(d) = self.drag.take() {
-                let (a, b) = (d.anchor.min(d.current), d.anchor.max(d.current) + 1);
+                let (a, b) = d.span(self.last_len, m.frames);
                 let row = &m.groups[d.group].rows[d.row];
-                let mut spans: Vec<(u64, u64)> = vec![];
-                if d.press {
-                    spans = row.spans.clone();
-                    spans.push((a, b));
-                } else {
-                    for &(s, e) in &row.spans {
-                        if e <= a || s >= b {
-                            spans.push((s, e));
-                        } else {
-                            if s < a {
-                                spans.push((s, a));
-                            }
-                            if e > b {
-                                spans.push((b, e));
-                            }
-                        }
-                    }
+                let mut spans = row.spans.clone();
+                spans.push((a, b));
+                let spans = merge(spans);
+                if d.moved {
+                    self.last_len = b - a;
                 }
-                action = Some(Action::Edit { edits: vec![(row.key, merge(spans))], from: a });
+                self.sel.clear();
+                if let Some(t) = span_at(&spans, a) {
+                    self.sel.insert((row.key, t.0));
+                }
+                action = Some(Action::Edit { edits: vec![(row.key, spans)], from: a });
             }
         }
 
-        // Delete removes the selected presses; Escape clears the selection.
-        if self.mode == Mode::Select && !self.sel.is_empty() && !ui.ctx().egui_wants_keyboard_input() {
-            let (del, esc) = ui.input_mut(|i| {
+        // Right-click removes the press under the pointer.
+        if resp.hovered() && ui.input(|i| i.pointer.secondary_pressed()) && self.gesture.is_none() && self.drag.is_none() {
+            if let Some((key, sp, _)) = pointer.and_then(press_at) {
+                if let Some((gi, ri)) = row_of(m, key) {
+                    let spans = m.groups[gi].rows[ri].spans.iter().copied().filter(|s| *s != sp).collect();
+                    self.sel.remove(&(key, sp.0));
+                    action = Some(Action::Edit { edits: vec![(key, spans)], from: sp.0 });
+                }
+            }
+        }
+        // Delete removes the selected presses; Escape clears the selection; Alt+Up/Down
+        // moves them to the next button row.
+        if !self.sel.is_empty() && !ui.ctx().egui_wants_keyboard_input() {
+            let (del, esc, up, down_k) = ui.input_mut(|i| {
                 (
                     i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace),
                     i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                    i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowUp),
+                    i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown),
                 )
             });
+            let want = if up { -1 } else if down_k { 1 } else { 0 };
+            if want != 0 {
+                let dr = clamp_rows(m, &self.sel, want);
+                if dr != 0 {
+                    if let Some((edits, from, new_sel)) = move_presses(m, &self.sel, 0, dr) {
+                        self.sel = new_sel;
+                        action = Some(Action::Edit { edits, from });
+                    }
+                }
+            }
             if del {
                 let gone = sel_spans(&self.sel);
                 let keys: BTreeSet<InputKey> = gone.iter().map(|(k, _)| *k).collect();
@@ -914,7 +940,7 @@ impl RollState {
         }
         // What would be selected if the drag ended now, for highlighting.
         let shown_sel: BTreeSet<PressId> = match &self.gesture {
-            Some(Gesture::Marquee { a, b, op }) => {
+            Some(Gesture::Marquee { a, b, op, .. }) => {
                 let found = in_area(*a, *b);
                 let mut s = if *op == SelOp::Replace { BTreeSet::new() } else { self.sel.clone() };
                 if *op == SelOp::Remove {
@@ -928,9 +954,9 @@ impl RollState {
             }
             _ => self.sel.clone(),
         };
-        let move_delta = match &self.gesture {
-            Some(Gesture::Move { delta, .. }) => *delta,
-            _ => 0,
+        let (move_delta, move_dr) = match &self.gesture {
+            Some(Gesture::Move { delta, dr, .. }) => (*delta, *dr),
+            _ => (0, 0),
         };
 
         // ---- drawing ----
@@ -996,7 +1022,7 @@ impl RollState {
                                 continue;
                             }
                         }
-                        if selected && move_delta != 0 {
+                        if selected && (move_delta != 0 || move_dr != 0) {
                             // Where the press was; the moved copy is drawn below.
                             rp.rect_stroke(span_rect(a, b), 2.0, Stroke::new(1.0, c.gamma_multiply(0.6)), StrokeKind::Inside);
                             continue;
@@ -1006,9 +1032,12 @@ impl RollState {
                             rp.rect_stroke(span_rect(a, b), 2.0, hl, StrokeKind::Inside);
                         }
                     }
-                    if move_delta != 0 {
-                        for &(a, b) in &row.spans {
-                            if self.sel.contains(&(row.key, a)) {
+                    // Moved copies of the selected presses from the row `move_dr` above.
+                    let src = ri as i64 - move_dr;
+                    if (move_delta != 0 || move_dr != 0) && src >= 0 && (src as usize) < g.rows.len() {
+                        let srow = &g.rows[src as usize];
+                        for &(a, b) in &srow.spans {
+                            if self.sel.contains(&(srow.key, a)) {
                                 let (na, nb) = ((a as i64 + move_delta) as u64, (b as i64 + move_delta) as u64);
                                 rp.rect_filled(span_rect(na, nb), 2.0, c);
                                 rp.rect_stroke(span_rect(na, nb), 2.0, hl, StrokeKind::Inside);
@@ -1017,14 +1046,9 @@ impl RollState {
                     }
                     if let Some(d) = &self.drag {
                         if d.group == gi && d.row == ri {
-                            let (a, b) = (d.anchor.min(d.current), d.anchor.max(d.current) + 1);
+                            let (a, b) = d.span(self.last_len, m.frames);
                             let r = Rect::from_min_max(Pos2::new(x_of(a as f32), top + 1.0), Pos2::new(x_of(b as f32).max(x_of(a as f32) + 2.0), bot - 1.0));
-                            if d.press {
-                                rp.rect_filled(r, 2.0, Color32::WHITE.gamma_multiply(0.7));
-                            } else {
-                                rp.rect_filled(r, 0.0, bg.gamma_multiply(0.9));
-                                rp.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(230, 90, 80)), StrokeKind::Inside);
-                            }
+                            rp.rect_filled(r, 2.0, Color32::WHITE.gamma_multiply(0.7));
                         }
                     }
                 }
@@ -1102,11 +1126,11 @@ impl RollState {
             }
         }
         if let Some(d) = &self.drag {
-            let (a, b) = (d.anchor.min(d.current), d.anchor.max(d.current));
-            hover_text = Some(format!("{} frames {a}..={b}", if d.press { "press" } else { "release" }));
+            let (a, b) = d.span(self.last_len, m.frames);
+            hover_text = Some(format!("new press, frames {a}..={} ({} frames)", b - 1, b - a));
         }
         match &self.gesture {
-            Some(Gesture::Marquee { a, b, op }) => {
+            Some(Gesture::Marquee { a, b, op, .. }) => {
                 let to_screen = |(f, y): (f32, f32)| Pos2::new(x_of(f), rows_top + y - self.scroll_y);
                 let r = Rect::from_two_pos(to_screen(*a), to_screen(*b));
                 let mc = if *op == SelOp::Remove { Color32::from_rgb(230, 90, 80) } else { Color32::from_rgb(120, 180, 255) };
@@ -1114,7 +1138,10 @@ impl RollState {
                 mp.rect_filled(r, 0.0, mc.gamma_multiply(0.12));
                 mp.rect_stroke(r, 0.0, Stroke::new(1.0, mc), StrokeKind::Inside);
             }
-            Some(Gesture::Move { delta, .. }) if *delta != 0 => hover_text = Some(format!("move {} press{} by {delta:+} frames", self.sel.len(), if self.sel.len() == 1 { "" } else { "es" })),
+            Some(Gesture::Move { delta, dr, .. }) if *delta != 0 || *dr != 0 => {
+                let rows = if *dr != 0 { format!(", {} row{} {}", dr.abs(), if dr.abs() == 1 { "" } else { "s" }, if *dr > 0 { "down" } else { "up" }) } else { String::new() };
+                hover_text = Some(format!("move {} press{} by {delta:+} frames{rows}", self.sel.len(), if self.sel.len() == 1 { "" } else { "es" }))
+            }
             Some(Gesture::Resize { span, left, to, .. }) => {
                 let (a, b) = if *left { (*to, span.1) } else { (span.0, *to) };
                 hover_text = Some(format!("press frames {a}..={} ({} frames)", b - 1, b - a));
@@ -1190,20 +1217,99 @@ impl RollState {
                 ui.label(t);
             });
         }
-        if self.mode == Mode::Select {
-            let icon = match &self.gesture {
-                Some(Gesture::Move { .. }) => Some(egui::CursorIcon::Grabbing),
-                Some(Gesture::Resize { .. }) => Some(egui::CursorIcon::ResizeHorizontal),
-                Some(Gesture::Marquee { .. }) => None,
-                None if resp.hovered() => pointer.and_then(press_at).map(|(_, _, edge)| if edge.is_some() { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::Grab }),
+        let in_rows = |p: Pos2| p.y >= rows_top && p.x >= tl_left && !header_at(p) && hit(p).is_some();
+        let icon = match &self.gesture {
+            Some(Gesture::Move { dr, .. }) => Some(if mods.alt || *dr != 0 { egui::CursorIcon::AllScroll } else { egui::CursorIcon::Grabbing }),
+            Some(Gesture::Resize { .. }) => Some(egui::CursorIcon::ResizeHorizontal),
+            Some(Gesture::Marquee { .. }) => None,
+            None if self.drag.is_some() => Some(egui::CursorIcon::Crosshair),
+            None if resp.hovered() => match pointer {
+                Some(p) if mods.command && in_rows(p) => None,
+                Some(p) => match press_at(p) {
+                    Some((_, _, edge)) => Some(if edge.is_some() { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::Grab }),
+                    None if in_rows(p) => Some(egui::CursorIcon::Crosshair),
+                    None => None,
+                },
                 None => None,
-            };
-            if let Some(icon) = icon {
-                ui.ctx().set_cursor_icon(icon);
-            }
-        } else if resp.hovered() && pointer.is_some_and(|p| p.y >= rows_top && p.x >= tl_left) {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            },
+            None => None,
+        };
+        if let Some(icon) = icon {
+            ui.ctx().set_cursor_icon(icon);
         }
         action
     }
+}
+
+/// How many rows (toward `want`) every selected press can move and stay in its controller.
+fn clamp_rows(m: &Model, sel: &BTreeSet<PressId>, want: i64) -> i64 {
+    let mut dr = want;
+    for (key, _) in sel {
+        if let Some((gi, ri)) = row_of(m, *key) {
+            let n = m.groups[gi].rows.len() as i64;
+            dr = dr.clamp(-(ri as i64), n - 1 - ri as i64);
+        }
+    }
+    if dr.signum() != want.signum() {
+        0
+    } else {
+        dr
+    }
+}
+
+/// The selected presses moved `delta` frames and `dr` rows down (same controller).
+/// Returns the new spans for every touched button, the first changed frame, and the
+/// moved presses' new ids.
+fn move_presses(m: &Model, sel: &BTreeSet<PressId>, delta: i64, dr: i64) -> Option<(Vec<(InputKey, Vec<(u64, u64)>)>, u64, BTreeSet<PressId>)> {
+    let moved: Vec<(InputKey, (u64, u64))> = sel
+        .iter()
+        .filter_map(|(key, start)| {
+            let (gi, ri) = row_of(m, *key)?;
+            m.groups[gi].rows[ri].spans.iter().find(|sp| sp.0 == *start).map(|sp| (*key, *sp))
+        })
+        .collect();
+    if moved.is_empty() {
+        return None;
+    }
+    let mut rows: HashMap<InputKey, Vec<(u64, u64)>> = HashMap::new();
+    let spans_of = |key: InputKey| row_of(m, key).map(|(gi, ri)| m.groups[gi].rows[ri].spans.clone()).unwrap_or_default();
+    // Take the moved presses out first, then put them in their new places.
+    for (key, sp) in &moved {
+        let v = rows.entry(*key).or_insert_with(|| spans_of(*key));
+        v.retain(|s| s != sp);
+    }
+    let mut from = u64::MAX;
+    let mut placed = vec![];
+    for (key, sp) in &moved {
+        let (gi, ri) = row_of(m, *key)?;
+        let to_key = m.groups[gi].rows.get((ri as i64 + dr) as usize)?.key;
+        let a = (sp.0 as i64 + delta).max(0) as u64;
+        rows.entry(to_key).or_insert_with(|| spans_of(to_key)).push((a, a + (sp.1 - sp.0)));
+        from = from.min(sp.0.min(a));
+        placed.push((to_key, a));
+    }
+    let mut edits = vec![];
+    let mut new_sel = BTreeSet::new();
+    for (key, spans) in rows {
+        let spans = merge(spans);
+        for (k, a) in &placed {
+            if *k == key {
+                if let Some(t) = span_at(&spans, *a) {
+                    new_sel.insert((key, t.0));
+                }
+            }
+        }
+        edits.push((key, spans));
+    }
+    Some((edits, from, new_sel))
+}
+
+/// A small circled "i", painted so it doesn't depend on the font having the glyph.
+fn info_icon(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+    let c = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().weak_text_color() };
+    let m = rect.center();
+    ui.painter().circle_stroke(m, 6.5, Stroke::new(1.2, c));
+    ui.painter().text(m + egui::vec2(0.0, 0.5), Align2::CENTER_CENTER, "i", FontId::proportional(10.0), c);
+    resp
 }

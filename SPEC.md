@@ -479,7 +479,11 @@ past its last body line.
     segment becomes the selected one, the playhead moves with it even when paused, and
     only then can it be edited. No edit ever spans two segments.
 - **One piano roll mode instead of Draw and Select** (in the style of FL Studio's
-  piano roll):
+  piano roll). Implemented, with two changes from the notes below: dragging on empty
+  space selects an area (no Ctrl/Cmd needed), so a press is only made by a click, as
+  long as the last one made or resized (4 frames to begin with); drag-to-draw may come
+  later. Shift+click toggles a press in the selection, and Shift+Alt+drag removes an
+  area from it. The original notes:
   - Click an empty cell to add a press, as long as the last press made or resized.
     Keep the button down and drag to set its length.
   - Drag a press's body to move it in time and its edges to resize it. Plain drags
