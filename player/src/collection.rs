@@ -25,6 +25,17 @@ pub struct Config {
     pub cache: Option<crate::cache::CacheConfig>,
 }
 
+/// `[mcp]` in .local/local.toml (docs/mcp.md).
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct McpLocal {
+    /// What `dj mcp` lets an agent do: "query", "draft" or "save".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<String>,
+    /// The GUI's MCP menu toggle: show drafts, list sessions, share the view. Off by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui: Option<bool>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RomConfig {
     pub sha256: String,
@@ -96,6 +107,9 @@ pub struct LocalConfig {
     /// Overrides config.toml's [cache] on this machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::cache::CacheConfig>,
+    /// `[mcp]`: what `dj mcp` allows, and whether the GUI works with agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpLocal>,
 }
 
 pub struct Collection {

@@ -168,6 +168,7 @@ diff_every = 300
 | `max_memory_mb` | `512` | How much memory the GUI's in-memory snapshots for the current segment may use (Emulation > Snapshot memory). |
 | `[cache]` | none | Any key from `config.toml`'s `[cache]`, overriding it on this machine only. |
 | `[mcp] allow` | `"draft"` | What `dj mcp` lets an agent do: `"query"`, `"draft"` or `"save"` ([mcp.md](mcp.md#what-an-agent-may-do)). `--allow` overrides it. |
+| `[mcp] gui` | `false` | Whether the GUI works with agents: their drafts, sessions and the shared view. MCP > Enable MCP writes it. |
 
 Next to it in `.local/`, the tools keep `cache.db` (the [local database](database.md)), and
 `dj mcp` keeps `drafts/` (agent [drafts](mcp.md#drafts)), `traces/`, `snapshots/` and

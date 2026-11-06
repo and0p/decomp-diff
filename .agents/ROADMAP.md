@@ -108,6 +108,23 @@ When one ships, its user-facing description moves into `docs/` and the entry her
 
 ## Project and CLI
 
+- **Versioning projects.** A project should say which version of the format and the
+  tools it needs, and the tools should handle the difference both ways. Today
+  `config.toml` has `format = 1` and `dj-replay 1` heads each segment, and older
+  layouts are upgraded silently on open ([older projects](../docs/segments.md#older-projects)).
+  To decide:
+  - A newer tool opening an older project: upgrade in place, as now, or ask first and
+    show what changes (a diff or a backup), since the upgrade lands in the author's git
+    history. A `dj upgrade <dir>` command could do it explicitly.
+  - An older tool opening a newer project: refuse with a clear message naming the
+    version needed, rather than misreading it. Which changes need a version bump and
+    which can be new optional header keys that older tools ignore.
+  - The core and setup: rebuilding a connector core changes the setup id, so every
+    segment's hashes and the database stop matching (this happened with the trace hook).
+    Options: a project records the connector version it was made with, a rebuild that
+    keeps emulation identical keeps the setup id, or `dj` re-pins and re-verifies the
+    tree after a core change and reports which segments still match.
+  - Recording which `dj` version last wrote a project, for bug reports.
 - **Backups without version control.** `dj backup <dir>` (and File > Back up… in
   the GUI) writes the project's shared files to a ZIP: `config.toml`, `segments/`,
   `blobs/`, `symbols/` and `unreachable.txt`, never `.local/` (the database can be
@@ -147,10 +164,26 @@ When one ships, its user-facing description moves into `docs/` and the entry her
   runs of `[WRITE]` lines. They would be stored locally, and segments would refer to
   them by name, as `[RNG]` ([reserved commands](../docs/segments.md#reserved-commands)) already reserves.
 - **MCP follow-ups.** `dj mcp` is built ([mcp.md](../docs/mcp.md)). Left to do:
-  - The GUI attaching to an agent's session over a socket, so the two share one core instead of the GUI following through files a second behind.
+  - **Sockets alongside the files.** The GUI follows sessions and shares its view through
+    files in `.local/mcp/`, which needs no connection handling while agent servers come and
+    go, but runs about a second behind and can't share a core. Keep the files as discovery
+    and fallback, and add a local socket: `dj mcp` listens and writes its address and a token
+    into the `sessions-<pid>.json` it already publishes. The GUI connects for live frames and
+    inputs, falling back to the files when it can't. Then **attach**: the GUI drives the
+    agent's own core instead of opening a copy at the same point. Use loopback TCP with the
+    token (or a named pipe) on Windows, or TCP everywhere so every platform shares one code
+    path; Rust's standard Unix sockets don't exist on Windows. Build live follow first,
+    then attach.
   - A Windows job object, so workers end if `dj mcp` is killed.
   - Trace hooks for connectors other than Mesen, and disassembly for CPUs other than the 6502.
   - Parity per function and per segment, once comparison cores exist (`dj parity <segment> --against <core>`, and an MCP tool).
+  - **An MCP console in the GUI.** A panel (MCP > Show console, or clicking the MCP state in
+    the status bar) with a running log: errors and warnings, servers starting and stopping,
+    sessions opened and closed, drafts written, saved or discarded, jobs starting, finding
+    new code and finishing, tool calls that failed, and when an agent read the shared view.
+    `dj mcp` would append events to a log in `.local/mcp/` (or send them over the socket,
+    once there is one) and the GUI would tail it, with filters by level and session and a
+    way to copy lines into a bug report.
   - Stable SQL views (`v_first_hits`, `v_function_coverage`) so agents can query the database without knowing its tables.
 
 ## Comparison and parity

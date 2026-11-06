@@ -138,6 +138,9 @@ struct App {
     return_to_edit: bool,
     /// The earliest frame of the current segment edited since playback last ran.
     edit_from: Option<u64>,
+    /// The MCP menu's switch: drafts, agent sessions and sharing are off until it is on
+    /// (`[mcp] gui` in .local/local.toml).
+    mcp_on: bool,
     /// Agent drafts from .local/drafts/ in the tree.
     show_drafts: bool,
     drafts_fp: u128,
@@ -288,6 +291,7 @@ impl Default for App {
             max_memory_mb: 512,
             return_to_edit: true,
             edit_from: None,
+            mcp_on: false,
             show_drafts: true,
             drafts_fp: 0,
             agent_polled: 0.0,
@@ -296,6 +300,22 @@ impl Default for App {
             share_view: false,
             shared: None,
         }
+    }
+}
+
+const KEEP_MENU_OPEN: &str = "dj_keep_menu_open";
+
+/// A menu checkbox: clicking it leaves the menu open (see `menu_bar`).
+trait KeepMenuOpen {
+    fn keep_open(self) -> Self;
+}
+
+impl KeepMenuOpen for egui::Response {
+    fn keep_open(self) -> Self {
+        if self.clicked() {
+            self.ctx.data_mut(|d| d.insert_temp(egui::Id::unique(KEEP_MENU_OPEN), true));
+        }
+        self
     }
 }
 
@@ -584,7 +604,11 @@ impl App {
     fn open_collection(&mut self, dir: &Path) {
         match Collection::open(dir) {
             Ok(mut col) => {
-                if self.show_drafts {
+                self.mcp_on = col.load_local().ok().and_then(|l| l.mcp).and_then(|m| m.gui).unwrap_or(false);
+                self.agent_sessions.clear();
+                self.share_view = false;
+                self.shared = None;
+                if self.mcp_on && self.show_drafts {
                     let _ = col.load_drafts();
                 }
                 self.drafts_fp = agent::drafts_fingerprint(dir);
@@ -1965,8 +1989,12 @@ impl App {
     // ---- UI ----
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
+        // Menus ignore clicks inside them (CloseOnClickOutside) and are closed below on any
+        // click that wasn't on a checkbox, so several boxes can be ticked in a row.
+        let config = egui::containers::menu::MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let mut bar: Vec<egui::InnerResponse<Option<()>>> = vec![];
+        egui::MenuBar::new().config(config).ui(ui, |ui| {
+            bar.push(ui.menu_button("File", |ui| {
                 if ui.button("Open project…").clicked() {
                     if let Some(dir) = rfd::FileDialog::new().set_title("Open a project folder").pick_folder() {
                         self.open_collection(&dir);
@@ -1983,8 +2011,8 @@ impl App {
                 if ui.button("Quit").clicked() {
                     ui.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-            });
-            ui.menu_button("Edit", |ui| {
+            }));
+            bar.push(ui.menu_button("Edit", |ui| {
                 use egui::{Key, KeyboardShortcut, Modifiers};
                 let ctx = ui.ctx().clone();
                 let sc = |m: Modifiers, k: Key| ctx.format_shortcut(&KeyboardShortcut::new(m, k));
@@ -2007,8 +2035,8 @@ impl App {
                 if ui.add_enabled(self.clip.is_some() && self.pb.is_some(), egui::Button::new("Paste at play cursor").shortcut_text(sc(Modifiers::COMMAND, Key::V))).clicked() {
                     self.paste();
                 }
-            });
-            ui.menu_button("Emulation", |ui| {
+            }));
+            bar.push(ui.menu_button("Emulation", |ui| {
                 let has = self.pb.is_some();
                 if ui.add_enabled(has, egui::Button::new(if self.playing { "Pause" } else { "Play" }).shortcut_text("Space")).clicked() {
                     self.toggle_play();
@@ -2050,16 +2078,19 @@ impl App {
                     self.start_hydrate(None, true);
                 }
                 let mut use_db = self.col.as_ref().and_then(|c| c.load_local().ok()).and_then(|l| l.database).unwrap_or(true);
-                if ui.add_enabled(self.col.is_some() && idle, egui::Checkbox::new(&mut use_db, "Use the local database")).on_hover_text("Off: play from power-on and keep snapshots only in memory, as before the database existed").changed() {
+                if ui.add_enabled(self.col.is_some() && idle, egui::Checkbox::new(&mut use_db, "Use the local database")).keep_open().on_hover_text("Off: play from power-on and keep snapshots only in memory, as before the database existed").changed() {
                     self.set_database(use_db);
                 }
+                // Clicking the submenu's own button leaves the menu open, as egui does by default.
                 ui.menu_button(format!("Snapshot memory: {} MB", self.max_memory_mb), |ui| {
                     for mb in [128, 256, 512, 1024, 2048, 4096] {
                         if ui.radio(self.max_memory_mb == mb, format!("{mb} MB")).clicked() {
                             self.set_max_memory(mb);
                         }
                     }
-                });
+                })
+                .response
+                .keep_open();
                 ui.separator();
                 let has_col = self.col.is_some();
                 if ui.add_enabled(has_col, egui::Button::new("Set ROM…")).clicked() {
@@ -2072,8 +2103,8 @@ impl App {
                         self.set_local(None, Some(f));
                     }
                 }
-            });
-            ui.menu_button("Segment", |ui| {
+            }));
+            bar.push(ui.menu_button("Segment", |ui| {
                 let sel = self.selected.clone();
                 let has = sel.is_some() && self.pb.is_some();
                 if ui.add_enabled(has, egui::Button::new("New child at end")).on_hover_text("A new empty segment that starts where this one ends").clicked() {
@@ -2101,24 +2132,31 @@ impl App {
                 if ui.add_enabled(sel.is_some(), egui::Button::new("Delete…")).on_hover_text("Delete this segment and everything below it").clicked() {
                     self.delete_dialog = sel.clone();
                 }
-            });
-            ui.menu_button("Agent", |ui| self.agent_menu(ui));
-            ui.menu_button("Input", |ui| {
+            }));
+            bar.push(ui.menu_button("MCP", |ui| self.agent_menu(ui)));
+            bar.push(ui.menu_button("Input", |ui| {
                 ui.add_enabled(false, egui::Button::new("Keyboard mapping…")).on_disabled_hover_text("Coming later: play the game from the keyboard and record into the roll");
-            });
-            ui.menu_button("View", |ui| {
+            }));
+            bar.push(ui.menu_button("View", |ui| {
                 if ui.button("Zoom in").clicked() {
                     self.roll.zoom(1.5);
                 }
                 if ui.button("Zoom out").clicked() {
                     self.roll.zoom(1.0 / 1.5);
                 }
-                ui.checkbox(&mut self.roll.follow, "Follow playhead");
-                ui.checkbox(&mut self.return_to_edit, "Return to the edit").on_hover_text("Any edit pauses playback and shows the earliest frame edited since playback last ran. Off: the frame you were on is redrawn.");
-                ui.checkbox(&mut self.roll.all_buttons, "Show every joypad button");
+                ui.checkbox(&mut self.roll.follow, "Follow playhead").keep_open();
+                ui.checkbox(&mut self.return_to_edit, "Return to the edit").keep_open().on_hover_text("Any edit pauses playback and shows the earliest frame edited since playback last ran. Off: the frame you were on is redrawn.");
+                ui.checkbox(&mut self.roll.all_buttons, "Show every joypad button").keep_open();
                 ui.add_enabled(false, egui::Checkbox::new(&mut false, "Second core side by side")).on_disabled_hover_text("Coming later");
-            });
+            }));
         });
+        let open = bar.iter().any(|r| r.inner.is_some());
+        let on_bar = bar.iter().any(|r| r.response.clicked());
+        let clicked = ui.input(|i| i.pointer.any_click());
+        let keep = ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::unique(KEEP_MENU_OPEN)).unwrap_or(false));
+        if open && clicked && !on_bar && !keep {
+            egui::Popup::close_all(ui.ctx());
+        }
     }
 
     fn end_matches(&self) -> Option<bool> {
@@ -2570,23 +2608,28 @@ impl App {
 
     fn agent_menu(&mut self, ui: &mut egui::Ui) {
         let has_col = self.col.is_some();
-        if ui.checkbox(&mut self.show_drafts, "Show agent drafts").on_hover_text("Drafts in .local/drafts/ appear in the tree in teal").changed() {
-            if let Some(col) = &mut self.col {
-                if self.show_drafts {
+        let mut on = self.mcp_on;
+        if ui
+            .add_enabled(has_col, egui::Checkbox::new(&mut on, "Enable MCP"))
+            .keep_open()
+            .on_hover_text("Work with AI agents running `dj mcp` on this project: show their drafts, follow their sessions, share your view. Saved for this project on this machine.")
+            .changed()
+        {
+            self.set_mcp(on);
+        }
+        ui.separator();
+        let mcp_on = self.mcp_on;
+        ui.add_enabled_ui(mcp_on, |ui| self.agent_menu_items(ui, has_col));
+    }
+
+    fn agent_menu_items(&mut self, ui: &mut egui::Ui, has_col: bool) {
+        if ui.checkbox(&mut self.show_drafts, "Show agent drafts").keep_open().on_hover_text("Drafts in .local/drafts/ appear in the tree in teal").changed() {
+            if self.show_drafts {
+                if let Some(col) = &mut self.col {
                     let _ = col.load_drafts();
-                } else {
-                    let ids: Vec<String> = col.drafts.iter().cloned().collect();
-                    for id in ids {
-                        col.replays.remove(&id);
-                        col.paths.remove(&id);
-                        self.edited.remove(&id);
-                    }
-                    col.drafts.clear();
-                    if self.selected.as_ref().is_some_and(|s| !col.replays.contains_key(s)) {
-                        self.selected = None;
-                        self.pb = None;
-                    }
                 }
+            } else {
+                self.unload_drafts();
             }
         }
         ui.separator();
@@ -2608,6 +2651,7 @@ impl App {
         ui.separator();
         if ui
             .add_enabled(has_col, egui::Checkbox::new(&mut self.share_view, "Share my view with agents"))
+            .keep_open()
             .on_hover_text("Agents can ask what you are looking at (the gui_view tool) and open a session there to take it from here")
             .changed()
         {
@@ -2620,8 +2664,94 @@ impl App {
         }
     }
 
+    /// Turns the GUI's MCP side on or off, and remembers it in .local/local.toml.
+    fn set_mcp(&mut self, on: bool) {
+        self.mcp_on = on;
+        if let Some(col) = &self.col {
+            let mut local = col.load_local().unwrap_or_default();
+            local.mcp.get_or_insert_with(Default::default).gui = Some(on);
+            let _ = col.save_local(&local);
+        }
+        if on {
+            if self.show_drafts {
+                if let Some(col) = &mut self.col {
+                    let _ = col.load_drafts();
+                }
+            }
+            if let Some(c) = &self.col {
+                self.drafts_fp = agent::drafts_fingerprint(&c.root);
+            }
+            self.poll_agents();
+            self.info("MCP on: agent drafts and sessions are shown");
+        } else {
+            self.unload_drafts();
+            self.follow = None;
+            self.agent_sessions.clear();
+            if self.share_view {
+                self.share_view = false;
+                self.shared = None;
+                if let Some(c) = &self.col {
+                    agent::share_view(&c.root, None);
+                }
+            }
+            self.info("MCP off");
+        }
+    }
+
+    /// Takes agent drafts out of the tree (the files stay).
+    fn unload_drafts(&mut self) {
+        let Some(col) = &mut self.col else { return };
+        let ids: Vec<String> = col.drafts.iter().cloned().collect();
+        for id in ids {
+            col.replays.remove(&id);
+            col.paths.remove(&id);
+            self.edited.remove(&id);
+        }
+        col.drafts.clear();
+        if self.selected.as_ref().is_some_and(|s| !col.replays.contains_key(s)) {
+            self.selected = None;
+            self.pb = None;
+        }
+    }
+
+    /// The MCP slot in the status bar.
+    fn mcp_status(&self, ui: &mut egui::Ui) {
+        if self.col.is_none() {
+            return;
+        }
+        if !self.mcp_on {
+            ui.label(RichText::new("MCP off").small().weak()).on_hover_text("Agents' drafts and sessions are hidden. MCP > Enable MCP to show them.");
+            return;
+        }
+        let n = self.agent_sessions.len();
+        let mut text = match n {
+            0 => "MCP: no sessions".to_string(),
+            1 => "MCP: 1 session".to_string(),
+            n => format!("MCP: {n} sessions"),
+        };
+        if let Some((_, s)) = &self.follow {
+            text += &format!(" · following {s}");
+        }
+        if self.share_view {
+            text += " · sharing view";
+        }
+        let servers: std::collections::BTreeSet<u64> = self.agent_sessions.iter().map(|s| s.pid).collect();
+        let drafts = self.col.as_ref().map(|c| c.drafts.len()).unwrap_or(0);
+        let hover = format!(
+            "{} running dj mcp server{} with open sessions, {drafts} agent draft{} in the tree.{}",
+            servers.len(),
+            if servers.len() == 1 { "" } else { "s" },
+            if drafts == 1 { "" } else { "s" },
+            if self.share_view { " Agents can read what you are looking at (gui_view)." } else { "" }
+        );
+        ui.label(RichText::new(text).small().color(if n > 0 { DRAFT } else { Color32::GRAY })).on_hover_text(hover);
+    }
+
     /// Picks up drafts that changed on disk, agent sessions, and what to share.
     fn poll_agents(&mut self) {
+        if !self.mcp_on {
+            return;
+        }
         let Some(root) = self.col.as_ref().map(|c| c.root.clone()) else { return };
         self.agent_sessions = agent::sessions(&root);
         if self.show_drafts && self.hydrating.is_none() {
@@ -3224,6 +3354,8 @@ impl App {
                         ui.label(RichText::new(format!("{} unsaved", self.edited.len())).small().color(Color32::from_rgb(240, 210, 90)));
                     }
                 }
+                ui.separator();
+                self.mcp_status(ui);
             });
         });
     }

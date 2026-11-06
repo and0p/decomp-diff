@@ -19,7 +19,7 @@ The ROM and core come from the project's `.local/local.toml` (written by the CLI
 | Left sidebar | Tabs for **Segments**, **Markers** and **Coverage**, with the coverage map below them | Below, and [coverage.md](coverage.md#in-the-gui) |
 | Top | The emulator picture, with the transport bar below it | [Transport](#transport) |
 | Bottom | The piano roll and marker lane | [editing.md](editing.md#piano-roll) |
-| Bottom edge | The status bar: messages on the left, the core and unsaved count on the right. Long seeks, loads and hydration show a progress bar there. | |
+| Bottom edge | The status bar: messages on the left; the unsaved count, the core and the MCP state (off, or agent sessions running, following, sharing) on the right. Long seeks, loads and hydration show a progress bar there. | |
 
 ## Segments tab
 
@@ -29,7 +29,7 @@ Edited segments are yellow italics until saved. A blue **db** after a segment's 
 means its current content is in the local database, and "+N" is how many instructions
 only that segment runs.
 
-Drafts written by an AI agent ([mcp.md](mcp.md#drafts)) appear in teal italics, marked
+With MCP > Enable MCP on, drafts written by an AI agent ([mcp.md](mcp.md#drafts)) appear in teal italics, marked
 `draft` and the session that has them open. They aren't counted in coverage, and the header
 counts them apart ("N agent drafts"). Right-click one to follow its session, save it as a
 segment or discard it.
@@ -65,7 +65,7 @@ Below the picture, left to right:
 | --- | --- |
 | File | Open project…, Save (Ctrl/Cmd+S), Reload from disk (discards unsaved edits), Quit |
 | Edit | Undo, Redo, Cut, Copy, Paste at play cursor ([editing.md](editing.md#undo-cut-copy-and-paste)) |
-| Agent | Show agent drafts, follow an agent session, Stop following, Share my view with agents ([mcp.md](mcp.md#the-gui)) |
+| MCP | Enable MCP (off by default), Show agent drafts, follow an agent session, Stop following, Share my view with agents ([mcp.md](mcp.md#the-gui)) |
 | Emulation | Play/pause, step, go to start or end, Accept end hash, hydration, Use the local database, Snapshot memory, Set ROM…, Set core… ([database.md](database.md#in-the-gui)) |
 | Segment | Tree edits and Add event at playhead (E) ([editing.md](editing.md#segment-menu)) |
 | Input | Keyboard mapping (coming later) |

@@ -203,12 +203,16 @@ pass `buttons` to choose others. A `seed` makes a run repeatable on one worker.
 
 ## The GUI
 
-`dj-gui` works alongside agents through files in `.local/`, so the two need no connection:
+`dj-gui` works alongside agents through files in `.local/`, so the two need no connection.
+It is off until you turn on **MCP > Enable MCP**, which is remembered for the project on
+that machine (`[mcp] gui` in `.local/local.toml`). The right of the status bar shows the
+state: `MCP off`, or the number of agent sessions running, and whether you are following one
+or sharing your view.
 
 - **Drafts** appear in the tree in teal, marked `draft` (and the session they are open in). Right-click one to **Follow session**, **Save as segment** (moves it to `segments/`; play it to the end and accept its end hash to make it clean) or **Discard draft**. You can edit a draft like any segment; your edits are saved to its file.
-- **Agent > Follow an agent session** lists running sessions (`dj mcp` publishes them in `.local/mcp/`). Following one shows its draft at the agent's frame as it plays, with its inputs filling the piano roll. **Stop following** takes the view back.
-- **Agent > Share my view with agents** writes the segment and frame you are on to `.local/mcp/gui.json`, which the agent reads with `gui_view`. Ask it to look at what you're looking at, or to take it from there: it opens a session at that point, and you can follow it.
-- **Agent > Show agent drafts** hides or shows them.
+- **MCP > Follow an agent session** lists running sessions (`dj mcp` publishes them in `.local/mcp/`). Following one shows its draft at the agent's frame as it plays, with its inputs filling the piano roll. **Stop following** takes the view back.
+- **MCP > Share my view with agents** writes the segment and frame you are on to `.local/mcp/gui.json`, which the agent reads with `gui_view`. Ask it to look at what you're looking at, or to take it from there: it opens a session at that point, and you can follow it.
+- **MCP > Show agent drafts** hides or shows them.
 
 ## Limits
 
