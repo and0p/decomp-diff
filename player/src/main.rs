@@ -1,3 +1,5 @@
+mod mcp;
+mod queries;
 use decomp_dj::{cache, coverage, libretro};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -28,6 +30,22 @@ struct Local {
     /// Run without the local database (.local/cache.db), playing everything from power-on
     #[arg(long, global = true)]
     no_db: bool,
+}
+
+#[derive(clap::Args, Clone)]
+struct QueryArgs {
+    /// Print JSON instead of text
+    #[arg(long)]
+    json: bool,
+    /// Rows to show
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+    /// Skip this many rows (the `next_cursor` of a previous page)
+    #[arg(long, default_value_t = 0)]
+    cursor: usize,
+    /// ROM file (default: the one saved in .local/local.toml)
+    #[arg(long)]
+    rom: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -115,14 +133,58 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Which segments first run a ROM offset or symbol, at which frame
-    Where {
+    /// Which segments first run an address, at which frame, nearest snapshot first
+    #[command(alias = "where")]
+    Xref {
         dir: PathBuf,
-        /// PRG:0x1F3A, 0x1F3A (PRG) or a symbol name
+        /// PRG:0x1F3A, 0x1F3A (a PRG offset), $C123 (a CPU address) or a symbol name (name+0x10 works)
         what: String,
         #[command(flatten)]
-        local: Local,
+        query: QueryArgs,
     },
+    /// Coverage headline numbers
+    Summary {
+        dir: PathBuf,
+        #[command(flatten)]
+        query: QueryArgs,
+    },
+    /// Functions with uncovered code, largest or nearest first
+    Gaps {
+        dir: PathBuf,
+        /// size (most uncovered instructions) or nearness (skipped by a covered branch first)
+        #[arg(long, default_value = "size")]
+        sort: decomp_dj::query::GapSort,
+        /// all, never (functions never entered) or partial
+        #[arg(long, default_value = "all")]
+        only: decomp_dj::query::GapFilter,
+        #[command(flatten)]
+        query: QueryArgs,
+    },
+    /// One function: its blocks, which run, which segments enter it, its callers
+    Function {
+        dir: PathBuf,
+        what: String,
+        #[command(flatten)]
+        query: QueryArgs,
+    },
+    /// Covered branches and calls that lead into uncovered code, with the segments that reach them
+    Frontier {
+        dir: PathBuf,
+        /// An address in uncovered code, or a function; leave out for the whole ROM
+        what: Option<String>,
+        #[command(flatten)]
+        query: QueryArgs,
+    },
+    /// Serve the project to an agent over MCP (stdio); see docs/mcp.md
+    Mcp {
+        dir: PathBuf,
+        /// What the agent may do: query, draft (the default) or save
+        #[arg(long)]
+        allow: Option<mcp::tools::Allow>,
+    },
+    /// Internal: one core driven by `dj mcp` over a pipe
+    #[command(hide = true)]
+    Worker { dir: PathBuf },
     /// Write the core state at a frame of a segment, to start a trace from
     Snapshot {
         dir: PathBuf,
@@ -183,9 +245,15 @@ fn real_main() -> Result<()> {
         Cmd::Run { dir, local, from_scratch, accept, screenshots } => run(&dir, &local, from_scratch, accept, screenshots),
         Cmd::Report { dir, local, json, gaps } => report(&dir, &local, json, gaps),
         Cmd::Hydrate { dir, local, segment, children, clean, force } => hydrate(&dir, &local, segment, children, clean, force),
-        Cmd::Where { dir, what, local } => where_cmd(&dir, &what, &local),
+        Cmd::Xref { dir, what, query } => queries::xref(&dir, &what, &query),
+        Cmd::Summary { dir, query } => queries::summary(&dir, &query),
+        Cmd::Gaps { dir, sort, only, query } => queries::gaps(&dir, sort, only, &query),
+        Cmd::Function { dir, what, query } => queries::function(&dir, &what, &query),
+        Cmd::Frontier { dir, what, query } => queries::frontier(&dir, what.as_deref(), &query),
         Cmd::Snapshot { dir, segment, frame, out, local } => snapshot_cmd(&dir, &segment, frame, &out, &local),
         Cmd::Sql { dir, query } => sql(&dir, &query),
+        Cmd::Worker { dir } => mcp::worker::run(dir),
+        Cmd::Mcp { dir, allow } => mcp::serve(dir, mcp::tools::Options { allow }),
         Cmd::Cache { cmd: CacheCmd::Stats { dir } } => cache_stats(&dir),
         Cmd::Cache { cmd: CacheCmd::Gc { dir, local } } => cache_gc(&dir, &local),
     }
@@ -492,50 +560,6 @@ fn hydrate(dir: &Path, local: &Local, segment: Option<String>, children: bool, c
     Ok(())
 }
 
-fn latest_setup(conn: &rusqlite::Connection) -> Result<String> {
-    conn.query_row("SELECT setup FROM contents ORDER BY played_at DESC LIMIT 1", [], |r| r.get(0)).context("the local database is empty; run `dj hydrate` first")
-}
-
-fn where_cmd(dir: &Path, what: &str, local: &Local) -> Result<()> {
-    let col = Collection::open(dir)?;
-    let conn = cache::Cache::open_readonly(&col)?;
-    let (region, offset) = if let Ok(ro) = decomp_dj::player::parse_region_offset(what) {
-        ro
-    } else if let Some(h) = what.strip_prefix("0x") {
-        ("PRG".to_string(), u64::from_str_radix(h, 16)?)
-    } else {
-        // A symbol name: needs the symbol map.
-        let mut found = None;
-        let rom = local.rom.as_ref().and_then(|p| std::fs::read(p).ok());
-        for sym in &col.config.symbols {
-            let funcs = decomp_dj::analysis::load_symbols(&col.root, sym, rom.as_deref())?;
-            if let Some(f) = funcs.iter().find(|f| f.name == what) {
-                found = Some((f.region.clone(), f.offset));
-                break;
-            }
-        }
-        found.ok_or_else(|| anyhow!("{what} is not an offset (PRG:0x1234 or 0x1234) or a symbol in the collection's symbol maps"))?
-    };
-    let setup = latest_setup(&conn)?;
-    let hits = coverage::first_hits_in(&col, &conn, &setup, &region, offset, offset)?;
-    if hits.is_empty() {
-        println!("no current segment runs {region}:{offset:#x} (as recorded in the local database)");
-        return Ok(());
-    }
-    println!("{region}:{offset:#x} first runs in:");
-    let keys = cache::current_keys(&conn, &col, &setup)?;
-    for h in hits {
-        let key = keys.get(&h.id).and_then(|(k, _)| k.clone());
-        let near: Option<i64> = match &key {
-            Some(k) => conn.query_row("SELECT max(frame) FROM frames WHERE content = ?1 AND frame <= ?2", rusqlite::params![k, h.frame as i64], |r| r.get(0))?,
-            None => None,
-        };
-        let note = if h.status == Status::Dirty { "  (dirty: doesn't count)" } else { "" };
-        let near = near.map(|n| format!("nearest snapshot at frame {n}")).unwrap_or_else(|| "no snapshot stored".into());
-        println!("  {} {}  frame {}  ({near}){note}", &h.id[..8.min(h.id.len())], col.replays[&h.id].title(), h.frame);
-    }
-    Ok(())
-}
 
 fn snapshot_cmd(dir: &Path, segment: &str, frame: u64, out: &Path, local: &Local) -> Result<()> {
     let col = Collection::open(dir)?;

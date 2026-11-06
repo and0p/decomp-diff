@@ -59,6 +59,7 @@ Details, and starting your own project, are in [install.md](docs/install.md).
 | [cli.md](docs/cli.md) | Every `dj` command |
 | [gui.md](docs/gui.md) | A tour of `dj-gui` |
 | [connectors.md](docs/connectors.md) | The coverage API, and adding a core |
+| [mcp.md](docs/mcp.md) | `dj mcp`: queries, traces, sessions, drafts and search jobs for AI agents |
 
 **Format version 1** is defined by [segments.md](docs/segments.md),
 [playback.md](docs/playback.md), the tree edits in [editing.md](docs/editing.md#tree-edits)

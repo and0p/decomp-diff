@@ -225,6 +225,9 @@ pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>, set
         }
     }
     for (id, depth) in col.tree_order() {
+        if col.is_draft(id) {
+            continue;
+        }
         let mine = per_replay.get(id).unwrap_or(&empty);
         let mut anc = vec![false; units.len()];
         for a in col.chain(id)?.iter().rev().skip(1) {

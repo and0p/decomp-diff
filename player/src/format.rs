@@ -241,6 +241,16 @@ impl Replay {
         self.header.push(HeaderLine::Field(key.to_string(), value.to_string()));
     }
 
+    pub fn header_keys(&self) -> Vec<String> {
+        self.header
+            .iter()
+            .filter_map(|h| match h {
+                HeaderLine::Field(k, _) => Some(k.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn remove_all(&mut self, key: &str) {
         self.header.retain(|h| !matches!(h, HeaderLine::Field(k, _) if k == key));
     }
@@ -524,6 +534,80 @@ impl Replay {
         up.reparse()?;
         down.reparse()?;
         Ok((up, down))
+    }
+
+    /// Cuts the replay back to its first `frame` frames: later lines and checkpoints go,
+    /// and so does the end hash.
+    pub fn truncate_at(&mut self, frame: u64) -> Result<()> {
+        let frames = self.frames()?;
+        if frame >= frames {
+            return Ok(());
+        }
+        let mut body = vec![];
+        for b in &self.body_text {
+            let t = b.trim();
+            if t.is_empty() || t.starts_with('#') || parse_body_line(t)?.0 < frame {
+                body.push(b.clone());
+            }
+        }
+        let cps = self.checkpoints()?;
+        self.body_text = body;
+        self.set("frames", &frame.to_string());
+        self.remove_all("end-hash");
+        self.remove_all("checkpoint");
+        for (f, h) in cps.iter().filter(|(f, _)| *f < frame) {
+            self.add("checkpoint", &format!("{f} {h}"));
+        }
+        self.reparse()
+    }
+
+    /// Adds `frames` frames at the end, with body lines whose frame numbers count from the
+    /// start of the chunk. Errors name the chunk's own line numbers.
+    pub fn append_chunk(&mut self, text: &str, frames: u64) -> Result<()> {
+        let start = self.frames()?;
+        let mut added = vec![];
+        for (n, raw) in text.lines().enumerate() {
+            let t = raw.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t.starts_with('#') {
+                added.push(t.to_string());
+                continue;
+            }
+            let (f, _) = parse_body_line(t).with_context(|| format!("line {}: `{t}`", n + 1))?;
+            if f >= frames {
+                bail!("line {}: frame {f} is past the end of the chunk ({frames} frames)", n + 1);
+            }
+            let rest = t.split_once(char::is_whitespace).map(|(_, r)| r.trim()).unwrap_or("");
+            added.push(format!("{} {rest}", start + f));
+        }
+        let old = self.clone();
+        self.body_text.extend(added);
+        self.set("frames", &(start + frames).to_string());
+        self.remove_all("end-hash");
+        if let Err(e) = self.reparse() {
+            *self = old;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Sets the frame count without touching the lines (which must all be before it).
+    pub fn set_frames(&mut self, frames: u64) -> Result<()> {
+        if let Some(l) = self.lines.last() {
+            if l.frame >= frames {
+                bail!("a line at frame {} is past {frames} frames", l.frame);
+            }
+        }
+        self.set("frames", &frames.to_string());
+        self.remove_all("end-hash");
+        Ok(())
+    }
+
+    /// The body text (everything after `---`).
+    pub fn body(&self) -> String {
+        self.body_text.join("\n")
     }
 
     #[allow(dead_code)]
@@ -842,6 +926,24 @@ fn parse_input(rest: &str) -> Result<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunks_append_and_truncate() {
+        let mut r = Replay::new("d", Some("p"), "t", 0);
+        r.append_chunk("0 P1 JOYPAD A 1\n# comment\n10 P1 JOYPAD A 0", 20).unwrap();
+        r.append_chunk("5 P1 JOYPAD RIGHT 1", 10).unwrap();
+        assert_eq!(r.frames().unwrap(), 30);
+        let frames: Vec<u64> = r.lines.iter().map(|l| l.frame).collect();
+        assert_eq!(frames, vec![0, 10, 25]);
+        let e = r.append_chunk("3 P1 JOYPAD B 1\n12 P1 JOYPAD B 0", 10).unwrap_err();
+        assert!(format!("{e:#}").contains("line 2"), "{e:#}");
+        assert_eq!(r.frames().unwrap(), 30, "a failed chunk changes nothing");
+        r.truncate_at(12).unwrap();
+        assert_eq!(r.frames().unwrap(), 12);
+        assert_eq!(r.lines.len(), 2);
+        r.truncate_at(40).unwrap();
+        assert_eq!(r.frames().unwrap(), 12);
+    }
 
     const SAMPLE: &str = "dj-replay 1
 id: 3b8f0f2c-1d44-4c1e-9e55-0d7a3c1b2e90

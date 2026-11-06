@@ -167,6 +167,11 @@ diff_every = 300
 | `database` | `true` | `false` plays without the local database, like `--no-db` on every command. The GUI's Emulation > Use the local database writes it. |
 | `max_memory_mb` | `512` | How much memory the GUI's in-memory snapshots for the current segment may use (Emulation > Snapshot memory). |
 | `[cache]` | none | Any key from `config.toml`'s `[cache]`, overriding it on this machine only. |
+| `[mcp] allow` | `"draft"` | What `dj mcp` lets an agent do: `"query"`, `"draft"` or `"save"` ([mcp.md](mcp.md#what-an-agent-may-do)). `--allow` overrides it. |
+
+Next to it in `.local/`, the tools keep `cache.db` (the [local database](database.md)), and
+`dj mcp` keeps `drafts/` (agent [drafts](mcp.md#drafts)), `traces/`, `snapshots/` and
+`mcp/` (running sessions and the view shared from the GUI).
 
 ## Other project files
 

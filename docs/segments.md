@@ -19,6 +19,9 @@ my-project/
   .local/                local only, never committed
     local.toml           local settings
     cache.db             the local DB
+    drafts/              segments written by agents, not yet saved (see mcp.md)
+    traces/ snapshots/   trace files and core states written for agents
+    mcp/                 running agent sessions and the GUI's shared view
 ```
 
 Segments are stored **flat**, named by id. The tree lives in each file's

@@ -27,6 +27,10 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 zstd = "0.13"
 object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
+base64 = "0.22"
 
 [profile.release]
 debug = 1
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"

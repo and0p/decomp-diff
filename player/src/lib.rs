@@ -9,3 +9,6 @@ pub mod format;
 pub mod hydrate;
 pub mod libretro;
 pub mod player;
+pub mod query;
+pub mod condition;
+pub mod trace;

@@ -16,7 +16,7 @@ lines. An edit gives a segment a new key, so it invalidates only that segment's 
 
 - **Snapshots** of the core state at frame 0, every `diff_every` frames, at markers, and at the end of segments with children. Each is split into pages that are stored once by hash and compressed with zstd.
 - **Previews** (PNG) at the start of each segment and at markers.
-- **Coverage** flags for each segment, and the frame at which each ROM byte first ran in it, which `dj where` reads ([coverage.md](coverage.md)).
+- **Coverage** flags for each segment, and the frame at which each ROM byte first ran in it, which `dj xref` reads ([coverage.md](coverage.md)).
 
 How many snapshots and previews it keeps is set by the `[cache]` table and its presets,
 in `config.toml` or per machine in `.local/local.toml` ([config.md](config.md#cache-optional)).

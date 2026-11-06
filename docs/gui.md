@@ -29,6 +29,11 @@ Edited segments are yellow italics until saved. A blue **db** after a segment's 
 means its current content is in the local database, and "+N" is how many instructions
 only that segment runs.
 
+Drafts written by an AI agent ([mcp.md](mcp.md#drafts)) appear in teal italics, marked
+`draft` and the session that has them open. They aren't counted in coverage, and the header
+counts them apart ("N agent drafts"). Right-click one to follow its session, save it as a
+segment or discard it.
+
 - Click a segment to go to it; double-click to play it. Right-click for the [Segment menu](editing.md#segment-menu) and hydration.
 - The filter box at the top matches titles, id prefixes and tags, and shows each match with the path down to it (the path is dimmed).
 - Indentation only steps in where a segment has more than one child. An only child stays in its parent's column, joined to it by a short line, so a long chain stays one column however deep it goes. The third icon (a stepped tree) switches to indenting every level, which reads better for small trees. The two icons before it collapse or expand every segment; Collapse all keeps the focused segment open.
@@ -60,6 +65,7 @@ Below the picture, left to right:
 | --- | --- |
 | File | Open project…, Save (Ctrl/Cmd+S), Reload from disk (discards unsaved edits), Quit |
 | Edit | Undo, Redo, Cut, Copy, Paste at play cursor ([editing.md](editing.md#undo-cut-copy-and-paste)) |
+| Agent | Show agent drafts, follow an agent session, Stop following, Share my view with agents ([mcp.md](mcp.md#the-gui)) |
 | Emulation | Play/pause, step, go to start or end, Accept end hash, hydration, Use the local database, Snapshot memory, Set ROM…, Set core… ([database.md](database.md#in-the-gui)) |
 | Segment | Tree edits and Add event at playhead (E) ([editing.md](editing.md#segment-menu)) |
 | Input | Keyboard mapping (coming later) |

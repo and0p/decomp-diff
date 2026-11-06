@@ -5,7 +5,7 @@
 //! one `Core` may exist per process. The callbacks reach the frontend's state
 //! through a thread-local.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -393,6 +393,41 @@ pub struct Connector {
     clear: unsafe extern "C" fn(),
     set_tick_exec: unsafe extern "C" fn(i32, i64),
     get_tick_count: unsafe extern "C" fn() -> u64,
+    /// The optional trace part of the API (dj_trace_*).
+    trace: Option<TraceFns>,
+}
+
+struct TraceFns {
+    start: unsafe extern "C" fn(usize),
+    stop: unsafe extern "C" fn(),
+    read: unsafe extern "C" fn(*mut *const TraceEvent, *mut u64) -> usize,
+}
+
+pub const TRACE_EXEC: u8 = 1;
+pub const TRACE_READ: u8 = 2;
+pub const TRACE_WRITE: u8 = 3;
+
+/// One traced instruction or memory access (`struct dj_trace_event`, docs/connectors.md).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TraceEvent {
+    pub cycle: u64,
+    /// Offset into `region`, or -1.
+    pub offset: i64,
+    /// CPU address.
+    pub addr: u16,
+    pub kind: u8,
+    /// Region index as in the coverage regions, or -1.
+    pub region: i8,
+    pub value: u8,
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
+    pub sp: u8,
+    pub p: u8,
+    pub operand_count: u8,
+    pub operands: [u8; 3],
+    pub reserved: [u8; 4],
 }
 
 pub struct CoverageRegion {
@@ -504,6 +539,13 @@ impl Core {
                     clear: std::mem::transmute(get("dj_clear")?),
                     set_tick_exec: std::mem::transmute(get("dj_set_tick_exec")?),
                     get_tick_count: std::mem::transmute(get("dj_get_tick_count")?),
+                    trace: (|| {
+                        Some(TraceFns {
+                            start: std::mem::transmute(get("dj_trace_start")?),
+                            stop: std::mem::transmute(get("dj_trace_stop")?),
+                            read: std::mem::transmute(get("dj_trace_read")?),
+                        })
+                    })(),
                 })
             });
 
@@ -691,6 +733,50 @@ impl Core {
     pub fn set_tick_exec(&mut self, region: Option<usize>, offset: u64) {
         if let Some(c) = &self.connector {
             unsafe { (c.set_tick_exec)(region.map(|r| r as i32).unwrap_or(-1), offset as i64) }
+        }
+    }
+
+    pub fn can_trace(&self) -> bool {
+        self.connector.as_ref().is_some_and(|c| c.trace.is_some())
+    }
+
+    /// Starts recording a trace of up to `capacity` events (instructions and data accesses).
+    pub fn trace_start(&mut self, capacity: usize) -> Result<()> {
+        let t = self.connector.as_ref().and_then(|c| c.trace.as_ref()).ok_or_else(|| anyhow!("this core's connector has no trace hook (dj_trace_start)"))?;
+        unsafe { (t.start)(capacity) };
+        Ok(())
+    }
+
+    /// Events recorded so far.
+    pub fn trace_len(&mut self) -> usize {
+        let Some(t) = self.connector.as_ref().and_then(|c| c.trace.as_ref()) else { return 0 };
+        unsafe { (t.read)(std::ptr::null_mut(), std::ptr::null_mut()) }
+    }
+
+    /// Stops recording and returns the events, and how many were dropped past the capacity.
+    pub fn trace_take(&mut self) -> (Vec<TraceEvent>, u64) {
+        let Some(t) = self.connector.as_ref().and_then(|c| c.trace.as_ref()) else { return (vec![], 0) };
+        unsafe {
+            (t.stop)();
+            let mut p: *const TraceEvent = std::ptr::null();
+            let mut dropped = 0u64;
+            let n = (t.read)(&mut p, &mut dropped);
+            let v = if p.is_null() { vec![] } else { std::slice::from_raw_parts(p, n).to_vec() };
+            (t.start)(0);
+            (v, dropped)
+        }
+    }
+
+    /// The connector's live flags for region `i`, writable: lets a caller clear a byte to see
+    /// whether it runs again.
+    pub fn coverage_slice_mut(&mut self, i: usize) -> Option<&mut [u8]> {
+        let c = self.connector.as_ref()?;
+        unsafe {
+            let mut r = DjRegionC { name: std::ptr::null(), flags: std::ptr::null_mut(), size: 0 };
+            if !(c.get_region)(i as _, &mut r) || r.flags.is_null() {
+                return None;
+            }
+            Some(std::slice::from_raw_parts_mut(r.flags, r.size))
         }
     }
 

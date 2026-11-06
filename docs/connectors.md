@@ -36,6 +36,35 @@ The player calls `dj_clear` when a segment starts and reads the flags as it play
 each segment records only its own frames. The GUI also reads and clears them on every
 screen refresh for live coverage.
 
+## Traces
+
+A connector may also export a trace hook, which the [MCP server](mcp.md#traces) uses to
+record every instruction and memory access over a span of frames. The player looks these up
+too, and treats a core without them as unable to trace.
+
+```c
+bool   dj_trace_start(size_t capacity);   // start recording, keeping at most capacity events
+void   dj_trace_stop(void);
+size_t dj_trace_read(const struct dj_trace_event **events, uint64_t *dropped);
+                                          // events since the last read; clears them
+
+struct dj_trace_event {      // 40 bytes
+    uint64_t cycle;
+    int64_t  offset;         // offset in the region, -1 if none
+    uint16_t addr;           // CPU address
+    uint8_t  kind;           // 1 execute, 2 read, 3 write
+    int8_t   region;         // index as in dj_get_region, -1 if none
+    uint8_t  value;          // the byte read or written, or the opcode
+    uint8_t  a, x, y, sp, p; // registers before an executed instruction
+    uint8_t  operand_count;
+    uint8_t  operands[3];
+    uint8_t  reserved[4];
+};
+```
+
+Events past the capacity are counted in `dropped` rather than stored. Only the Mesen
+connector has the hook so far.
+
 ## Writing one for another core
 
 1. Find where the core fetches an instruction byte, and where it can turn a CPU address into a ROM offset (Mesen's mappers already do: `BaseMapper::GetAbsoluteAddressAndType`).

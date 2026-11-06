@@ -13,7 +13,12 @@ hashes, fills the local database and reports coverage. Building it is in
 | `dj run <dir> [--from-scratch] [--accept] [--screenshots]` | Plays everything, checks hashes, records coverage | [playback.md](playback.md#checking-hashes) |
 | `dj hydrate <dir> [SEGMENT [--children]] [--clean] [--force]` | Fills the local database | [database.md](database.md#from-the-command-line) |
 | `dj report <dir> [--json FILE] [--gaps FILE.csv]` | Coverage of the current, clean segments | [coverage.md](coverage.md#from-the-command-line) |
-| `dj where <dir> PRG:0x1234 \| 0x8123 \| SYMBOL` | Which segments first run that code, at which frame | [coverage.md](coverage.md#from-the-command-line) |
+| `dj xref <dir> ADDR` (alias `where`) | Which segments first run that code, at which frame, and the nearest snapshot | [coverage.md](coverage.md#from-the-command-line) |
+| `dj summary <dir>` | Instructions, blocks and functions covered, and the segments that add most | [coverage.md](coverage.md#from-the-command-line) |
+| `dj gaps <dir> [--sort size\|nearness] [--only all\|never\|partial]` | Functions with uncovered code, largest or nearest first | [coverage.md](coverage.md#from-the-command-line) |
+| `dj function <dir> ADDR` | One function's blocks (covered or not, first run, where they go), callers and the segments that enter it | [coverage.md](coverage.md#from-the-command-line) |
+| `dj frontier <dir> [ADDR]` | Covered branches and calls that lead into uncovered code, with the segments that reach them | [coverage.md](coverage.md#from-the-command-line) |
+| `dj mcp <dir> [--allow query\|draft\|save]` | Serves the project to an AI agent over MCP (stdio) | [mcp.md](mcp.md) |
 | `dj snapshot <dir> SEGMENT FRAME --out FILE` | Writes the core state at that frame, to start a trace from | [coverage.md](coverage.md#from-the-command-line) |
 | `dj sql <dir> "SELECT ..."` | Queries the local database | [database.md](database.md) |
 | `dj cache stats <dir>` / `dj cache gc <dir>` | Database size, or drop what no segment uses | [database.md](database.md#from-the-command-line) |
@@ -23,3 +28,4 @@ Common to every command:
 - Ids can be shortened to any unique prefix.
 - `--rom` and `--core` are remembered per project in `.local/local.toml`, so later commands don't need them.
 - Every command that plays takes `--no-db` to run without the local database.
+- The queries (`xref`, `summary`, `gaps`, `function`, `frontier`) take `--json` for scripts, `--limit` and `--cursor` for paging, and an address as `PRG:0x1F3A`, `0x1F3A` (a PRG offset), `$C123` (a CPU address) or a symbol, optionally `name+0x10`. They read the local database, so hydrate first.

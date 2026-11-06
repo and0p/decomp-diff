@@ -588,6 +588,58 @@ pub fn analyze_6502(funcs: &[Function], rom: &[u8]) -> Vec<AnalyzedFunction> {
     out
 }
 
+/// Where control can go after each block of `f`: (block index, successor offsets in the
+/// same region). Falling through and branch targets are included; a jump or branch target
+/// outside the function is left out. Used to find covered code that skips an uncovered block.
+pub fn block_successors_6502(f: &AnalyzedFunction, prg: &[u8]) -> Vec<Vec<u64>> {
+    let off_of_cpu = |cpu: u64| -> Option<u64> {
+        let base = f.func.cpu_addr?;
+        (cpu >= base && cpu < base + f.func.size).then(|| f.func.offset + (cpu - base))
+    };
+    let end = f.func.offset + f.func.size;
+    f.blocks
+        .iter()
+        .map(|b| {
+            let Some(&last) = b.instructions.last() else { return vec![] };
+            let Some(&op) = prg.get(last as usize) else { return vec![] };
+            let len = op_len_6502(op) as u64;
+            let bytes = &prg[last as usize..((last + len) as usize).min(prg.len())];
+            let cpu = f.func.cpu_addr.map(|c| c + (last - f.func.offset)).unwrap_or(0);
+            let next = last + len;
+            let mut out = vec![];
+            match flow_6502(op, bytes, cpu) {
+                Flow::Next => out.push(next),
+                Flow::Branch(t) => {
+                    out.push(next);
+                    if let Some(o) = off_of_cpu(t) {
+                        out.push(o);
+                    }
+                }
+                Flow::Jump(t) => {
+                    if op == 0x20 {
+                        out.push(next);
+                    } else if let Some(o) = t.and_then(off_of_cpu) {
+                        out.push(o);
+                    }
+                }
+                Flow::Stop => {}
+            }
+            out.retain(|o| *o < end && f.blocks.iter().any(|b| b.offset == *o));
+            out.dedup();
+            out
+        })
+        .collect()
+}
+
+/// The CPU address a `JSR abs` or `JMP abs` at the start of `bytes` targets.
+pub fn call_target_6502(bytes: &[u8]) -> Option<(u64, bool)> {
+    match bytes {
+        [0x20, lo, hi, ..] => Some((u16::from_le_bytes([*lo, *hi]) as u64, true)),
+        [0x4C, lo, hi, ..] => Some((u16::from_le_bytes([*lo, *hi]) as u64, false)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

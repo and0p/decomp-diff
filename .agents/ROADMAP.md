@@ -146,10 +146,12 @@ When one ships, its user-facing description moves into `docs/` and the entry her
 - **Macros and Lua scripts** for active RNG manipulation and pokes, instead of long
   runs of `[WRITE]` lines. They would be stored locally, and segments would refer to
   them by name, as `[RNG]` ([reserved commands](../docs/segments.md#reserved-commands)) already reserves.
-- **An MCP server** for agents doing decomp work. It would cover where a block first
-  runs, the nearest snapshot to trace from, coverage and parity per function, and
-  running a segment. The CLI gets the same abilities, including checking parity for
-  a single segment (`dj parity <segment> --against <comparison core>`).
+- **MCP follow-ups.** `dj mcp` is built ([mcp.md](../docs/mcp.md)). Left to do:
+  - The GUI attaching to an agent's session over a socket, so the two share one core instead of the GUI following through files a second behind.
+  - A Windows job object, so workers end if `dj mcp` is killed.
+  - Trace hooks for connectors other than Mesen, and disassembly for CPUs other than the 6502.
+  - Parity per function and per segment, once comparison cores exist (`dj parity <segment> --against <core>`, and an MCP tool).
+  - Stable SQL views (`v_first_hits`, `v_function_coverage`) so agents can query the database without knowing its tables.
 
 ## Comparison and parity
 

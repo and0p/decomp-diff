@@ -544,6 +544,9 @@ pub fn current_keys(conn: &Connection, col: &Collection, setup: &str) -> Result<
     let mut out = BTreeMap::new();
     let mut last = conn.prepare_cached("SELECT c.key, c.body FROM segment_runs s JOIN contents c ON c.key = s.content WHERE s.segment_id = ?1 AND c.setup = ?2")?;
     for (id, _) in col.tree_order() {
+        if col.is_draft(id) {
+            continue;
+        }
         let r = &col.replays[id];
         let devices = crate::player::devices_at_start(col, id)?;
         let body = body_hash(r, &devices)?;

@@ -13,11 +13,14 @@ use decomp_dj::player::{trunk_start_frame, Session};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
+mod agent;
 mod cov;
 mod roll;
 
 /// A save state is kept every this many frames, so seeking never replays more than this.
 const SNAP_EVERY: u64 = 10;
+/// Agent drafts in the tree.
+const DRAFT: Color32 = Color32::from_rgb(90, 200, 200);
 
 fn main() -> eframe::Result {
     let start = std::env::args().nth(1).map(PathBuf::from);
@@ -135,6 +138,17 @@ struct App {
     return_to_edit: bool,
     /// The earliest frame of the current segment edited since playback last ran.
     edit_from: Option<u64>,
+    /// Agent drafts from .local/drafts/ in the tree.
+    show_drafts: bool,
+    drafts_fp: u128,
+    /// When the drafts folder and agent sessions were last looked at (UI time).
+    agent_polled: f64,
+    agent_sessions: Vec<agent::AgentSession>,
+    /// An agent session the view follows: (pid, session).
+    follow: Option<(u64, String)>,
+    /// Write what is shown to .local/mcp/gui.json for agents.
+    share_view: bool,
+    shared: Option<(String, u64)>,
 }
 
 /// What playback does when it reaches the end of a segment.
@@ -274,6 +288,13 @@ impl Default for App {
             max_memory_mb: 512,
             return_to_edit: true,
             edit_from: None,
+            show_drafts: true,
+            drafts_fp: 0,
+            agent_polled: 0.0,
+            agent_sessions: vec![],
+            follow: None,
+            share_view: false,
+            shared: None,
         }
     }
 }
@@ -562,7 +583,12 @@ impl App {
 
     fn open_collection(&mut self, dir: &Path) {
         match Collection::open(dir) {
-            Ok(col) => {
+            Ok(mut col) => {
+                if self.show_drafts {
+                    let _ = col.load_drafts();
+                }
+                self.drafts_fp = agent::drafts_fingerprint(dir);
+                self.follow = None;
                 // Only one libretro core can be loaded per process, so drop the old one first.
                 self.session = None;
                 self.pb = None;
@@ -2076,6 +2102,7 @@ impl App {
                     self.delete_dialog = sel.clone();
                 }
             });
+            ui.menu_button("Agent", |ui| self.agent_menu(ui));
             ui.menu_button("Input", |ui| {
                 ui.add_enabled(false, egui::Button::new("Keyboard mapping…")).on_disabled_hover_text("Coming later: play the game from the keyboard and record into the roll");
             });
@@ -2114,7 +2141,7 @@ impl App {
         ui.add_space(4.0);
         ui.heading(&col.config.name);
         let (mut clean, mut dirty, mut unv) = (0, 0, 0);
-        for id in col.replays.keys() {
+        for id in col.replays.keys().filter(|id| !col.is_draft(id)) {
             match col.tree_status(id) {
                 Status::Clean => clean += 1,
                 Status::Dirty => dirty += 1,
@@ -2125,6 +2152,9 @@ impl App {
             for (n, s) in [(clean, Status::Clean), (dirty, Status::Dirty), (unv, Status::Unverified)] {
                 status_dot(ui, s);
                 ui.label(RichText::new(format!("{n} {}", s.label())).color(status_color(s)).small());
+            }
+            if !col.drafts.is_empty() {
+                ui.label(RichText::new(format!("{} agent drafts", col.drafts.len())).color(DRAFT).small());
             }
         });
         ui.add_space(2.0);
@@ -2325,6 +2355,10 @@ impl App {
                     if filtering && !matches.contains(id) {
                         title = title.weak();
                     }
+                    let is_draft = col.is_draft(id);
+                    if is_draft {
+                        title = title.italics().color(DRAFT);
+                    }
                     if self.edited.contains(id) {
                         title = title.italics().color(Color32::from_rgb(240, 210, 90));
                     }
@@ -2373,6 +2407,17 @@ impl App {
                     if r.is_poked() {
                         ui.label(RichText::new("poke").small().color(Color32::from_rgb(200, 120, 220))).on_hover_text("Has [WRITE] lines: memory is changed directly");
                     }
+                    if is_draft {
+                        let live = self.agent_sessions.iter().find(|s| s.draft == *id).map(|s| s.session.clone());
+                        let tag = match &live {
+                            Some(s) => format!("draft · {s}"),
+                            None => "draft".to_string(),
+                        };
+                        ui.label(RichText::new(tag).small().color(DRAFT)).on_hover_text(match &live {
+                            Some(s) => format!("An agent's draft, open in its session {s}: right-click to follow it, save it as a segment or discard it"),
+                            None => "An agent's draft in .local/drafts/: right-click to save it as a segment or discard it".into(),
+                        });
+                    }
                     let resp = resp.on_hover_ui(|ui| {
                         ui.label(RichText::new(r.title()).strong());
                         ui.label(format!("id {id}"));
@@ -2384,6 +2429,13 @@ impl App {
                         if self.edited.contains(id) {
                             ui.label("edited, not saved");
                         }
+                        if is_draft {
+                            for k in ["draft-note", "draft-condition"] {
+                                if let Some(v) = r.get(k) {
+                                    ui.label(format!("{}: {v}", k.trim_start_matches("draft-")));
+                                }
+                            }
+                        }
                     });
                     if resp.double_clicked() {
                         double = Some(id.to_string());
@@ -2391,6 +2443,20 @@ impl App {
                         clicked = Some(id.to_string());
                     }
                     resp.context_menu(|ui| {
+                        if is_draft {
+                            if let Some(s) = self.agent_sessions.iter().find(|s| s.draft == *id) {
+                                if ui.button(format!("Follow session {}", s.session)).on_hover_text("Show this draft at the agent's frame as it plays").clicked() {
+                                    context = Some((id.to_string(), "follow"));
+                                }
+                            }
+                            if ui.button("Save as segment").on_hover_text("Move it into segments/. Play it to the end and accept its end hash to make it clean.").clicked() {
+                                context = Some((id.to_string(), "draft_save"));
+                            }
+                            if ui.button("Discard draft").on_hover_text("Delete its file in .local/drafts/").clicked() {
+                                context = Some((id.to_string(), "draft_discard"));
+                            }
+                            ui.separator();
+                        }
                         if ui.button("Play to here").on_hover_text("Play through to the end of this segment").clicked() {
                             context = Some((id.to_string(), "playto"));
                         }
@@ -2487,9 +2553,223 @@ impl App {
             Some((id, "join")) => self.join_with_parent(&id),
             Some((id, "hydrate1")) => self.start_hydrate(Some((id, false)), false),
             Some((id, "hydrate")) => self.start_hydrate(Some((id, true)), false),
+            Some((id, "follow")) => {
+                if let Some(s) = self.agent_sessions.iter().find(|s| s.draft == id) {
+                    self.follow = Some((s.pid, s.session.clone()));
+                    self.follow_agent();
+                }
+            }
+            Some((id, "draft_save")) => self.draft_save(&id),
+            Some((id, "draft_discard")) => self.draft_discard(&id),
             Some((id, _)) => self.open_node_dialog(&id),
             None => {}
         }
+    }
+
+    // ---- agents ----
+
+    fn agent_menu(&mut self, ui: &mut egui::Ui) {
+        let has_col = self.col.is_some();
+        if ui.checkbox(&mut self.show_drafts, "Show agent drafts").on_hover_text("Drafts in .local/drafts/ appear in the tree in teal").changed() {
+            if let Some(col) = &mut self.col {
+                if self.show_drafts {
+                    let _ = col.load_drafts();
+                } else {
+                    let ids: Vec<String> = col.drafts.iter().cloned().collect();
+                    for id in ids {
+                        col.replays.remove(&id);
+                        col.paths.remove(&id);
+                        self.edited.remove(&id);
+                    }
+                    col.drafts.clear();
+                    if self.selected.as_ref().is_some_and(|s| !col.replays.contains_key(s)) {
+                        self.selected = None;
+                        self.pb = None;
+                    }
+                }
+            }
+        }
+        ui.separator();
+        ui.label(RichText::new("Follow an agent session").weak().small());
+        if self.agent_sessions.is_empty() {
+            ui.label(RichText::new("No agent sessions (dj mcp)").weak());
+        }
+        for s in self.agent_sessions.clone() {
+            let title = self.col.as_ref().and_then(|c| c.replays.get(&s.draft)).map(|r| r.title().to_string()).unwrap_or_default();
+            let on = self.follow.as_ref() == Some(&(s.pid, s.session.clone()));
+            if ui.selectable_label(on, format!("{} · {title} · frame {}", s.session, s.frame)).clicked() {
+                self.follow = if on { None } else { Some((s.pid, s.session.clone())) };
+                self.follow_agent();
+            }
+        }
+        if ui.add_enabled(self.follow.is_some(), egui::Button::new("Stop following")).clicked() {
+            self.follow = None;
+        }
+        ui.separator();
+        if ui
+            .add_enabled(has_col, egui::Checkbox::new(&mut self.share_view, "Share my view with agents"))
+            .on_hover_text("Agents can ask what you are looking at (the gui_view tool) and open a session there to take it from here")
+            .changed()
+        {
+            self.shared = None;
+            if !self.share_view {
+                if let Some(c) = &self.col {
+                    agent::share_view(&c.root, None);
+                }
+            }
+        }
+    }
+
+    /// Picks up drafts that changed on disk, agent sessions, and what to share.
+    fn poll_agents(&mut self) {
+        let Some(root) = self.col.as_ref().map(|c| c.root.clone()) else { return };
+        self.agent_sessions = agent::sessions(&root);
+        if self.show_drafts && self.hydrating.is_none() {
+            let fp = agent::drafts_fingerprint(&root);
+            if fp != self.drafts_fp {
+                self.drafts_fp = fp;
+                self.reload_drafts();
+            }
+        }
+        if self.follow.is_some() {
+            if !self.agent_sessions.iter().any(|s| Some(&(s.pid, s.session.clone())) == self.follow.as_ref()) {
+                self.follow = None;
+                self.info("The agent session you followed has closed.");
+            } else {
+                self.follow_agent();
+            }
+        }
+        if self.share_view {
+            let now = self.selected.clone().map(|id| (id, self.pb.as_ref().and_then(|p| p.shown()).unwrap_or(0)));
+            if now != self.shared {
+                if let (Some((id, f)), Some(col)) = (&now, &self.col) {
+                    let title = col.replays.get(id).map(|r| r.title().to_string()).unwrap_or_default();
+                    agent::share_view(&root, Some((id, *f, &title, col.is_draft(id))));
+                }
+                self.shared = now;
+            }
+        }
+    }
+
+    fn reload_drafts(&mut self) {
+        let Some(col) = &mut self.col else { return };
+        // Drafts edited here and not saved yet keep the edits.
+        let keep: Vec<(String, decomp_dj::format::Replay)> = self.edited.iter().filter(|id| col.is_draft(id)).filter_map(|id| col.replays.get(id).map(|r| (id.clone(), r.clone()))).collect();
+        let old: Option<decomp_dj::format::Replay> = self.selected.as_ref().and_then(|s| col.replays.get(s)).cloned();
+        let Ok(changed) = col.load_drafts() else { return };
+        for (id, r) in keep {
+            col.replays.insert(id.clone(), r);
+            col.drafts.insert(id);
+        }
+        let Some(sel) = self.selected.clone() else { return };
+        if !changed.contains(&sel) || self.edited.contains(&sel) {
+            return;
+        }
+        let Some(new) = col.replays.get(&sel).cloned() else {
+            // The selected draft was saved or discarded.
+            let next = old.as_ref().and_then(|o| o.parent()).map(String::from).filter(|p| col.replays.contains_key(p));
+            self.pb = None;
+            self.selected = None;
+            if let Some(p) = next {
+                self.select(&p);
+            }
+            return;
+        };
+        // Where the draft changed: the first frame whose lines differ, or the old end.
+        let from = match &old {
+            Some(o) => {
+                let a: Vec<String> = o.lines.iter().map(|l| format!("{} {:?}", l.frame, l.command)).collect();
+                let b: Vec<String> = new.lines.iter().map(|l| format!("{} {:?}", l.frame, l.command)).collect();
+                let first = a.iter().zip(&b).position(|(x, y)| x != y).map(|i| new.lines[i].frame.min(o.lines[i].frame));
+                let tail = if a.len() != b.len() { o.lines.get(b.len().min(a.len())).map(|l| l.frame).into_iter().chain(new.lines.get(a.len().min(b.len())).map(|l| l.frame)).min() } else { None };
+                let ends = o.frames().unwrap_or(0).min(new.frames().unwrap_or(0));
+                [first, tail, Some(ends)].into_iter().flatten().min().unwrap_or(0)
+            }
+            None => 0,
+        };
+        self.roll.invalidate();
+        let frames = new.frames().unwrap_or(0);
+        if let Some(pb) = &mut self.pb {
+            if pb.id == sel {
+                let shown = pb.shown();
+                pb.snapshots.retain(|k, _| *k <= from);
+                pb.frames = frames;
+                pb.end_hash = None;
+                pb.checkpoint_miss = None;
+                if self.follow.is_none() {
+                    if let Some(c) = shown.filter(|c| *c >= from) {
+                        self.seek(c.min(frames.saturating_sub(1)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shows the followed session's draft at the agent's frame.
+    fn follow_agent(&mut self) {
+        let Some(f) = self.follow.clone() else { return };
+        let Some(s) = self.agent_sessions.iter().find(|s| (s.pid, s.session.clone()) == f).cloned() else { return };
+        if self.hydrating.is_some() {
+            return;
+        }
+        let Some(col) = &mut self.col else { return };
+        if !col.replays.contains_key(&s.draft) {
+            let _ = col.load_drafts();
+            self.drafts_fp = 0;
+        }
+        if !self.col.as_ref().is_some_and(|c| c.replays.contains_key(&s.draft)) {
+            return;
+        }
+        if self.selected.as_deref() != Some(s.draft.as_str()) {
+            self.select(&s.draft);
+        }
+        // The agent's core is at the start of `frame`: the picture is the frame before.
+        let target = s.frame.saturating_sub(1);
+        let shown = self.pb.as_ref().and_then(|p| p.shown());
+        if shown != Some(target) && !self.playing && self.job.is_none() {
+            self.seek(target);
+            self.roll.follow_to(target);
+        }
+    }
+
+    fn draft_save(&mut self, id: &str) {
+        if self.edited.contains(id) {
+            self.save();
+        }
+        let Some(col) = &mut self.col else { return };
+        match col.draft_to_segment(id) {
+            Ok(()) => {
+                self.drafts_fp = agent::drafts_fingerprint(&col.root);
+                self.coverage_stale();
+                self.info("Saved the draft as a segment. Play it to the end and accept its end hash to make it clean.");
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
+    fn draft_discard(&mut self, id: &str) {
+        let Some(col) = &mut self.col else { return };
+        if col.replays.values().any(|r| r.parent() == Some(id)) {
+            self.error("Other segments or drafts start from this draft; discard those first.");
+            return;
+        }
+        if let Some(p) = col.paths.get(id) {
+            let _ = std::fs::remove_file(p);
+        }
+        let parent = col.replays.get(id).and_then(|r| r.parent()).map(String::from);
+        col.replays.remove(id);
+        col.paths.remove(id);
+        col.drafts.remove(id);
+        self.edited.remove(id);
+        self.drafts_fp = agent::drafts_fingerprint(&col.root);
+        if self.selected.as_deref() == Some(id) {
+            self.pb = None;
+            self.selected = None;
+            if let Some(p) = parent {
+                self.select(&p);
+            }
+        }
+        self.info("Discarded the draft.");
     }
 
     // ---- local database ----
@@ -3059,6 +3339,12 @@ impl eframe::App for App {
             ctx.copy_text(t);
         }
         let dt = ctx.input(|i| i.unstable_dt).min(0.1) as f64;
+        let now = ctx.input(|i| i.time);
+        if now - self.agent_polled > 0.5 {
+            self.agent_polled = now;
+            self.poll_agents();
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(600));
         self.work();
         self.coverage_update(ctx.input(|i| i.time));
         self.update_sticky_tip();

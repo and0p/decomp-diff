@@ -1,5 +1,5 @@
 diff --git a/Core/CPU.cpp b/Core/CPU.cpp
-index da52796..b484244 100644
+index da527968..ef16cfa4 100644
 --- a/Core/CPU.cpp
 +++ b/Core/CPU.cpp
 @@ -2,6 +2,9 @@
@@ -12,7 +12,19 @@ index da52796..b484244 100644
  #include "PPU.h"
  #include "APU.h"
  #include "DeltaModulationChannel.h"
-@@ -239,6 +242,11 @@ uint8_t CPU::MemoryRead(uint16_t addr, MemoryOperationType operationType) {
+@@ -219,6 +222,11 @@ void CPU::MemoryWrite(uint16_t addr, uint8_t value, MemoryOperationType operatio
+ #else
+ 	_cpuWrite = true;
+ 	StartCpuCycle(false);
++#ifdef DECOMP_DJ
++	if(DjCoverage::Tracing()) {
++		DjCoverage::OnTrace(_console->GetMapper(), (int)operationType, addr, value, _state.A, _state.X, _state.Y, _state.SP, _state.PS, _cycleCount);
++	}
++#endif
+ 	_memoryManager->Write(addr, value, operationType);
+ 	EndCpuCycle(false);
+ 	_cpuWrite = false;
+@@ -239,7 +247,17 @@ uint8_t CPU::MemoryRead(uint16_t addr, MemoryOperationType operationType) {
  	ProcessPendingDma(addr);
  
  	StartCpuCycle(true);
@@ -22,20 +34,27 @@ index da52796..b484244 100644
 +	}
 +#endif
  	uint8_t value = _memoryManager->Read(addr, operationType);
++#ifdef DECOMP_DJ
++	if(DjCoverage::Tracing()) {
++		DjCoverage::OnTrace(_console->GetMapper(), (int)operationType, addr, value, _state.A, _state.X, _state.Y, _state.SP, _state.PS, _cycleCount);
++	}
++#endif
  	EndCpuCycle(true);
  	return value;
+ #endif
 diff --git a/Core/DjCoverage.cpp b/Core/DjCoverage.cpp
 new file mode 100644
-index 0000000..6da552f
+index 00000000..22a2777a
 --- /dev/null
 +++ b/Core/DjCoverage.cpp
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,187 @@
 +#include "stdafx.h"
 +#include <cstring>
 +#include <vector>
 +#include "DjCoverage.h"
 +#include "BaseMapper.h"
 +#include "DebuggerTypes.h"
++#include "Types.h"
 +
 +namespace
 +{
@@ -44,6 +63,11 @@ index 0000000..6da552f
 +
 +	BaseMapper* _mapper = nullptr;
 +	std::vector<uint8_t> _flags[RegCount];
++
++	std::vector<dj_trace_event> _trace;
++	size_t _traceCap = 0;
++	uint64_t _traceDropped = 0;
++	int64_t _lastExec = -1;
 +
 +	int _tickRegion = -1;
 +	int64_t _tickOffset = -1;
@@ -68,6 +92,56 @@ index 0000000..6da552f
 +			default: return -1;
 +		}
 +	}
++}
++
++bool DjCoverage::TraceOn = false;
++
++void DjCoverage::OnTrace(BaseMapper* mapper, int operationType, uint16_t addr, uint8_t value, uint8_t a, uint8_t x, uint8_t y, uint8_t sp, uint8_t p, uint64_t cycle)
++{
++	uint8_t kind;
++	switch((MemoryOperationType)operationType) {
++		case MemoryOperationType::ExecOpCode: kind = DJ_TRACE_EXEC; break;
++		case MemoryOperationType::ExecOperand:
++			if(_lastExec >= 0 && (size_t)_lastExec < _trace.size()) {
++				dj_trace_event& e = _trace[_lastExec];
++				if(e.operand_count < 3) {
++					e.operands[e.operand_count++] = value;
++				}
++			}
++			return;
++		case MemoryOperationType::Read: kind = DJ_TRACE_READ; break;
++		case MemoryOperationType::Write: kind = DJ_TRACE_WRITE; break;
++		default: return;
++	}
++	if(_trace.size() >= _traceCap) {
++		_traceDropped++;
++		if(kind == DJ_TRACE_EXEC) {
++			_lastExec = -1;
++		}
++		return;
++	}
++	dj_trace_event e;
++	memset(&e, 0, sizeof(e));
++	e.cycle = cycle;
++	e.addr = addr;
++	e.kind = kind;
++	e.value = value;
++	e.a = a; e.x = x; e.y = y; e.sp = sp; e.p = p;
++	e.region = -1;
++	e.offset = -1;
++	if(mapper) {
++		AddressTypeInfo info;
++		mapper->GetAbsoluteAddressAndType(addr, &info);
++		int region = ToRegion(info.Type);
++		if(info.Address >= 0 && region >= 0) {
++			e.region = (int8_t)region;
++			e.offset = info.Address;
++		}
++	}
++	if(kind == DJ_TRACE_EXEC) {
++		_lastExec = (int64_t)_trace.size();
++	}
++	_trace.push_back(e);
 +}
 +
 +void DjCoverage::OnExec(BaseMapper* mapper, uint16_t addr, bool opcode)
@@ -122,6 +196,29 @@ index 0000000..6da552f
 +	}
 +
 +	static uint64_t dj_get_tick_count(void) { return _tickCount; }
++
++	// Starts tracing into a fresh buffer of `capacity` events (0 stops tracing). Events past
++	// the capacity are counted as dropped. The buffer is kept until the next call.
++	static void dj_trace_start(size_t capacity)
++	{
++		_trace.clear();
++		_trace.shrink_to_fit();
++		_trace.reserve(capacity);
++		_traceCap = capacity;
++		_traceDropped = 0;
++		_lastExec = -1;
++		DjCoverage::TraceOn = capacity > 0;
++	}
++
++	static void dj_trace_stop(void) { DjCoverage::TraceOn = false; }
++
++	// The events recorded since dj_trace_start; valid until the next dj_trace_start.
++	static size_t dj_trace_read(const struct dj_trace_event** events, uint64_t* dropped)
++	{
++		if(events) *events = _trace.empty() ? nullptr : _trace.data();
++		if(dropped) *dropped = _traceDropped;
++		return _trace.size();
++	}
 +}
 +
 +void* DjCoverage::GetProcAddress(const char* sym)
@@ -133,14 +230,17 @@ index 0000000..6da552f
 +	if(!strcmp(sym, "dj_clear")) return (void*)&dj_clear;
 +	if(!strcmp(sym, "dj_set_tick_exec")) return (void*)&dj_set_tick_exec;
 +	if(!strcmp(sym, "dj_get_tick_count")) return (void*)&dj_get_tick_count;
++	if(!strcmp(sym, "dj_trace_start")) return (void*)&dj_trace_start;
++	if(!strcmp(sym, "dj_trace_stop")) return (void*)&dj_trace_stop;
++	if(!strcmp(sym, "dj_trace_read")) return (void*)&dj_trace_read;
 +	return nullptr;
 +}
 diff --git a/Core/DjCoverage.h b/Core/DjCoverage.h
 new file mode 100644
-index 0000000..6271d67
+index 00000000..cd81da3a
 --- /dev/null
 +++ b/Core/DjCoverage.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,50 @@
 +// emu_coverage connector for Mesen (libretro core).
 +// Records which bytes of each code region the CPU executed, keyed by offset
 +// into the region (PRG ROM offset, not CPU address), and counts "logic ticks"
@@ -163,13 +263,36 @@ index 0000000..6271d67
 +	size_t size;
 +};
 +
++// Trace events (optional part of the API, dj_trace_*): one per executed instruction and
++// per data read or write while tracing is on.
++#define DJ_TRACE_EXEC  1
++#define DJ_TRACE_READ  2
++#define DJ_TRACE_WRITE 3
++
++struct dj_trace_event
++{
++	uint64_t cycle;        // CPU cycle count
++	int64_t offset;        // offset into `region`, or -1 when the address maps to no region
++	uint16_t addr;         // CPU address
++	uint8_t kind;          // DJ_TRACE_*
++	int8_t region;         // region index as in dj_get_region, or -1
++	uint8_t value;         // byte read or written; the opcode for DJ_TRACE_EXEC
++	uint8_t a, x, y, sp, p; // registers before the instruction (DJ_TRACE_EXEC), or at the access
++	uint8_t operand_count; // operand bytes in `operands` (DJ_TRACE_EXEC)
++	uint8_t operands[3];
++	uint8_t reserved[4];
++};
++
 +namespace DjCoverage
 +{
++	extern bool TraceOn;
++	inline bool Tracing() { return TraceOn; }
 +	void OnExec(BaseMapper* mapper, uint16_t addr, bool opcode);
++	void OnTrace(BaseMapper* mapper, int operationType, uint16_t addr, uint8_t value, uint8_t a, uint8_t x, uint8_t y, uint8_t sp, uint8_t p, uint64_t cycle);
 +	void* GetProcAddress(const char* sym);
 +}
 diff --git a/Libretro/Makefile b/Libretro/Makefile
-index 02db726..54fc77f 100644
+index 02db726e..fe5b8cda 100644
 --- a/Libretro/Makefile
 +++ b/Libretro/Makefile
 @@ -369,7 +369,7 @@ ifeq (,$(findstring windows_msvc2017,$(platform)))
@@ -182,7 +305,7 @@ index 02db726..54fc77f 100644
  
  all: $(TARGET)
 diff --git a/Libretro/Makefile.common b/Libretro/Makefile.common
-index a25e446..04ff8aa 100644
+index a25e4467..32aac144 100644
 --- a/Libretro/Makefile.common
 +++ b/Libretro/Makefile.common
 @@ -31,6 +31,7 @@ SOURCES_CXX := $(LIBRETRO_DIR)/libretro.cpp \
@@ -194,7 +317,7 @@ index a25e446..04ff8aa 100644
                 $(CORE_DIR)/DefaultVideoFilter.cpp \
                 $(CORE_DIR)/RawVideoFilter.cpp \
 diff --git a/Libretro/libretro.cpp b/Libretro/libretro.cpp
-index 48fa641..71b17ae 100644
+index 48fa6412..250301b0 100644
 --- a/Libretro/libretro.cpp
 +++ b/Libretro/libretro.cpp
 @@ -5,6 +5,9 @@

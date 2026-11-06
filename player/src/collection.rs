@@ -103,6 +103,9 @@ pub struct Collection {
     pub config: Config,
     pub replays: BTreeMap<String, Replay>,
     pub paths: HashMap<String, PathBuf>,
+    /// Segments loaded from .local/drafts/ (agent drafts, docs/mcp.md#drafts): shown and
+    /// playable, but left out of coverage, xref and hydrating everything.
+    pub drafts: std::collections::BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,7 +182,7 @@ impl Collection {
                 replays.insert(id, r);
             }
         }
-        let c = Collection { root: root.to_path_buf(), config, replays, paths };
+        let c = Collection { root: root.to_path_buf(), config, replays, paths, drafts: Default::default() };
         c.check_tree()?;
         c.upgrade_blob_names()?;
         Ok(c)
@@ -303,6 +306,73 @@ impl Collection {
             Some(p) if self.tree_status(p) == Status::Dirty => Status::Dirty,
             _ => s,
         }
+    }
+
+    pub fn drafts_dir(&self) -> PathBuf {
+        self.root.join(".local").join("drafts")
+    }
+
+    pub fn is_draft(&self, id: &str) -> bool {
+        self.drafts.contains(id)
+    }
+
+    /// Adds the drafts in .local/drafts/ (again: drafts loaded before are replaced, and
+    /// drafts whose file is gone are dropped). Returns the ids that are new or changed.
+    pub fn load_drafts(&mut self) -> Result<Vec<String>> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut changed = vec![];
+        if let Ok(rd) = std::fs::read_dir(self.drafts_dir()) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some(SEGMENT_EXT) {
+                    continue;
+                }
+                let Ok(r) = Replay::load(&p) else { continue };
+                let Ok(id) = r.id().map(String::from) else { continue };
+                if self.replays.contains_key(&id) && !self.drafts.contains(&id) {
+                    continue; // a segment with that id exists: the draft was saved already
+                }
+                if self.replays.get(&id).map(|o| o.to_text()) != Some(r.to_text()) {
+                    changed.push(id.clone());
+                }
+                self.replays.insert(id.clone(), r);
+                self.paths.insert(id.clone(), p);
+                seen.insert(id);
+            }
+        }
+        let gone: Vec<String> = self.drafts.difference(&seen).cloned().collect();
+        for id in gone {
+            self.replays.remove(&id);
+            self.paths.remove(&id);
+            changed.push(id);
+        }
+        self.drafts = seen;
+        Ok(changed)
+    }
+
+    /// Turns a draft into a segment: drops its `draft-*` fields and moves its file to
+    /// segments/. Its hashes are not recorded here (play it and accept them).
+    pub fn draft_to_segment(&mut self, id: &str) -> Result<()> {
+        if !self.drafts.contains(id) {
+            bail!("{id} is not a draft");
+        }
+        if let Some(p) = self.replays[id].parent() {
+            if self.drafts.contains(p) {
+                bail!("its parent is a draft too: save that one first");
+            }
+        }
+        let old = self.paths.remove(id);
+        let r = self.replays.get_mut(id).unwrap();
+        let keys: Vec<String> = r.header_keys().into_iter().filter(|k| k.starts_with("draft-")).collect();
+        for k in keys {
+            r.remove_all(&k);
+        }
+        self.drafts.remove(id);
+        self.save_replay(id)?;
+        if let Some(o) = old {
+            let _ = std::fs::remove_file(o);
+        }
+        Ok(())
     }
 
     pub fn save_replay(&mut self, id: &str) -> Result<()> {

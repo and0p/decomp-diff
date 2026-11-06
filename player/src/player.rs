@@ -399,7 +399,7 @@ impl Session {
         })
     }
 
-    fn write(&mut self, region: &str, address: u64, bytes: &[u8]) -> Result<()> {
+    pub fn write(&mut self, region: &str, address: u64, bytes: &[u8]) -> Result<()> {
         if region == "BUS" {
             for (i, b) in bytes.iter().enumerate() {
                 let p = self.core.bus_byte(address as usize + i).ok_or_else(|| anyhow!("BUS address {:#x} is not mapped", address as usize + i))?;

@@ -41,7 +41,7 @@ struct Current {
 impl Hydrator {
     /// `scope`: None for the whole tree, or a segment and whether to include its children.
     pub fn new(col: &Collection, scope: Option<(&str, bool)>, clean: bool, force: bool) -> Result<Hydrator> {
-        let order: Vec<String> = col.tree_order().into_iter().map(|(id, _)| id.to_string()).collect();
+        let order: Vec<String> = col.tree_order().into_iter().filter(|(id, _)| !col.is_draft(id) || scope.is_some_and(|(s, _)| s == *id)).map(|(id, _)| id.to_string()).collect();
         let targets = match scope {
             None => order,
             Some((root, children)) => order.into_iter().filter(|id| id == root || (children && col.chain(id).map(|c| c.contains(&root)).unwrap_or(false))).collect(),
