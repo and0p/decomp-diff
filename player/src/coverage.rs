@@ -1,4 +1,4 @@
-//! Local coverage database and reports (SPEC.md section 9).
+//! Local coverage database and reports (.agents/SPEC.md section 9).
 
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
@@ -69,6 +69,36 @@ pub struct Report {
     pub replays: Vec<ReplayRow>,
     pub smallest_set: Vec<String>,
     pub functions: Vec<FunctionRow>,
+    /// What the report was worked out from, for views that need more than the rows (the GUI).
+    #[serde(skip)]
+    pub detail: Detail,
+}
+
+/// The raw material behind a report: the analyzed functions (unreachable instructions
+/// removed, in the same order as `Report::functions`) and the union of the opcode flags
+/// of every segment that counts.
+#[derive(Default)]
+pub struct Detail {
+    pub analyzed: Vec<AnalyzedFunction>,
+    /// Instructions of each analyzed function that unreachable.txt removed.
+    pub unreachable_per_function: Vec<usize>,
+    /// PRG flags of every segment that counts, OR'd together.
+    pub prg: Vec<u8>,
+    /// Segments that count, with their PRG flags.
+    pub per_segment_prg: BTreeMap<String, Vec<u8>>,
+    /// PRG ranges from unreachable.txt (inclusive).
+    pub unreachable: Vec<(u64, u64)>,
+}
+
+impl Detail {
+    /// Whether PRG offset `off` ran as an opcode in any segment that counts.
+    pub fn hit(&self, off: u64) -> bool {
+        self.prg.get(off as usize).is_some_and(|b| b & FLAG_OPCODE != 0)
+    }
+
+    pub fn is_unreachable(&self, off: u64) -> bool {
+        self.unreachable.iter().any(|(a, b)| off >= *a && off <= *b)
+    }
 }
 
 fn union(a: &mut Vec<u8>, b: &[u8]) {
@@ -85,11 +115,15 @@ fn opcode_set(flags: &[u8]) -> Vec<bool> {
 }
 
 /// Coverage of the collection as it is now, from the local database: every segment that
-/// isn't dirty and has been played with its current content counts (SPEC.md, "Coverage").
-pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>) -> Result<Report> {
-    let setup: String = conn
-        .query_row("SELECT setup FROM contents ORDER BY played_at DESC LIMIT 1", [], |r| r.get(0))
-        .context("nothing has been played into the local database yet; run `dj hydrate` first")?;
+/// isn't dirty and has been played with its current content counts (.agents/SPEC.md, "Coverage").
+/// `setup` picks the setup (ROM, core and options) to report on; by default, the one played last.
+pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>, setup: Option<&str>) -> Result<Report> {
+    let setup: String = match setup {
+        Some(s) => s.to_string(),
+        None => conn
+            .query_row("SELECT setup FROM contents ORDER BY played_at DESC LIMIT 1", [], |r| r.get(0))
+            .context("nothing has been played into the local database yet; run `dj hydrate` first")?,
+    };
     let keys = cache::current_keys(conn, col, &setup)?;
     let mut cov: BTreeMap<String, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
     let mut ticks: HashMap<String, Option<i64>> = HashMap::new();
@@ -134,11 +168,13 @@ pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>) -> 
     }
     let symbols = !analyzed.is_empty();
     let mut unreachable_instructions = 0;
+    let mut unreachable_per_function = vec![];
     for f in &mut analyzed {
         let before = f.instructions.len();
         f.instructions.retain(|i| !is_unreachable(i.offset));
         f.blocks.retain(|b| !is_unreachable(b.offset));
         unreachable_instructions += before - f.instructions.len();
+        unreachable_per_function.push(before - f.instructions.len());
     }
 
     // Units of coverage: instruction offsets in PRG when we have symbols, else opcode bytes.
@@ -178,20 +214,19 @@ pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>) -> 
     let per_replay: HashMap<&str, Vec<bool>> = cov.iter().map(|(id, m)| (id.as_str(), unit_hits(m.get("PRG")))).collect();
     let mut replays = vec![];
     let empty = vec![false; units.len()];
+    // How many segments run each unit: a unit is unique to a segment when only it runs it.
+    let mut hit_count = vec![0u32; units.len()];
+    for v in per_replay.values() {
+        for (n, h) in hit_count.iter_mut().zip(v) {
+            *n += *h as u32;
+        }
+    }
     for (id, depth) in col.tree_order() {
         let mine = per_replay.get(id).unwrap_or(&empty);
         let mut anc = vec![false; units.len()];
         for a in col.chain(id)?.iter().rev().skip(1) {
             if let Some(v) = per_replay.get(a) {
                 for (x, y) in anc.iter_mut().zip(v) {
-                    *x |= *y;
-                }
-            }
-        }
-        let mut others = vec![false; units.len()];
-        for (oid, v) in &per_replay {
-            if *oid != id {
-                for (x, y) in others.iter_mut().zip(v) {
                     *x |= *y;
                 }
             }
@@ -205,7 +240,7 @@ pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>) -> 
             ticks: ticks.get(id).copied().flatten(),
             own: mine.iter().filter(|b| **b).count(),
             new_vs_ancestors: mine.iter().zip(&anc).filter(|(m, a)| **m && !**a).count(),
-            unique: mine.iter().zip(&others).filter(|(m, o)| **m && !**o).count(),
+            unique: mine.iter().zip(&hit_count).filter(|(m, n)| **m && **n == 1).count(),
         });
     }
 
@@ -307,7 +342,48 @@ pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>) -> 
         replays,
         smallest_set,
         functions,
+        detail: Detail {
+            analyzed,
+            unreachable_per_function,
+            per_segment_prg: cov.iter().filter_map(|(id, m)| m.get("PRG").map(|p| (id.clone(), p.clone()))).collect(),
+            prg: all_prg,
+            unreachable: unreachable.iter().filter(|u| u.region == "PRG").map(|u| (u.start, u.end)).collect(),
+        },
     })
+}
+
+/// Where code first runs: one row per current segment whose recorded play ran any ROM
+/// byte of `region` in `start..=end` as an opcode, with the first frame it did.
+pub struct FirstHit {
+    pub id: String,
+    pub frame: u64,
+    pub offset: u64,
+    pub status: Status,
+    /// Segments above it, so 0 for a root segment.
+    pub depth: usize,
+}
+
+/// First hits of `region` `start..=end` in the segments as they are now, for `setup`. Sorted so
+/// the most useful comes first: segments that count (not dirty) before dirty ones, then
+/// shallower segments, then earlier frames.
+pub fn first_hits_in(col: &Collection, conn: &Connection, setup: &str, region: &str, start: u64, end: u64) -> Result<Vec<FirstHit>> {
+    let keys = cache::current_keys(conn, col, setup)?;
+    let by_key: HashMap<&str, (&str, Status)> = keys.iter().filter_map(|(id, (k, st))| k.as_deref().map(|k| (k, (id.as_str(), *st)))).collect();
+    let mut st = conn.prepare_cached("SELECT content, rom_offset, frame FROM first_hits WHERE region = ?1 AND rom_offset BETWEEN ?2 AND ?3")?;
+    let rows = st.query_map(rusqlite::params![region, start as i64, end as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64)))?;
+    let mut best: HashMap<&str, FirstHit> = HashMap::new();
+    for row in rows {
+        let (content, offset, frame) = row?;
+        let Some((id, status)) = by_key.get(content.as_str()) else { continue };
+        let e = best.entry(id).or_insert(FirstHit { id: id.to_string(), frame, offset, status: *status, depth: col.chain(id).map(|c| c.len() - 1).unwrap_or(0) });
+        if frame < e.frame {
+            e.frame = frame;
+            e.offset = offset;
+        }
+    }
+    let mut out: Vec<FirstHit> = best.into_values().collect();
+    out.sort_by_key(|h| (h.status == Status::Dirty, h.depth, h.frame, h.id.clone()));
+    Ok(out)
 }
 
 fn pct(a: usize, b: usize) -> String {

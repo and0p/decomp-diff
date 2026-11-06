@@ -23,7 +23,7 @@ uint64_t dj_get_tick_count(void);
   addresses, so bank-switched code is counted correctly.
 - A core whose recompiler only sees whole blocks may set `0x01` on each block's
   first byte and leave the rest to the player's disassembly. Its README must say so.
-- The player works without a connector. It still plays replays and checks hashes,
+- The player works without a connector. It still plays segments and checks hashes,
   but records no coverage.
 
 | Connector | System | Upstream | Status |

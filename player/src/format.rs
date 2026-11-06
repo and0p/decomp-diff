@@ -1,4 +1,4 @@
-//! Parser and writer for `.segment` files (SPEC.md section 3).
+//! Parser and writer for `.segment` files (.agents/SPEC.md section 3).
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
@@ -9,7 +9,7 @@ pub const MAGIC: &str = "dj-replay 1";
 /// The first line before the rename to decomp-dj. Still read; files are written with MAGIC.
 const OLD_MAGIC: &str = "emucov-replay 1";
 
-/// Hashes are the first 32 hex digits of a BLAKE3 digest (SPEC.md section 6).
+/// Hashes are the first 32 hex digits of a BLAKE3 digest (.agents/SPEC.md section 6).
 pub const HASH_HEX: usize = 32;
 
 /// A BLAKE3 digest as the format writes it.
@@ -29,7 +29,15 @@ pub fn normalize_hash(v: &str) -> String {
 }
 
 /// Header fields whose values are hashes (`checkpoint` holds `<frame> <hash>`).
-const HASH_FIELDS: [&str; 4] = ["start-hash", "end-hash", "save", "sram"];
+const HASH_FIELDS: [&str; 4] = ["start-hash", "end-hash", "snapshot", "sram"];
+
+/// Header field names from before a rename, and what they are called now.
+fn current_key(k: &str) -> &str {
+    match k {
+        "save" => "snapshot",
+        _ => k,
+    }
+}
 
 fn normalize_field(k: &str, v: &str) -> String {
     if HASH_FIELDS.contains(&k) {
@@ -65,8 +73,9 @@ pub fn upgrade_text(text: &str) -> String {
         } else if in_header && i > 0 {
             match body.split_once(':') {
                 Some((k, v)) if !body.trim_start().starts_with('#') => {
-                    let nv = normalize_field(k.trim(), v.trim());
-                    if nv == v.trim() { body.to_string() } else { format!("{}: {nv}", k.trim()) }
+                    let key = current_key(k.trim());
+                    let nv = normalize_field(key, v.trim());
+                    if nv == v.trim() && key == k.trim() { body.to_string() } else { format!("{key}: {nv}") }
                 }
                 _ => body.to_string(),
             }
@@ -172,7 +181,8 @@ impl Replay {
                     continue;
                 }
                 let (k, v) = t.split_once(':').ok_or_else(|| anyhow!("line {line_no}: expected `key: value`"))?;
-                header.push(HeaderLine::Field(k.trim().to_string(), normalize_field(k.trim(), v.trim())));
+                let key = current_key(k.trim());
+                header.push(HeaderLine::Field(key.to_string(), normalize_field(key, v.trim())));
             } else {
                 body_text.push(l.to_string());
                 let t = l.trim();
@@ -499,8 +509,8 @@ impl Replay {
         down.body_text = down_body;
         down.set("parent", upstream_id);
         down.set("frames", &(frames - frame).to_string());
-        // Only a trunk starts from blobs; those stay with the upstream part.
-        down.remove_all("save");
+        // Only a root segment starts from blobs; those stay with the upstream part.
+        down.remove_all("snapshot");
         down.remove_all("sram");
         down.remove_all("start-hash");
         match self.get("start-frame").and_then(|s| s.parse::<u64>().ok()) {
@@ -942,5 +952,15 @@ frames: 100
         let r = Replay::parse(&old).unwrap();
         assert_eq!(r.get("end-hash"), Some(h32));
         assert_eq!(r.checkpoints().unwrap(), vec![(5, h32.to_string())]);
+    }
+
+    #[test]
+    fn renames_save_to_snapshot() {
+        let h = "ab".repeat(16);
+        let old = format!("dj-replay 1\nid: a\nparent: none\nframes: 10\nsave: blake3-{h}{h}\n---\n");
+        assert_eq!(upgrade_text(&old), format!("dj-replay 1\nid: a\nparent: none\nframes: 10\nsnapshot: {h}\n---\n"));
+        let r = Replay::parse(&old).unwrap();
+        assert_eq!(r.get("snapshot"), Some(h.as_str()));
+        assert!(r.to_text().contains(&format!("snapshot: {h}\n")));
     }
 }

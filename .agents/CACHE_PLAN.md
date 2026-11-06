@@ -1,7 +1,6 @@
 # Plan: the local database
 
-Status: mostly implemented (see "What's built" at the end). This file covers the first item under "Future directions" in
-SPEC.md (section 11): a local store for everything derived from playing a
+Status: mostly implemented (see "What's built" at the end). This file covers the local database: a local store for everything derived from playing a
 project. It uses the words defined in SPEC.md's "Terminology" section:
 segment, snapshot, diff, child segment, save and macro.
 
@@ -31,15 +30,15 @@ things up, and nothing depends on it.
 
 ## Storage: SQLite (decided)
 
-There is no server. Everything lives in one `.local/cache.db` per project,
-replacing today's `.local/coverage.sqlite` and `.local/states/` folder.
+There is no server. Everything lives in one `.local/cache.db` per project.
+It replaced the earlier `.local/coverage.sqlite` and `.local/states/` folder.
 
 - **No setup for collaborators.** It's a file inside the project's `.local/`
   folder, so it can't point at the wrong project, and deleting the folder resets
   it.
 - **Agents can read it directly.** Python's standard library, the `sqlite3` command
-  line tool, and every language's drivers can open it. A `dj sql "<query>"`
-  command and an MCP tool can come later. In WAL mode, the GUI, a hydrate run and an
+  line tool, and every language's drivers can open it. `dj sql "<query>"`
+  runs a query, and an MCP tool can come later. In WAL mode, the GUI, a hydrate run and an
   agent can all read while one of them writes.
 - **No pile of small files.** Pages, previews and diffs are rows. SQLite reads and
   writes blobs under about 100 KB faster than separate files do. Pages are small (64 KB at most), so
@@ -150,7 +149,7 @@ WHERE h.rom_offset = 0x1C3A0
 ORDER BY h.frame LIMIT 5;
 ```
 
-A `from_frame` of NULL means the segment's start snapshot. CLI wrappers will cover
+A `from_frame` of NULL means the segment's start snapshot. CLI wrappers cover
 the common questions:
 
 - `dj where <symbol|offset>` lists the segments and frames that first run it.
@@ -172,7 +171,7 @@ diff_every = 18000             # frames between diffs inside a segment; 0 = none
 diff_at_markers = true
 exclude = ["RDRAM:0x00300000-0x003FFFFF"]   # e.g. framebuffers
 page_kb = 64                   # missing, or >= snapshot size = 1:1 (one page per snapshot)
-previews = "thumb"             # thumb (1/4 size) | full | off
+previews = "thumb"             # thumb (half width and height) | full | off
 preview_at = ["start", "marker"]
 budget_gb = 20                 # cache gc trims unused content past this
 ```
@@ -231,15 +230,12 @@ address). That's a design item for the N64 connector.
 
 ## The GUI: memory first, then the database
 
-The GUI already keeps snapshots in memory: one every 10 frames for the current
-segment, with no eviction (gui/README, "How seeking works now"). It also already
-starts a segment from its parent's stored end state when that parent is clean. With
-the database, these become three levels, checked in order:
+The GUI keeps snapshots in memory, one every 10 frames for the current segment
+(gui/README, "How seeking works now"), and starts a segment from its parent's stored
+end state when that parent is clean. These are three levels, checked in order:
 
-1. **An in-memory LRU of decoded snapshots**, capped by a `max_memory` setting (for
-   example 512 MB, in local settings). This holds the dense every-10-frames
-   snapshots near the playhead, plus recently used starts. The plan in gui/README
-   ("a configurable save-state cache") becomes this cache.
+1. **Snapshots in memory**, capped by `max_memory_mb` in `.local/local.toml` (512 MB
+   by default). Past the cap, the snapshots farthest from the playhead go first.
 2. **The database.** On a memory miss, the GUI rebuilds the nearest stored frame
    from pages and diffs, and keeps the decoded result in memory.
 3. **Playing.** The GUI plays forward from whichever of the two is nearest, and
@@ -381,6 +377,7 @@ and the GUI:
   `unreachable.txt`, and `dj where`, `snapshot`, `sql`, `cache stats` and
   `cache gc`. `--no-db` and `database = false`.
 - The GUI's memory limit (`max_memory_mb`) and seeking from stored snapshots.
+- The GUI's Coverage tab, built on the same report as `dj report` and on `first_hits`.
 
 Not built yet:
 

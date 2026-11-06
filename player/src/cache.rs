@@ -1,4 +1,4 @@
-//! The local database (CACHE_PLAN.md): snapshots stored as deduplicated pages, stored
+//! The local database (.agents/CACHE_PLAN.md): snapshots stored as deduplicated pages, stored
 //! frames inside segments, previews, coverage and first hits, all keyed by content key.
 //! Everything here is derived by playing the collection and can be deleted at any time.
 
@@ -160,7 +160,7 @@ pub fn body_hash(r: &Replay, devices: &BTreeMap<u32, u32>) -> Result<String> {
     Ok(h.finalize().to_hex().to_string())
 }
 
-/// The content key (CACHE_PLAN.md): setup, start state and body. Derived rows are filed
+/// The content key (.agents/CACHE_PLAN.md): setup, start state and body. Derived rows are filed
 /// under it, so renaming or moving a segment invalidates nothing.
 pub fn content_key(setup: &str, start_hash: &str, body: &str) -> String {
     let mut h = blake3::Hasher::new();
@@ -276,7 +276,7 @@ impl Cache {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         let info_map: BTreeMap<String, String> = setup_info.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
-        // A different version of the same core is only a warning (CACHE_PLAN.md, "Decided").
+        // A different version of the same core is only a warning (.agents/CACHE_PLAN.md, "Decided").
         {
             let mut st = conn.prepare("SELECT info FROM setups WHERE id != ?1")?;
             let others: Vec<String> = st.query_map([setup], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;

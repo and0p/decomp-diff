@@ -1,4 +1,4 @@
-//! Plays replays on a loaded core (SPEC.md sections 5 and 6).
+//! Plays replays on a loaded core (.agents/SPEC.md sections 5 and 6).
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -212,9 +212,9 @@ impl Session {
     pub fn start_trunk(&mut self, col: &Collection, r: &Replay) -> Result<()> {
         let boot = self.boot_state.clone();
         self.core.unserialize(&boot)?;
-        if let Some(save) = r.get("save") {
-            let data = col.read_blob(save, "save")?;
-            self.core.unserialize(&data).with_context(|| format!("loading save blob {save}"))?;
+        if let Some(snap) = r.get("snapshot") {
+            let data = col.read_blob(snap, "snapshot")?;
+            self.core.unserialize(&data).with_context(|| format!("loading snapshot blob {snap}"))?;
         }
         if let Some(sram) = r.get("sram") {
             let data = col.read_blob(sram, "sram")?;
@@ -580,7 +580,7 @@ impl Session {
 }
 
 pub fn trunk_start_frame(r: &Replay) -> u64 {
-    if r.get("save").is_some() {
+    if r.get("snapshot").is_some() {
         r.get("start-frame").and_then(|s| s.parse().ok()).unwrap_or(0)
     } else {
         0

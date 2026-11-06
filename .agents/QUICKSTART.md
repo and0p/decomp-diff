@@ -4,11 +4,11 @@ What is here so far (first plan, steps 1 to 4, plus a GUI prototype):
 
 | Path | What it is |
 | --- | --- |
-| [SPEC.md](SPEC.md) | The replay project format, v1 draft |
-| [player/](player/) | `dj`, the headless player (Rust): plays replay trees on any libretro core, checks state hashes, records and reports coverage |
-| [gui/](gui/) | `dj-gui`, a desktop viewer and editor (Rust, egui): replay tree, live preview, piano roll |
-| [connectors/](connectors/) | Per-core coverage patches. [mesen](connectors/mesen/) (NES) is the first |
-| [examples/thwaite/](examples/thwaite/) | A 12-replay project for a free NES game, used as the end-to-end test |
+| [SPEC.md](SPEC.md) | The project format, v1 draft |
+| [player/](../player/) | `dj`, the headless player (Rust): plays segment trees on any libretro core, checks state hashes, records and reports coverage |
+| [gui/](../gui/) | `dj-gui`, a desktop viewer and editor (Rust, egui): segment tree, live preview, piano roll |
+| [connectors/](../connectors/) | Per-core coverage patches. [mesen](../connectors/mesen/) (NES) is the first |
+| [examples/thwaite/](../examples/thwaite/) | A 12-segment project for a free NES game, used as the end-to-end test |
 
 ## Build
 
@@ -22,7 +22,7 @@ connectors/mesen/build.sh                 # git, make, a C++11 compiler; output 
 
 ```sh
 dj init  <dir> --name NAME --rom ROM --core CORE [--option KEY=VALUE]... [--symbols FILE]
-dj new   <dir> [--parent ID] [--title TEXT] [--frames N]     # prints the new replay's path
+dj new   <dir> [--parent ID] [--title TEXT] [--frames N]     # prints the new segment's path
 dj status <dir>                                              # tree with clean / dirty / unverified marks
 dj play  <dir> <id> [--screenshots DIR] [--shot 60,120] [--no-cache] [--accept]
 dj run   <dir> [--from-scratch] [--accept] [--screenshots]   # play everything, check hashes, record coverage
@@ -39,8 +39,8 @@ Every command that plays takes `--no-db` to run without the local database.
 - `--rom` and `--core` are remembered per project in `.local/local.toml`, which is never committed.
 - Ids can be shortened to any unique prefix.
 - `init` records **every** core option's current value in `config.toml`, so the setup is pinned.
-- `run` exits with an error when a replay's hashes differ from the recorded ones. `--accept` writes the new hashes instead.
-- `run --from-scratch` replays every chain from power-on instead of from cached parent states, which checks that save states round-trip exactly.
+- `run` exits with an error when a segment's hashes differ from the recorded ones. `--accept` writes the new hashes instead.
+- `run --from-scratch` replays every chain from power-on instead of from cached parent states, which checks that snapshots round-trip exactly.
 
 ### The local database
 
@@ -62,7 +62,7 @@ preset = "nes-sparse"   # nes-sparse (default), nes-aggressive, n64-sparse, n64-
 page_kb = 4             # split snapshots into pages of this size; missing, or the snapshot size or more, keeps them whole
 diff_every = 300        # also store a snapshot every N frames (0: only at frame 0 and markers)
 diff_at_markers = true
-previews = "thumb"      # none, thumb (half size) or full
+previews = "thumb"      # off, thumb (half width and height) or full
 ```
 
 `.local/local.toml` also takes `database = false` (play without it, like `--no-db`) and `max_memory_mb` (the GUI's in-memory snapshot limit).
@@ -76,11 +76,12 @@ target/release/dj-gui ../examples/thwaite       # or File > Open project…
 
 The ROM and core come from the project's `.local/local.toml` (written by the CLI's `--rom`/`--core`), or set them with Emulation > Set ROM… / Set core….
 
-- Left: two tabs, **Segments** and **Markers**. Markers lists every event in the project alphabetically (then writes and other lines) with the frame and segment; its filter matches marker text and segment titles, and clicking a row goes to that segment and frame.
-- Segments: the replay tree. Dots show clean (green), dirty (orange) and unverified (gray); anything under a dirty replay is dirty too. Edited replays are yellow italics until saved. Click a segment to go to it; double-click to play it; Enter (or F2) renames the selected segment in place (Enter or clicking away keeps the new name, Escape cancels). The filter box at the top matches titles, id prefixes and tags, and shows each match with the path down to it (the path is dimmed).
+- Left: three tabs, **Segments**, **Markers** and **Coverage**. Markers lists every event in the project alphabetically (then writes and other lines) with the frame and segment; its filter matches marker text and segment titles, and clicking a row goes to that segment and frame.
+- Coverage: the project's coverage from the local database (the same numbers as `dj report`), a ROM map with one square per function in ROM order (a fixed slice of PRG without a symbol map), shaded from grey to green by how much of it is covered, and a function list that sorts by ROM order, most uncovered, least covered or name. Click a square or a row to see its uncovered blocks and the segments where it first runs; click one of those to go to that segment and frame. While a segment plays, code it reaches that no counted segment runs shows in yellow-green, squares that gain some flash, and "+N new while playing" counts it. That live count starts again when you select or edit a segment, and only counts towards the project once the segment is clean and hydrated. In the tree, "+N" after a segment is how many instructions only that segment runs.
+- Segments: the segment tree. Dots show clean (green), dirty (orange) and unverified (gray); anything under a dirty segment is dirty too. Edited segments are yellow italics until saved. Click a segment to go to it; double-click to play it; Enter (or F2) renames the selected segment in place (Enter or clicking away keeps the new name, Escape cancels). The filter box at the top matches titles, id prefixes and tags, and shows each match with the path down to it (the path is dimmed).
   - Indentation only steps in where a segment has more than one child. An only child stays in its parent's column, joined to it by a short line, so a long chain of segments stays one column however deep it goes.
   - The third icon (a stepped tree) switches to indenting every level, which reads better for small trees; click it again to keep only children in line. The two icons before it collapse or expand every segment. Collapse all keeps the focused segment open, so its children still show.
-  - **Sticky segments**: the tree remembers the deepest segment you've been in. Going back up its chain highlights the chain above the selection, and the segments below it that lead back to the deepest one are highlighted faintly with faded titles. Continue and the child button follow those even where a segment has several children. Selecting a segment off that chain starts a new one.
+  - **Sticky segments**: the tree remembers the deepest segment you've been in. Going back up its chain highlights the chain above the selection, and the segments below it that lead back to the deepest one are highlighted faintly with faded titles. Continue and the end button follow those even where a segment has several children. Selecting a segment off that chain starts a new one.
   - Right-click > **Focus here** shows only that segment and what is below it. A breadcrumb bar above the filter shows the path to it (long paths fold the middle into a "… N" menu); click any crumb to focus there, or **All** for the whole tree. The filter searches inside the focused part only.
 - Top: the emulator picture, with the transport below it, left to right:
   - **⏮** (start) goes to frame 0; pressed again at frame 0, it goes back to the last frame of the parent segment (off at the start of a root segment). **◀●** goes to the previous marker in this segment.
@@ -89,8 +90,8 @@ The ROM and core come from the project's `.local/local.toml` (written by the CLI
   - **⏭** (end) goes to the last frame; pressed again at the end, it goes on into a child segment (carrying straight on from the current state): the sticky segment (where you were), or the only child, or, with several, it opens the list. It is a split button: the ▾ beside it lists every child at any time (faint when there is only one). At the end of a segment with no children it is off.
   - **↪** (continue, on by default) carries playback on into the next segment at the end of a segment: the only child, or the sticky segment, as long as neither has unsaved changes.
   - Speed: a dropdown of 0.25×, 0.5×, 1×, 2×, 4×, 8× and MAX, with − and + beside it. Reaching the last frame checks the end hash.
-- Bottom: the piano roll. Time runs left to right; one row per button, grouped by controller. Groups the replay uses are tinted and open, unused ones dimmed and closed; click a group name to open or close it. A closed group still shows when any of its buttons are held.
-  - Wheel or trackpad over the timeline scrolls time; Ctrl/Cmd+wheel zooms at the pointer; wheel over the names scrolls rows; "fit" shows the whole replay.
+- Bottom: the piano roll. Time runs left to right; one row per button, grouped by controller. Groups the segment uses are tinted and open, unused ones dimmed and closed; click a group name to open or close it. A closed group still shows when any of its buttons are held.
+  - Wheel or trackpad over the timeline scrolls time; Ctrl/Cmd+wheel zooms at the pointer; wheel over the names scrolls rows; "fit" shows the whole segment.
   - Click or drag on the ruler to seek.
   - One editing mode (hover the ⓘ in the roll's toolbar for a summary):
     - Click an empty cell to add a press as long as the last press made or resized (4 frames to begin with).
@@ -108,15 +109,15 @@ The ROM and core come from the project's `.local/local.toml` (written by the CLI
 
 ## Results on the Thwaite example
 
-- All 12 replays reproduce their recorded hashes on Linux x86_64 (where they were recorded) and on macOS arm64 (Apple clang 17), both from cached parent states and from scratch. The ROM builds byte-identical on both.
+- All 12 segments reproduce their recorded hashes on Linux x86_64 (where they were recorded) and on macOS arm64 (Apple clang 17), both from cached parent states and from scratch. The ROM builds byte-identical on both.
 - Coverage from 11,140 frames: 114 of 134 functions entered, 835 of 1,087 basic blocks, 3,733 of 4,656 instructions (80.2%).
-- The 5-replay smallest set keeps all of it.
+- The 5-segment smallest set keeps all of it.
 - Playback from cached parent states runs at about 480 frames per second on one Linux x86_64 cloud core and 717 on an Apple silicon MacBook Air (8 to 12 times real time). The coverage patch costs about 5% against stock Mesen, with identical hashes.
-- The gaps are what you would expect from short, unskilled play: balloons and MIRVs, end-of-round scoring, and rebuilding houses and silos. Each needs a replay that survives a full round.
+- The gaps are what you would expect from short, unskilled play: balloons and MIRVs, end-of-round scoring, and rebuilding houses and silos. Each needs a segment that survives a full round.
 
 ## Known limits
 
 - Only one core has a connector (Mesen, NES).
 - Block and function rollup is 6502-only. Other CPUs get raw executed-byte counts until their disassembler is added.
 - Determinism has been checked on Linux x86_64 and macOS arm64; Windows still needs a run.
-- The GUI is a first prototype: button inputs only (no analog, lightgun or pointer rows yet), no keyboard play/recording, one core at a time. Tested on Linux; macOS and Windows not tried yet.
+- The GUI is a first prototype: button inputs only (no analog, lightgun or pointer rows yet), no keyboard play/recording, one core at a time. Tested on Linux and macOS; Windows not tried yet.

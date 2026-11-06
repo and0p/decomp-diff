@@ -1,4 +1,4 @@
-//! A project on disk: config.toml, segments/, blobs/ (SPEC.md sections 1, 2, 4, 8).
+//! A project on disk: config.toml, segments/, blobs/ (.agents/SPEC.md sections 1, 2, 4, 8).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ pub struct Config {
     pub tick: Option<TickConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub symbols: Vec<SymbolsConfig>,
-    /// Thresholds for the local database (CACHE_PLAN.md).
+    /// Thresholds for the local database (.agents/CACHE_PLAN.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::cache::CacheConfig>,
 }
@@ -191,8 +191,8 @@ impl Collection {
                 seen.push(p);
                 cur = self.replays[p].parent();
             }
-            if r.parent().is_some() && (r.get("save").is_some() || r.get("sram").is_some()) {
-                bail!("replay {id} has a parent, so it cannot also name `save` or `sram` (only trunks start from blobs)");
+            if r.parent().is_some() && (r.get("snapshot").is_some() || r.get("sram").is_some()) {
+                bail!("replay {id} has a parent, so it cannot also name `snapshot` or `sram` (only root segments start from blobs)");
             }
         }
         Ok(())
@@ -264,7 +264,7 @@ impl Collection {
         out
     }
 
-    /// Status worked out from hashes alone (SPEC.md section 8).
+    /// Status worked out from hashes alone (.agents/SPEC.md section 8).
     pub fn status(&self, id: &str) -> Status {
         let r = &self.replays[id];
         if let (Some(p), Some(start)) = (r.parent(), r.get("start-hash")) {
@@ -313,7 +313,7 @@ impl Collection {
         Ok(())
     }
 
-    /// `blobs/<hash>.srm` for the header field `sram`, `blobs/<hash>.state` for `save`.
+    /// `blobs/<hash>.srm` for the header field `sram`, `blobs/<hash>.state` for `snapshot`.
     pub fn blob_path(&self, blob: &str, field: &str) -> PathBuf {
         self.root.join("blobs").join(format!("{blob}.{}", blob_ext(field)))
     }
@@ -322,7 +322,7 @@ impl Collection {
     /// segments name to the current form.
     fn upgrade_blob_names(&self) -> Result<()> {
         for r in self.replays.values() {
-            for field in ["save", "sram"] {
+            for field in ["snapshot", "sram"] {
                 let Some(blob) = r.get(field) else { continue };
                 let path = self.blob_path(blob, field);
                 if path.exists() {

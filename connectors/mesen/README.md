@@ -12,8 +12,8 @@ so it reports which code ran, for decomp-dj.
 
 ## Why Mesen
 
-Mesen is one of the most accurate NES emulators and still fast enough to run
-replays far faster than real time. Its mapper code already translates a CPU
+Mesen is one of the most accurate NES emulators and still fast enough to play
+segments far faster than real time. Its mapper code already translates a CPU
 address into "which byte of PRG ROM / work RAM / save RAM is mapped here"
 (`BaseMapper::GetAbsoluteAddressAndType`), which is exactly the key coverage
 needs on bank-switched cartridges. The libretro build leaves out Mesen's
@@ -31,6 +31,6 @@ Each byte holds flags: `0x01` executed as an opcode, `0x02` executed as an opera
 
 The patch adds one call to every instruction-fetch cycle. On the Thwaite
 example it costs about 5% (482 vs 506 frames per second on one x86_64 core,
-about 8 times real time), and every replay's state hashes are identical with
+about 8 times real time), and every segment's state hashes are identical with
 and without the patch. Mesen's accuracy is the main cost; a faster NES core
 could get its own connector later.

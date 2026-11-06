@@ -1,9 +1,9 @@
 # Example: Thwaite
 
-A small replay project for [Thwaite](https://github.com/pinobatch/thwaite-nes),
+A small project for [Thwaite](https://github.com/pinobatch/thwaite-nes),
 a free NES game by Damian Yerrick (GPL-3.0). It is the end-to-end test for
-decomp-dj: 12 replays that boot the game, go through every menu, play,
-pause, lose, use a SNES mouse, and include one poked replay.
+decomp-dj: 12 segments that boot the game, go through every menu, play,
+pause, lose, use a SNES mouse, and include one poked segment.
 
 ```
 Boot, skip the legal screen
@@ -31,15 +31,15 @@ $E run . --rom build/thwaite.nes --core ../../build/cores/mesen_libretro.so   # 
 $E report . --gaps gaps.csv
 ```
 
-Every replay has recorded start and end hashes, so `run` doubles as a
+Every segment has recorded start and end hashes, so `run` doubles as a
 determinism check: on a matching setup each line reads `ok`. Add
 `--from-scratch` to replay every chain from power-on instead of from cached
 parent states.
 
 `[tick]` in `config.toml` counts executions of `doStateAction`, the
 routine Thwaite runs once per game-logic step. Menus show 0 ticks, and the
-pause replay shows 130 ticks over 300 frames.
+pause segment shows 130 ticks over 300 frames.
 
-The `Mouse` replay sends mouse input on `P1` although the mouse is plugged
+The `Mouse` segment sends mouse input on `P1` although the mouse is plugged
 into port 2: the Mesen core reads mouse motion from libretro port 1 whatever
 port the mouse is in.

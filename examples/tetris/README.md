@@ -19,10 +19,10 @@ gitignored.
     - Start B-Type Game at Level 0, Height 0 › Lose Game immediately and return to menu
     - Start B-Type Game at Level 3, Height 3 › Lose Game immediately and return to menu
 
-Each "Start …" node ends as the game begins, so other ways of playing that game can go
+Each "Start …" segment ends as the game begins, so other ways of playing that game can go
 beside "Lose Game". The lost games carry events for the last piece you can move, the piece
 that ends the game, the start of the game-over curtain, and the return to the menu
-(checkpoints mark where the old nodes were joined). In the B-type games those frames come
+(checkpoints mark where the old segments were joined). In the B-type games those frames come
 from RAM: `$48` (play state) is 8 on the frame a piece spawns and 10 (0x0A) during the
 curtain, and `$58` counts curtain rows.
 
@@ -41,11 +41,11 @@ There are no symbols, so coverage reports can't name functions or blocks.
 
 ## Why small input changes change the pieces
 
-Traced with `player/examples/ramtrace.rs`, which plays a node's chain from power-on and
+Traced with `player/examples/ramtrace.rs`, which plays a segment's chain from power-on and
 prints RAM bytes per frame:
 
 ```sh
-cd player && cargo run --release --example ramtrace -- ../examples/tetris <node id> 17,18,19,BF 20
+cd player && cargo run --release --example ramtrace -- ../examples/tetris <segment id> 17,18,19,BF 20
 ```
 
 - `$17-$18` is Tetris's random number (a 16-bit shift register). It steps **once every
@@ -69,10 +69,10 @@ What this means for projects:
 
 - Any input change before a spawn can change every later piece. That changes the RAM
   hash, so everything below turns dirty. This is correct, but it can surprise.
-- A node can pin the sequence with `[WRITE] RAM 0x17 <hi> <lo>` (or the spawn bytes)
+- A segment can pin the sequence with `[WRITE] RAM 0x17 <hi> <lo>` (or the spawn bytes)
   at a known frame. That makes its gameplay independent of upstream timing, at the cost
   of being a poke.
 - Ideas for decomp-dj: per-project watched addresses (here the random number and the
   next piece) drawn as a lane in the piano roll, and after an edit, a marker at the first
   frame a watched value differs from the last run. A game-specific `[RNG]` command
-  (reserved in SPEC.md) could set the random number by name.
+  (reserved in .agents/SPEC.md) could set the random number by name.

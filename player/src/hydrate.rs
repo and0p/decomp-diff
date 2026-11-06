@@ -1,4 +1,4 @@
-//! Hydration (CACHE_PLAN.md, "Hydrating"): play the segments whose current content
+//! Hydration (.agents/CACHE_PLAN.md, "Hydrating"): play the segments whose current content
 //! isn't in the local database yet, a slice at a time so a GUI can show it, pause it
 //! and stop it. Each finished segment is committed on its own.
 

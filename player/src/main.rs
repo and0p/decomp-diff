@@ -449,7 +449,7 @@ fn report(dir: &Path, local: &Local, json: Option<PathBuf>, gaps: Option<PathBuf
         Err(_) => None,
     };
     let conn = cache::Cache::open_readonly(&col)?;
-    let rep = coverage::build_report(&col, &conn, rom.as_deref())?;
+    let rep = coverage::build_report(&col, &conn, rom.as_deref(), None)?;
     coverage::print_report(&rep, &col);
     if let Some(j) = json {
         std::fs::write(&j, serde_json::to_string_pretty(&rep)?)?;
@@ -521,29 +521,22 @@ fn where_cmd(dir: &Path, what: &str, local: &Local) -> Result<()> {
         found.ok_or_else(|| anyhow!("{what} is not an offset (PRG:0x1234 or 0x1234) or a symbol in the collection's symbol maps"))?
     };
     let setup = latest_setup(&conn)?;
-    let keys = cache::current_keys(&conn, &col, &setup)?;
-    let mut st = conn.prepare("SELECT content, frame FROM first_hits WHERE region = ?1 AND rom_offset = ?2")?;
-    let rows: Vec<(String, u64)> = st.query_map(rusqlite::params![region, offset as i64], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?.collect::<rusqlite::Result<_>>()?;
-    let mut hits = vec![];
-    for (id, (key, status)) in &keys {
-        let Some(key) = key else { continue };
-        for (c, f) in &rows {
-            if c == key {
-                let near: Option<i64> = conn.query_row("SELECT max(frame) FROM frames WHERE content = ?1 AND frame <= ?2", rusqlite::params![key, *f as i64], |r| r.get(0))?;
-                hits.push((id.clone(), *f, near, *status));
-            }
-        }
-    }
+    let hits = coverage::first_hits_in(&col, &conn, &setup, &region, offset, offset)?;
     if hits.is_empty() {
         println!("no current segment runs {region}:{offset:#x} (as recorded in the local database)");
         return Ok(());
     }
-    hits.sort_by_key(|(id, f, _, _)| (col.chain(id).map(|c| c.len()).unwrap_or(0), *f));
     println!("{region}:{offset:#x} first runs in:");
-    for (id, f, near, status) in hits {
-        let note = if status == Status::Dirty { "  (dirty: doesn't count)" } else { "" };
+    let keys = cache::current_keys(&conn, &col, &setup)?;
+    for h in hits {
+        let key = keys.get(&h.id).and_then(|(k, _)| k.clone());
+        let near: Option<i64> = match &key {
+            Some(k) => conn.query_row("SELECT max(frame) FROM frames WHERE content = ?1 AND frame <= ?2", rusqlite::params![k, h.frame as i64], |r| r.get(0))?,
+            None => None,
+        };
+        let note = if h.status == Status::Dirty { "  (dirty: doesn't count)" } else { "" };
         let near = near.map(|n| format!("nearest snapshot at frame {n}")).unwrap_or_else(|| "no snapshot stored".into());
-        println!("  {} {}  frame {f}  ({near}){note}", &id[..8.min(id.len())], col.replays[&id].title());
+        println!("  {} {}  frame {}  ({near}){note}", &h.id[..8.min(h.id.len())], col.replays[&h.id].title(), h.frame);
     }
     Ok(())
 }

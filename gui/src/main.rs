@@ -13,6 +13,7 @@ use decomp_dj::player::{trunk_start_frame, Session};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
+mod cov;
 mod roll;
 
 /// A save state is kept every this many frames, so seeking never replays more than this.
@@ -82,8 +83,10 @@ struct App {
     tree_closed: HashSet<String>,
     /// Tree filter text: matches title, id or tags.
     filter: String,
-    /// Sidebar shows the marker list instead of the segment tree.
-    markers_tab: bool,
+    /// Which list the left sidebar shows.
+    side_tab: SideTab,
+    /// The Coverage tab and live coverage.
+    cov: cov::CovState,
     marker_filter: String,
     /// The segment the tree is focused on (hoisted): only it and its descendants show.
     hoist: Option<String>,
@@ -122,6 +125,13 @@ struct App {
     stored_ids: HashSet<String>,
     /// Limit for in-memory snapshots of the current segment, in MB.
     max_memory_mb: u64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SideTab {
+    Segments,
+    Markers,
+    Coverage,
 }
 
 struct Hydrating {
@@ -192,7 +202,8 @@ impl Default for App {
             texture: None,
             tree_closed: HashSet::new(),
             filter: String::new(),
-            markers_tab: false,
+            side_tab: SideTab::Segments,
+            cov: cov::CovState::default(),
             marker_filter: String::new(),
             hoist: None,
             indent_all: false,
@@ -591,6 +602,7 @@ impl App {
             }
         }
         self.edited.clear();
+        self.coverage_stale();
         self.info(format!("Saved {} segment(s)", ids.len()));
     }
 
@@ -672,6 +684,7 @@ impl App {
         }
         let stored = s.stored_frames(col, id, &start_hash).unwrap_or_default();
         self.pb = Some(Playback { id: id.to_string(), start_frame, frames, ran: 0, snapshots: BTreeMap::from([(0, snap)]), checkpoints, checkpoint_miss: None, end_hash: None, start_hash: Some(start_hash), stored });
+        self.coverage_restart_live();
         Ok(())
     }
 
@@ -1063,6 +1076,7 @@ impl App {
         self.pb = Some(Playback { id: child.to_string(), start_frame, frames, ran: 0, snapshots: BTreeMap::from([(0, snap)]), checkpoints, checkpoint_miss: None, end_hash: None, start_hash, stored: vec![] });
         self.selected = Some(child.to_string());
         self.roll.follow_to(0);
+        self.coverage_restart_live();
         Ok(())
     }
 
@@ -1103,9 +1117,14 @@ impl App {
                 pb.checkpoints = keep.into_iter().collect();
                 pb.checkpoint_miss = pb.checkpoint_miss.filter(|m| *m <= from);
                 pb.end_hash = None;
-                if let Some(cur) = pb.shown() {
+                let cur = pb.shown();
+                // Live coverage starts again: the frames after the edit run differently now.
+                self.coverage_restart_live();
+                if let Some(cur) = cur {
                     // Redraw the current frame from before the edit.
-                    pb.ran = 0;
+                    if let Some(pb) = &mut self.pb {
+                        pb.ran = 0;
+                    }
                     self.seek(cur);
                 }
             }
@@ -1141,6 +1160,7 @@ impl App {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.coverage_stale();
     }
 
     fn undo(&mut self) {
@@ -1163,6 +1183,7 @@ impl App {
 
     /// Puts the segments of `step` back and returns the step that reverses it.
     fn restore(&mut self, step: UndoStep) -> UndoStep {
+        self.coverage_stale();
         self.renaming = None;
         self.playing = false;
         let here = self.pb.as_ref().and_then(|p| p.shown());
@@ -1962,14 +1983,18 @@ impl App {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            for (on, name) in [(false, "Segments"), (true, "Markers")] {
-                if ui.selectable_label(self.markers_tab == on, name).clicked() {
-                    self.markers_tab = on;
+            for (tab, name) in [(SideTab::Segments, "Segments"), (SideTab::Markers, "Markers"), (SideTab::Coverage, "Coverage")] {
+                if ui.selectable_label(self.side_tab == tab, name).clicked() {
+                    self.side_tab = tab;
                 }
             }
         });
         ui.separator();
-        if self.markers_tab {
+        if self.side_tab == SideTab::Coverage {
+            self.coverage_tab(ui);
+            return;
+        }
+        if self.side_tab == SideTab::Markers {
             let shown = self.selected.as_deref().zip(self.pb.as_ref().and_then(|b| b.shown()));
             if let Some((id, f)) = marker_list(ui, col, &mut self.marker_filter, shown) {
                 if self.selected.as_deref() != Some(id.as_str()) {
@@ -2194,6 +2219,10 @@ impl App {
                     if self.stored_ids.contains(id) {
                         ui.label(RichText::new("db").small().color(Color32::from_rgb(110, 150, 190))).on_hover_text("Hydrated: this segment's current content is in the local database");
                     }
+                    if let Some(n) = self.cov.unique.get(id) {
+                        ui.label(RichText::new(format!("+{n}")).small().color(cov::COVERED))
+                            .on_hover_text(format!("{n} instructions that only this segment runs (Coverage tab)"));
+                    }
                     if r.is_poked() {
                         ui.label(RichText::new("poke").small().color(Color32::from_rgb(200, 120, 220))).on_hover_text("Has [WRITE] lines: memory is changed directly");
                     }
@@ -2320,6 +2349,7 @@ impl App {
 
     /// Which segments' current content is stored (the tree's "db" marks).
     fn refresh_stored(&mut self) {
+        self.coverage_stale();
         self.stored_ids.clear();
         let (Some(col), Some(s)) = (&self.col, &self.session) else { return };
         let Some(c) = &s.cache else { return };
@@ -2872,6 +2902,7 @@ impl eframe::App for App {
         }
         let dt = ctx.input(|i| i.unstable_dt).min(0.1) as f64;
         self.work();
+        self.coverage_update(ctx.input(|i| i.time));
         self.update_sticky_tip();
         if self.job.is_some() || self.hydrating.as_ref().is_some_and(|h| !h.paused) {
             ctx.request_repaint();

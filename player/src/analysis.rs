@@ -1,5 +1,5 @@
 //! Symbol maps and static analysis used to roll byte coverage up into
-//! instructions, basic blocks and functions (SPEC.md section 9).
+//! instructions, basic blocks and functions (.agents/SPEC.md section 9).
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeSet, HashMap};
