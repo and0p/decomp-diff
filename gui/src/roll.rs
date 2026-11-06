@@ -22,6 +22,15 @@ const ROW_H: f32 = 15.0;
 const JOYPAD_ORDER: [u32; 16] = [4, 5, 6, 7, 2, 3, 0, 8, 1, 9, 10, 11, 12, 13, 14, 15];
 const JOYPAD_BASIC: usize = 8;
 
+/// What the roll shows around the segment, read-only: the end of the parent to the left of
+/// frame 0 and the start of the next segment past the last frame; and from which frame
+/// the segment hasn't been played since the last edit.
+pub struct Neighbours {
+    pub prev: Option<String>,
+    pub next: Option<String>,
+    pub stale_from: Option<u64>,
+}
+
 pub enum Action {
     Seek(u64),
     /// Open the editor for the non-input lines on this frame.
@@ -95,6 +104,36 @@ struct Model {
     frames: u64,
     groups: Vec<Group>,
     markers: Vec<Marker>,
+    prev: Option<Side>,
+    next: Option<Side>,
+}
+
+/// A neighbouring segment, laid out on this segment's rows: `rows[g][r]` are the spans of
+/// row `r` of group `g`, and `union[g]` everything the neighbour presses on that controller.
+struct Side {
+    id: String,
+    title: String,
+    frames: u64,
+    rows: Vec<Vec<Vec<(u64, u64)>>>,
+    union: Vec<Vec<(u64, u64)>>,
+}
+
+fn build_side(col: &Collection, id: &str, groups: &[Group]) -> Option<Side> {
+    let r = col.replays.get(id)?;
+    let mut keys: BTreeSet<InputKey> = BTreeSet::new();
+    for l in &r.lines {
+        if let Command::Input { key, .. } = &l.command {
+            if format::is_binary(*key) {
+                keys.insert(*key);
+            }
+        }
+    }
+    let rows = groups.iter().map(|g| g.rows.iter().map(|row| if keys.contains(&row.key) { r.binary_spans(row.key) } else { vec![] }).collect()).collect();
+    let union = groups
+        .iter()
+        .map(|g| merge(keys.iter().filter(|k| k.port == g.port && k.device == g.device).flat_map(|k| r.binary_spans(*k)).collect()))
+        .collect();
+    Some(Side { id: id.to_string(), title: r.title().to_string(), frames: r.frames().unwrap_or(0), rows, union })
 }
 
 /// Making a new press: from a click on an empty cell. A plain click makes it as long as
@@ -268,7 +307,7 @@ fn build_model(col: &Collection, id: &str, gen: u64, all_buttons: bool) -> Model
         groups.push(Group { port, device, name: format!("P{} {}", port + 1, device_name(device)), rows, union, other: oth, presses });
     }
     markers.sort_by_key(|m| m.frame);
-    Model { id: id.to_string(), gen, all_buttons, frames, groups, markers }
+    Model { id: id.to_string(), gen, all_buttons, frames, groups, markers, prev: None, next: None }
 }
 
 /// Spans overlapping `[f0, f1)`, found by binary search.
@@ -359,25 +398,36 @@ impl RollState {
         self.jump_to = Some(frame);
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, col: &Collection, id: &str, playhead: Option<u64>, playing: bool) -> Option<Action> {
+    pub fn show(&mut self, ui: &mut egui::Ui, col: &Collection, id: &str, playhead: Option<u64>, playing: bool, nb: &Neighbours) -> Option<Action> {
+        let side_id = |s: &Option<Side>| s.as_ref().map(|s| s.id.clone());
         let stale = match &self.model {
-            Some(m) => m.id != id || m.gen != self.gen || m.all_buttons != self.all_buttons,
+            Some(m) => m.id != id || m.gen != self.gen || m.all_buttons != self.all_buttons || side_id(&m.prev) != nb.prev || side_id(&m.next) != nb.next,
             None => true,
         };
         if stale {
-            if self.model.as_ref().is_some_and(|m| m.id != id) {
-                self.scroll_x = 0.0;
+            if let Some(old) = self.model.as_ref().filter(|m| m.id != id) {
+                // Crossing into a neighbour keeps the view where it was, so the picture doesn't
+                // jump: the old segment's end is the new one's frame 0, and the other way round.
+                self.scroll_x = if old.next.as_ref().is_some_and(|n| n.id == id) {
+                    self.scroll_x - old.frames as f32
+                } else if old.prev.as_ref().is_some_and(|p| p.id == id) {
+                    self.scroll_x + old.prev.as_ref().map_or(0, |p| p.frames) as f32
+                } else {
+                    0.0
+                };
                 self.drag = None;
                 self.gesture = None;
                 self.sel.clear();
             }
-            let m = build_model(col, id, self.gen, self.all_buttons);
+            let mut m = build_model(col, id, self.gen, self.all_buttons);
+            m.prev = nb.prev.as_deref().and_then(|p| build_side(col, p, &m.groups));
+            m.next = nb.next.as_deref().and_then(|n| build_side(col, n, &m.groups));
             // Keep only selected presses that still exist after the edit.
             self.sel.retain(|(key, start)| row_of(&m, *key).is_some_and(|(g, r)| m.groups[g].rows[r].spans.iter().any(|s| s.0 == *start)));
             self.model = Some(m);
         }
         let model = self.model.take().unwrap();
-        let action = self.draw(ui, &model, playhead, playing);
+        let action = self.draw(ui, &model, playhead, playing, nb.stale_from);
         self.model = Some(model);
         action
     }
@@ -386,7 +436,7 @@ impl RollState {
         *self.open.get(&(g.port, g.device)).unwrap_or(&g.used())
     }
 
-    fn draw(&mut self, ui: &mut egui::Ui, m: &Model, playhead: Option<u64>, playing: bool) -> Option<Action> {
+    fn draw(&mut self, ui: &mut egui::Ui, m: &Model, playhead: Option<u64>, playing: bool, stale_from: Option<u64>) -> Option<Action> {
         let mut action = None;
         // Toolbar.
         ui.horizontal(|ui| {
@@ -525,11 +575,18 @@ impl RollState {
                 self.scroll_x = ph - view_frames * 0.1;
             }
         }
-        self.scroll_x = self.scroll_x.clamp(-view_frames * 0.05, (m.frames as f32 - view_frames * 0.5).max(0.0));
+        // The view may run on into the neighbours, but no further.
+        let lo = -view_frames * 0.05 - m.prev.as_ref().map_or(0, |p| p.frames) as f32;
+        let hi = (m.frames + m.next.as_ref().map_or(0, |n| n.frames)) as f32 - view_frames * 0.5;
+        self.scroll_x = self.scroll_x.clamp(lo, hi.max(0.0));
         self.scroll_y = self.scroll_y.clamp(0.0, (content_h - view_h).max(0.0));
 
         let x_of = |f: f32| tl_left + (f - self.scroll_x) * ppf;
         let frame_at = |x: f32| ((x - tl_left) / ppf + self.scroll_x).floor().max(0.0) as u64;
+        // Outside the segment: the neighbours, which nothing on the roll may change. A few
+        // pixels of slack keep the outer edges of the first and last presses grabbable.
+        let seg_x = (x_of(0.0), x_of(m.frames as f32));
+        let outside = |x: f32| x < seg_x.0 - 4.0 || x > seg_x.1 + 4.0;
         let f0 = self.scroll_x.floor().max(0.0) as u64;
         let f1 = ((self.scroll_x + view_frames).ceil().max(0.0) as u64 + 1).min(m.frames);
 
@@ -654,6 +711,9 @@ impl RollState {
             if p.x < tl_left {
                 return None;
             }
+            if outside(p.x) {
+                return None;
+            }
             let row = &m.groups[gi].rows[ri];
             let f = ff_at(p.x);
             let lo = (f - 8.0 / ppf).floor().max(0.0) as u64;
@@ -712,6 +772,8 @@ impl RollState {
                     self.markers_open = !self.markers_open;
                 } else if let Some(bi) = marker_at(p) {
                     action = Some(Action::OpenFrame(boxes[bi].frame));
+                } else if p.x >= tl_left && outside(p.x) {
+                    // In a neighbour: read-only, a click does nothing.
                 } else if p.y < rows_top && p.x >= tl_left {
                     self.scrubbing = true;
                 } else if p.x >= tl_left && !header_at(p) && hit(p).is_some() && mods.command {
@@ -751,7 +813,7 @@ impl RollState {
                         None => {
                             // An empty cell: a drag selects an area; a click adds a press here.
                             let f = frame_at(p.x);
-                            let cell = row_here.filter(|_| f < m.frames).map(|(gi, ri)| (gi, ri, f));
+                            let cell = row_here.filter(|_| f < m.frames && ff_at(p.x) >= 0.0).map(|(gi, ri)| (gi, ri, f));
                             let a = (ff_at(p.x), p.y - rows_top + self.scroll_y);
                             self.gesture = Some(Gesture::Marquee { a, b: a, op, cell });
                         }
@@ -965,6 +1027,18 @@ impl RollState {
         let step = tick_step(ppf);
         let first_tick = (f0 / step) * step;
 
+        // The neighbours: (side, frame offset of its frame 0 on this roll, its visible frames).
+        let sides: Vec<(&Side, f32, u64, u64)> = [(m.prev.as_ref(), true), (m.next.as_ref(), false)]
+            .into_iter()
+            .filter_map(|(s, before)| {
+                let s = s?;
+                let off = if before { -(s.frames as f32) } else { m.frames as f32 };
+                let a = (self.scroll_x - off).floor().max(0.0) as u64;
+                let b = ((self.scroll_x + view_frames - off).ceil().max(0.0) as u64 + 1).min(s.frames);
+                (a < b).then_some((s, off, a, b))
+            })
+            .collect();
+
         // Rows.
         let rows_clip = Rect::from_min_max(Pos2::new(rect.left(), rows_top), rect.max);
         let rp = painter.with_clip_rect(rows_clip);
@@ -989,6 +1063,13 @@ impl RollState {
                         let x1 = x_of(b as f32).max(x0 + 1.5);
                         rp.rect_filled(Rect::from_min_max(Pos2::new(x0, top + 6.0), Pos2::new(x1, bot - 6.0)), 1.0, col_u);
                     }
+                    for (sd, off, a0, b0) in &sides {
+                        for &(a, b) in visible(&sd.union[gi], *a0, *b0) {
+                            let x0 = x_of(a as f32 + off);
+                            let x1 = x_of(b as f32 + off).max(x0 + 1.5);
+                            rp.rect_filled(Rect::from_min_max(Pos2::new(x0, top + 6.0), Pos2::new(x1, bot - 6.0)), 1.0, col_u.gamma_multiply(0.6));
+                        }
+                    }
                     let a = g.other.partition_point(|f| *f < f0);
                     let b = g.other.partition_point(|f| *f < f1);
                     for f in &g.other[a..b] {
@@ -1004,15 +1085,21 @@ impl RollState {
                         rp.rect_filled(row_rect, 0.0, Color32::from_gray(26));
                     }
                     let c = port_color(g.port, g.device);
-                    let span_rect = |a: u64, b: u64| {
-                        let x0 = x_of(a as f32);
-                        Rect::from_min_max(Pos2::new(x0, top + 2.0), Pos2::new(x_of(b as f32).max(x0 + 1.5), bot - 2.0))
+                    let span_rect_f = |a: f32, b: f32| {
+                        let x0 = x_of(a);
+                        Rect::from_min_max(Pos2::new(x0, top + 2.0), Pos2::new(x_of(b).max(x0 + 1.5), bot - 2.0))
                     };
+                    let span_rect = |a: u64, b: u64| span_rect_f(a as f32, b as f32);
                     let resizing = match &self.gesture {
                         Some(Gesture::Resize { key, span, left, to }) if *key == row.key => Some((*span, if *left { (*to, span.1) } else { (span.0, *to) })),
                         _ => None,
                     };
                     let hl = Stroke::new(1.5, Color32::WHITE);
+                    for (sd, off, a0, b0) in &sides {
+                        for &(a, b) in visible(&sd.rows[gi][ri], *a0, *b0) {
+                            rp.rect_filled(span_rect_f(a as f32 + off, b as f32 + off), 2.0, c.gamma_multiply(0.6));
+                        }
+                    }
                     for &(a, b) in visible(&row.spans, f0, f1) {
                         let selected = shown_sel.contains(&(row.key, a));
                         if let Some((old, new)) = resizing {
@@ -1069,9 +1156,54 @@ impl RollState {
             grid.text(Pos2::new(x + 3.0, rect.top() + 2.0), Align2::LEFT_TOP, t.to_string(), FontId::monospace(10.0), Color32::from_gray(150));
             t += step;
         }
+        // The neighbours' own frame numbers, dimmer.
+        for (_, off, a0, b0) in &sides {
+            let mut t = (a0 / step) * step;
+            while t < *b0 {
+                // Frame 0 of the next segment is this one's end, already labelled.
+                if t == 0 && *off > 0.0 {
+                    t += step;
+                    continue;
+                }
+                let x = x_of(t as f32 + off);
+                grid.line_segment([Pos2::new(x, rect.top() + RULER_H * 0.5), Pos2::new(x, rect.top() + RULER_H)], Stroke::new(1.0, Color32::from_white_alpha(10)));
+                grid.text(Pos2::new(x + 3.0, rect.top() + 2.0), Align2::LEFT_TOP, t.to_string(), FontId::monospace(10.0), Color32::from_gray(90));
+                t += step;
+            }
+        }
+        // Frames not played since the last edit: an amber band on the ruler.
+        let mut stale_rect = None;
+        if let Some(sf) = stale_from.filter(|s| *s < m.frames) {
+            let (x0, x1) = (x_of(sf as f32).max(tl_left), end_x);
+            if x1 > x0 {
+                let r = Rect::from_min_max(Pos2::new(x0, rect.top() + RULER_H - 5.0), Pos2::new(x1, rect.top() + RULER_H));
+                grid.rect_filled(r, 0.0, Color32::from_rgb(230, 150, 50).gamma_multiply(0.7));
+                stale_rect = Some((Rect::from_min_max(Pos2::new(x0, rect.top()), Pos2::new(x1, rect.top() + RULER_H)), sf));
+            }
+        }
+        // Outside the segment: dimmed, with the boundary marked.
+        let start_x = x_of(0.0);
+        if start_x > tl_left {
+            grid.rect_filled(Rect::from_min_max(Pos2::new(tl_left, rect.top()), Pos2::new(start_x, rect.bottom())), 0.0, Color32::from_black_alpha(110));
+            grid.line_segment([Pos2::new(start_x, rect.top()), Pos2::new(start_x, rect.bottom())], Stroke::new(1.0, Color32::from_gray(90)));
+        }
         if end_x < rect.right() {
             grid.rect_filled(Rect::from_min_max(Pos2::new(end_x, rect.top()), rect.max), 0.0, Color32::from_black_alpha(110));
             grid.line_segment([Pos2::new(end_x, rect.top()), Pos2::new(end_x, rect.bottom())], Stroke::new(1.0, Color32::from_gray(90)));
+        }
+        // The neighbours' titles in the marker lane, against the boundary.
+        let title_font = FontId::proportional(11.0);
+        if let Some(p) = &m.prev {
+            if start_x > tl_left + 40.0 {
+                let t = format!("⏴ {}", short_label(&p.title));
+                grid.text(Pos2::new(start_x - 6.0, my), Align2::RIGHT_CENTER, t, title_font.clone(), Color32::from_gray(150));
+            }
+        }
+        if let Some(n) = &m.next {
+            if end_x < rect.right() - 40.0 {
+                let t = format!("{} ⏵", short_label(&n.title));
+                grid.text(Pos2::new(end_x + 6.0, my), Align2::LEFT_CENTER, t, title_font, Color32::from_gray(150));
+            }
         }
         grid.line_segment([Pos2::new(tl_left, rect.top() + RULER_H), Pos2::new(rect.right(), rect.top() + RULER_H)], Stroke::new(1.0, Color32::from_gray(50)));
         grid.line_segment([Pos2::new(tl_left, rows_top), Pos2::new(rect.right(), rows_top)], Stroke::new(1.0, Color32::from_gray(50)));
@@ -1108,7 +1240,16 @@ impl RollState {
             grid.add(egui::Shape::convex_polygon(vec![Pos2::new(x - 5.0, rect.top()), Pos2::new(x + 5.0, rect.top()), Pos2::new(x, rect.top() + 7.0)], hl, Stroke::NONE));
         }
         if let Some(p) = pointer {
-            if rect.contains(p) && p.x >= tl_left && self.drag.is_none() {
+            if rect.contains(p) && p.x >= tl_left && hover_text.is_none() {
+                let ff = ff_at(p.x);
+                let side = if ff < 0.0 { m.prev.as_ref().map(|s| (s, ff + s.frames as f32)) } else if ff >= m.frames as f32 { m.next.as_ref().map(|s| (s, ff - m.frames as f32)) } else { None };
+                if let Some((s, f)) = side.filter(|(s, f)| *f >= 0.0 && *f < s.frames as f32) {
+                    hover_text = Some(format!("\"{}\", frame {} (step or play across to edit it)", s.title, f.floor() as u64));
+                } else if let Some((_, sf)) = stale_rect.filter(|(r, _)| r.contains(p)) {
+                    hover_text = Some(format!("Frames from {sf} on haven't been played since the last edit"));
+                }
+            }
+            if rect.contains(p) && p.x >= tl_left && self.drag.is_none() && ff_at(p.x) >= 0.0 {
                 let f = frame_at(p.x);
                 if f < m.frames {
                     let x = x_of(f as f32 + 0.5);

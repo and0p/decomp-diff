@@ -1,5 +1,5 @@
 //! The Coverage tab in the left sidebar: totals, a ROM map, a function list, and live
-//! coverage of the segment being played (.agents/SPEC.md section 9 and "Coverage in the GUI").
+//! coverage of the segment being played (docs/coverage.md).
 //!
 //! The project's coverage comes from `decomp_dj::coverage::build_report`, the same numbers
 //! as `dj report`: segments that aren't dirty and whose current content has been played into
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use crate::App;
 
-/// Same colors as SPEC.md's terminology: green covered, blue unreachable.
+/// Same colors as docs/concepts.md: green covered, blue unreachable.
 pub const COVERED: Color32 = Color32::from_rgb(92, 184, 92);
 pub const UNREACHABLE: Color32 = Color32::from_rgb(90, 140, 230);
 /// Reached by the segment being played, but not counted yet (it isn't clean and hydrated).
@@ -23,6 +23,8 @@ const EMPTY: Color32 = Color32::from_gray(58);
 
 /// How long a square stays highlighted after live play reaches new code in it.
 const FLASH_SECS: f64 = 1.5;
+/// How long a square glows after its code runs (new or not).
+const GLOW_SECS: f64 = 0.5;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Sort {
@@ -59,6 +61,8 @@ pub struct Live {
     pub new_per_cell: Vec<usize>,
     /// When each cell last gained live coverage (seconds, egui time).
     pub flash: HashMap<usize, f64>,
+    /// When each cell's code last ran at all (seconds, egui time): the activity glow.
+    pub glow: HashMap<usize, f64>,
 }
 
 pub struct CovState {
@@ -285,6 +289,7 @@ impl CovState {
         self.live.new = 0;
         self.live.new_per_cell.iter_mut().for_each(|n| *n = 0);
         self.live.flash.clear();
+        self.live.glow.clear();
     }
 
     fn visible_cells(&self) -> Vec<usize> {
@@ -329,16 +334,37 @@ impl App {
         if id != self.cov.live.id {
             self.cov.clear_live(id.as_deref());
         }
+        // The connector's flags hold what ran since they were last cleared. They are read and
+        // cleared every screen refresh, so they say what ran since the last one (the glow),
+        // and are OR'd into `live.prg` for everything since the segment started.
         let Some(i) = s.core.coverage_region_index("PRG") else { return };
         let Some(flags) = s.core.coverage_slice(i) else { return };
-        if flags != self.cov.live.prg.as_slice() {
-            self.cov.live.prg.clear();
-            self.cov.live.prg.extend_from_slice(flags);
-            for c in self.cov.recount_live() {
-                self.cov.live.flash.insert(c, now);
+        if flags.iter().any(|b| *b != 0) {
+            let live = &mut self.cov.live;
+            if live.prg.len() < flags.len() {
+                live.prg.resize(flags.len(), 0);
+            }
+            let mut grew = false;
+            for (a, b) in live.prg.iter_mut().zip(flags) {
+                if *a | *b != *a {
+                    *a |= *b;
+                    grew = true;
+                }
+            }
+            for (cell, off) in &self.cov.unit_cells {
+                if flags.get(*off as usize).is_some_and(|b| b & FLAG_OPCODE != 0) {
+                    self.cov.live.glow.insert(*cell, now);
+                }
+            }
+            s.core.coverage_clear();
+            if grew {
+                for c in self.cov.recount_live() {
+                    self.cov.live.flash.insert(c, now);
+                }
             }
         }
         self.cov.live.flash.retain(|_, t| now - *t < FLASH_SECS);
+        self.cov.live.glow.retain(|_, t| now - *t < GLOW_SECS);
     }
 
     /// Clears the connector and live coverage, so live counts start again from here.
@@ -372,14 +398,141 @@ impl App {
         self.cov.hits = Some((cell, res));
     }
 
+    /// The ROM map at the bottom of the sidebar, shown whatever the tab: live coverage,
+    /// a legend, and one square per function (or slice of PRG).
+    pub(crate) fn coverage_map(&mut self, ui: &mut egui::Ui) {
+        ui.set_max_width(ui.available_width());
+        let now = ui.input(|i| i.time);
+        if !self.cov.live.flash.is_empty() || !self.cov.live.glow.is_empty() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if self.cov.report.is_none() {
+            let text = if self.hydrating.is_some() {
+                "Coverage updates when hydration finishes.".to_string()
+            } else {
+                self.cov.error.clone().unwrap_or_else(|| "No coverage yet.".into())
+            };
+            ui.label(RichText::new(text).small().weak());
+            return;
+        }
+        let mut pick: Option<usize> = None;
+        let mut refresh = false;
+        {
+            let cov = &self.cov;
+            let r = cov.report.as_ref().unwrap();
+            let w = ui.available_width();
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (color, label) in [(COVERED, "covered"), (EMPTY, "uncovered"), (UNREACHABLE, "unreachable"), (LIVE, "playing")] {
+                    let (rr, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rr, 1.0, color);
+                    ui.label(RichText::new(label).small().weak());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("⟳").on_hover_text(format!("Recount from the local database (took {} ms)", cov.took_ms)).clicked() {
+                        refresh = true;
+                    }
+                });
+            });
+
+            // Live.
+            if let Some(id) = &cov.live.id {
+                ui.horizontal(|ui| {
+                    let title = crate::col_title(self.col.as_ref(), id);
+                    let n = cov.live.new;
+                    let text = if n > 0 { RichText::new(format!("+{n} new while playing")).small().strong().color(LIVE) } else { RichText::new("No new code while playing").small().weak() };
+                    ui.label(text).on_hover_text(format!(
+                        "Code that \"{title}\" has run since it started playing (or was last edited) and that no segment that counts runs. It counts once the segment is clean and hydrated."
+                    ));
+                });
+            }
+            // The ROM map.
+            let gap = 1.0;
+            let avail = w;
+            // Squares as big as fit in the rest of the panel, between 5 and 16 px.
+            let fit_h = (ui.available_height() - 12.0).max(30.0);
+            let px = ((avail * fit_h / cov.cells.len().max(1) as f32).sqrt() - gap).floor().clamp(5.0, 16.0);
+            let cols = ((avail + gap) / (px + gap)).floor().max(1.0) as usize;
+            let rows = cov.cells.len().div_ceil(cols);
+            let map_h = rows as f32 * (px + gap);
+            let max_h = ui.available_height().max(20.0);
+            egui::ScrollArea::vertical().id_salt("cov_map").max_height(max_h).auto_shrink([false, false]).show(ui, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail, map_h), egui::Sense::click());
+                let p = ui.painter_at(rect);
+                let at = |i: usize| egui::Rect::from_min_size(rect.min + egui::vec2((i % cols) as f32 * (px + gap), (i / cols) as f32 * (px + gap)), egui::vec2(px, px));
+                for (i, c) in cov.cells.iter().enumerate() {
+                    let rr = at(i);
+                    if !ui.is_rect_visible(rr) {
+                        continue;
+                    }
+                    let live_new = cov.live.new_per_cell.get(i).copied().unwrap_or(0);
+                    let mut fill = cell_color(c, live_new);
+                    if let Some(t0) = cov.live.glow.get(&i) {
+                        // Ran just now: brighter, fading back over GLOW_SECS.
+                        fill = mix(fill, Color32::WHITE, 0.4 * (1.0 - (now - t0) / GLOW_SECS).clamp(0.0, 1.0) as f32);
+                    }
+                    p.rect_filled(rr, 1.0, fill);
+                    if let Some(t0) = cov.live.flash.get(&i) {
+                        let a = (1.0 - (now - t0) / FLASH_SECS).clamp(0.0, 1.0) as f32;
+                        p.rect_stroke(rr.expand(1.0), 1.0, egui::Stroke::new(1.5, Color32::WHITE.gamma_multiply(a)), egui::StrokeKind::Outside);
+                    }
+                    if cov.selected == Some(i) {
+                        p.rect_stroke(rr.expand(1.0), 1.0, egui::Stroke::new(1.5, ui.visuals().selection.stroke.color), egui::StrokeKind::Outside);
+                    }
+                }
+                let cell_at = |pos: egui::Pos2| -> Option<usize> {
+                    let v = pos - rect.min;
+                    if v.x < 0.0 || v.y < 0.0 {
+                        return None;
+                    }
+                    let (cx, cy) = ((v.x / (px + gap)) as usize, (v.y / (px + gap)) as usize);
+                    let i = cy * cols + cx;
+                    (cx < cols && i < cov.cells.len()).then_some(i)
+                };
+                if let Some(i) = resp.hover_pos().and_then(cell_at) {
+                    let c = &cov.cells[i];
+                    let live_new = cov.live.new_per_cell.get(i).copied().unwrap_or(0);
+                    resp.clone().on_hover_ui_at_pointer(|ui| {
+                        ui.label(RichText::new(&c.name).strong());
+                        if r.symbols {
+                            let addr = c.cpu_addr.map(|a| format!("${a:04X}  ")).unwrap_or_default();
+                            ui.label(RichText::new(format!("{addr}PRG:{:#x}, {} bytes", c.offset, c.size)).small().monospace());
+                            ui.label(format!("{} of {} instructions ({}), {} of {} blocks", c.covered, c.units, pct(c.covered, c.units), c.blocks_covered, c.blocks));
+                        } else {
+                            ui.label(format!("{} of {} bytes ran as an opcode", c.covered, c.units));
+                        }
+                        if live_new > 0 {
+                            ui.label(RichText::new(format!("+{live_new} while playing")).color(LIVE));
+                        }
+                        if c.unreachable > 0 {
+                            ui.label(RichText::new(format!("{} unreachable", c.unreachable)).color(UNREACHABLE));
+                        }
+                    });
+                }
+                if resp.clicked() {
+                    if let Some(i) = resp.interact_pointer_pos().and_then(cell_at) {
+                        pick = Some(i);
+                    }
+                }
+            });
+        }
+        if refresh {
+            self.cov.stale = true;
+        }
+        // A square opens its function in the Coverage tab.
+        if let Some(i) = pick {
+            self.side_tab = crate::SideTab::Coverage;
+            self.cov.selected = Some(i);
+            self.cov.scroll_to_selected = true;
+            self.load_hits(i);
+        }
+    }
+
     /// The Coverage tab.
     pub(crate) fn coverage_tab(&mut self, ui: &mut egui::Ui) {
         // Nothing here may widen the sidebar.
         ui.set_max_width(ui.available_width());
-        let now = ui.input(|i| i.time);
-        if !self.cov.live.flash.is_empty() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
-        }
         if self.session.is_none() {
             ui.label(RichText::new(self.core_error.clone().unwrap_or_else(|| "Coverage needs the ROM and the core.".into())).weak());
             return;
@@ -399,7 +552,6 @@ impl App {
         // (cell, picked on the map): a pick on the map scrolls the list to it.
         let mut pick: Option<(usize, bool)> = None;
         let mut go: Option<FirstHit> = None;
-        let mut refresh = false;
         {
             let cov = &self.cov;
             let r = cov.report.as_ref().unwrap();
@@ -445,96 +597,6 @@ impl App {
                     }
                 });
             }
-            // Live.
-            if let Some(id) = &cov.live.id {
-                ui.horizontal(|ui| {
-                    let title = crate::col_title(self.col.as_ref(), id);
-                    let n = cov.live.new;
-                    let text = if n > 0 { RichText::new(format!("+{n} new while playing")).small().strong().color(LIVE) } else { RichText::new("No new code while playing").small().weak() };
-                    ui.label(text).on_hover_text(format!(
-                        "Code that \"{title}\" has run since it started playing (or was last edited) and that no segment that counts runs. It counts once the segment is clean and hydrated."
-                    ));
-                });
-            }
-            ui.separator();
-
-            // The ROM map.
-            let gap = 1.0;
-            let avail = w;
-            // Squares as big as fit in about 140 px of height, between 5 and 16 px.
-            let px = ((avail * 140.0 / cov.cells.len().max(1) as f32).sqrt() - gap).floor().clamp(5.0, 16.0);
-            let cols = ((avail + gap) / (px + gap)).floor().max(1.0) as usize;
-            let rows = cov.cells.len().div_ceil(cols);
-            let map_h = rows as f32 * (px + gap);
-            let max_h = (ui.available_height() * 0.4).max(80.0);
-            egui::ScrollArea::vertical().id_salt("cov_map").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(avail, map_h), egui::Sense::click());
-                let p = ui.painter_at(rect);
-                let at = |i: usize| egui::Rect::from_min_size(rect.min + egui::vec2((i % cols) as f32 * (px + gap), (i / cols) as f32 * (px + gap)), egui::vec2(px, px));
-                for (i, c) in cov.cells.iter().enumerate() {
-                    let rr = at(i);
-                    if !ui.is_rect_visible(rr) {
-                        continue;
-                    }
-                    let live_new = cov.live.new_per_cell.get(i).copied().unwrap_or(0);
-                    p.rect_filled(rr, 1.0, cell_color(c, live_new));
-                    if let Some(t0) = cov.live.flash.get(&i) {
-                        let a = (1.0 - (now - t0) / FLASH_SECS).clamp(0.0, 1.0) as f32;
-                        p.rect_stroke(rr.expand(1.0), 1.0, egui::Stroke::new(1.5, Color32::WHITE.gamma_multiply(a)), egui::StrokeKind::Outside);
-                    }
-                    if cov.selected == Some(i) {
-                        p.rect_stroke(rr.expand(1.0), 1.0, egui::Stroke::new(1.5, ui.visuals().selection.stroke.color), egui::StrokeKind::Outside);
-                    }
-                }
-                let cell_at = |pos: egui::Pos2| -> Option<usize> {
-                    let v = pos - rect.min;
-                    if v.x < 0.0 || v.y < 0.0 {
-                        return None;
-                    }
-                    let (cx, cy) = ((v.x / (px + gap)) as usize, (v.y / (px + gap)) as usize);
-                    let i = cy * cols + cx;
-                    (cx < cols && i < cov.cells.len()).then_some(i)
-                };
-                if let Some(i) = resp.hover_pos().and_then(cell_at) {
-                    let c = &cov.cells[i];
-                    let live_new = cov.live.new_per_cell.get(i).copied().unwrap_or(0);
-                    resp.clone().on_hover_ui_at_pointer(|ui| {
-                        ui.label(RichText::new(&c.name).strong());
-                        if r.symbols {
-                            let addr = c.cpu_addr.map(|a| format!("${a:04X}  ")).unwrap_or_default();
-                            ui.label(RichText::new(format!("{addr}PRG:{:#x}, {} bytes", c.offset, c.size)).small().monospace());
-                            ui.label(format!("{} of {} instructions ({}), {} of {} blocks", c.covered, c.units, pct(c.covered, c.units), c.blocks_covered, c.blocks));
-                        } else {
-                            ui.label(format!("{} of {} bytes ran as an opcode", c.covered, c.units));
-                        }
-                        if live_new > 0 {
-                            ui.label(RichText::new(format!("+{live_new} while playing")).color(LIVE));
-                        }
-                        if c.unreachable > 0 {
-                            ui.label(RichText::new(format!("{} unreachable", c.unreachable)).color(UNREACHABLE));
-                        }
-                    });
-                }
-                if resp.clicked() {
-                    if let Some(i) = resp.interact_pointer_pos().and_then(cell_at) {
-                        pick = Some((i, true));
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                for (color, label) in [(COVERED, "covered"), (EMPTY, "uncovered"), (UNREACHABLE, "unreachable"), (LIVE, "playing")] {
-                    let (rr, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rr, 1.0, color);
-                    ui.label(RichText::new(label).small().weak());
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("⟳").on_hover_text(format!("Recount from the local database (took {} ms)", cov.took_ms)).clicked() {
-                        refresh = true;
-                    }
-                });
-            });
-
             // The selected cell.
             if let Some(i) = cov.selected.filter(|i| *i < cov.cells.len()) {
                 let c = &cov.cells[i];
@@ -635,9 +697,6 @@ impl App {
             }
         });
 
-        if refresh {
-            self.cov.stale = true;
-        }
         if let Some((i, from_map)) = pick {
             if self.cov.selected == Some(i) && !from_map {
                 self.cov.selected = None;

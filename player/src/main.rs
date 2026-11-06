@@ -47,7 +47,7 @@ enum Cmd {
         /// Core option overrides, KEY=VALUE
         #[arg(long = "option")]
         options: Vec<String>,
-        /// Symbol map to copy into symbols/ (a cc65 .dbg file or a CSV)
+        /// Symbol map to copy into symbols/ (cc65 .dbg, splat symbol_addrs.txt, Mesen .mlb, GNU ld .map, ELF or CSV)
         #[arg(long)]
         symbols: Option<PathBuf>,
     },
@@ -241,8 +241,8 @@ fn init(dir: &Path, name: &str, rom: &Path, core_path: &Path, core_build: Option
         std::fs::create_dir_all(dir.join("symbols"))?;
         let fname = s.file_name().ok_or_else(|| anyhow!("bad symbols path"))?;
         std::fs::copy(s, dir.join("symbols").join(fname))?;
-        let format = if s.extension().and_then(|e| e.to_str()) == Some("dbg") { "ca65-dbg" } else { "csv" };
-        syms.push(SymbolsConfig { file: format!("symbols/{}", fname.to_string_lossy()), format: format.into(), rom_header: None });
+        let format = decomp_dj::analysis::guess_format(s);
+        syms.push(SymbolsConfig { file: format!("symbols/{}", fname.to_string_lossy()), format: format.into(), rom_header: None, region: None, cpu_base: None });
     }
     let config = Config {
         format: 1,
@@ -506,18 +506,14 @@ fn where_cmd(dir: &Path, what: &str, local: &Local) -> Result<()> {
     } else {
         // A symbol name: needs the symbol map.
         let mut found = None;
+        let rom = local.rom.as_ref().and_then(|p| std::fs::read(p).ok());
         for sym in &col.config.symbols {
-            let path = col.root.join(&sym.file);
-            let funcs = match sym.format.as_str() {
-                "ca65-dbg" => decomp_dj::analysis::load_ca65_dbg(&path, sym.rom_header.unwrap_or(16))?,
-                "csv" => decomp_dj::analysis::load_csv(&path)?,
-                _ => continue,
-            };
+            let funcs = decomp_dj::analysis::load_symbols(&col.root, sym, rom.as_deref())?;
             if let Some(f) = funcs.iter().find(|f| f.name == what) {
-                found = Some(("PRG".to_string(), f.offset));
+                found = Some((f.region.clone(), f.offset));
+                break;
             }
         }
-        let _ = local;
         found.ok_or_else(|| anyhow!("{what} is not an offset (PRG:0x1234 or 0x1234) or a symbol in the collection's symbol maps"))?
     };
     let setup = latest_setup(&conn)?;

@@ -59,6 +59,11 @@ struct Playback {
     start_hash: Option<String>,
     /// Frames with a snapshot in the local database, for this content.
     stored: Vec<u64>,
+    /// First frame not run again since the last edit: from here to the end, what the
+    /// roll's ruler and the picture show may be out of date.
+    stale_from: Option<u64>,
+    /// The picture is from before the latest edit and is being recomputed.
+    picture_stale: bool,
 }
 
 impl Playback {
@@ -98,8 +103,8 @@ struct App {
     /// Frames per tick multiplier; 0 means as fast as possible.
     /// Index into SPEEDS.
     speed: usize,
-    /// At the end of a segment with exactly one child, carry on into it.
-    auto_continue: bool,
+    /// What playback does at the end of a segment.
+    end_mode: EndMode,
     /// Sticky children: remember the deepest segment visited on the selected chain.
     /// The deepest segment visited on the current chain (tracked even while sticky is off).
     sticky_tip: Option<String>,
@@ -125,6 +130,46 @@ struct App {
     stored_ids: HashSet<String>,
     /// Limit for in-memory snapshots of the current segment, in MB.
     max_memory_mb: u64,
+    /// Return to the edit: an edit pauses playback and shows the earliest frame edited
+    /// since playback last ran.
+    return_to_edit: bool,
+    /// The earliest frame of the current segment edited since playback last ran.
+    edit_from: Option<u64>,
+}
+
+/// What playback does when it reaches the end of a segment.
+#[derive(Clone, Copy, PartialEq)]
+enum EndMode {
+    /// Stop.
+    Stop,
+    /// Play the same segment again from frame 0.
+    Loop,
+    /// Carry on into the sticky child, or the only child.
+    Next,
+    /// Carry on down the segment list, in the tree's order.
+    List,
+}
+
+impl EndMode {
+    const ALL: [EndMode; 4] = [EndMode::Stop, EndMode::Loop, EndMode::Next, EndMode::List];
+
+    fn label(self) -> &'static str {
+        match self {
+            EndMode::Stop => "Stop",
+            EndMode::Loop => "Loop",
+            EndMode::Next => "Next",
+            EndMode::List => "List",
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            EndMode::Stop => "Stop at the end of each segment.",
+            EndMode::Loop => "Play the segment again from its first frame, until you stop it.",
+            EndMode::Next => "Carry on into the next segment: the child you came back up from (sticky), or the only child. Stops where a segment has several children and none is sticky, or where either side has unsaved changes.",
+            EndMode::List => "Carry on down the segment list in tree order, through every segment below and after this one (whether folded or filtered out), to the end of the list. With the tree focused on a segment (Focus here), it stops at the end of that segment's branch. Started on a root segment, it plays the whole tree.",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -211,7 +256,7 @@ impl Default for App {
             roll: roll::RollState::default(),
             message: None,
             speed: 2,
-            auto_continue: true,
+            end_mode: EndMode::Next,
             sticky_tip: None,
             route: vec![],
             route_target: None,
@@ -227,6 +272,8 @@ impl Default for App {
             hydrating: None,
             stored_ids: HashSet::new(),
             max_memory_mb: 512,
+            return_to_edit: true,
+            edit_from: None,
         }
     }
 }
@@ -683,7 +730,8 @@ impl App {
             c.put_snapshot(&start_hash, &snap)?;
         }
         let stored = s.stored_frames(col, id, &start_hash).unwrap_or_default();
-        self.pb = Some(Playback { id: id.to_string(), start_frame, frames, ran: 0, snapshots: BTreeMap::from([(0, snap)]), checkpoints, checkpoint_miss: None, end_hash: None, start_hash: Some(start_hash), stored });
+        self.pb = Some(Playback { id: id.to_string(), start_frame, frames, ran: 0, snapshots: BTreeMap::from([(0, snap)]), checkpoints, checkpoint_miss: None, end_hash: None, start_hash: Some(start_hash), stored, stale_from: None, picture_stale: false });
+        self.edit_from = None;
         self.coverage_restart_live();
         Ok(())
     }
@@ -785,6 +833,13 @@ impl App {
         }
         let frame = s.step(col, &pb.id, k, capture || k + 1 == pb.frames)?;
         pb.ran += 1;
+        // Frames run since the edit are up to date again.
+        if let Some(st) = pb.stale_from {
+            pb.stale_from = (pb.ran < pb.frames).then_some(st.max(pb.ran));
+        }
+        if frame.is_some() {
+            pb.picture_stale = false;
+        }
         if pb.ran == pb.frames {
             let h = s.state_hash(col)?;
             // The end state is where every child starts: keep it in the database.
@@ -872,6 +927,22 @@ impl App {
 
     fn step_by(&mut self, delta: i64) {
         self.playing = false;
+        // Stepping past either end crosses into the neighbour the roll shows there.
+        if let Some(pb) = &self.pb {
+            let at = pb.shown();
+            if delta < 0 && at.is_none_or(|f| f == 0) && self.job.is_none() {
+                if let Some(p) = self.col.as_ref().and_then(|c| c.replays.get(&pb.id)).and_then(|r| r.parent()).map(String::from) {
+                    self.segment_back(&p);
+                    return;
+                }
+            }
+            if delta > 0 && at.is_some_and(|f| f + 1 >= pb.frames) && self.job.is_none() {
+                if let Some(n) = self.next_neighbour() {
+                    self.segment_forward(&n);
+                    return;
+                }
+            }
+        }
         if let Some(cur) = self.pb.as_ref().and_then(|p| p.shown()) {
             let t = (cur as i64 + delta).max(0) as u64;
             self.seek(t);
@@ -912,6 +983,8 @@ impl App {
             self.clock = 0.0;
             return;
         }
+        // Playback is running: the next edit starts a new "since playback last ran".
+        self.edit_from = None;
         let speed = SPEEDS[self.speed].0;
         let res = if speed == 0.0 {
             // As fast as the core goes, drawing once per screen refresh.
@@ -964,14 +1037,22 @@ impl App {
                 self.playing = false;
                 return;
             }
-            match self.next_node() {
-                Some(child) if self.auto_continue => {
-                    if let Err(e) = self.continue_into(&child) {
-                        self.playing = false;
-                        self.error(e);
-                    }
+            match self.end_mode {
+                EndMode::Stop => self.playing = false,
+                EndMode::Loop => {
+                    self.seek(0);
+                    self.roll.follow_to(0);
                 }
-                _ => self.playing = false,
+                EndMode::Next => match self.next_node() {
+                    Some(child) => {
+                        if let Err(e) = self.continue_into(&child) {
+                            self.playing = false;
+                            self.error(e);
+                        }
+                    }
+                    None => self.playing = false,
+                },
+                EndMode::List => self.list_next(),
             }
         }
     }
@@ -1027,6 +1108,47 @@ impl App {
         Some(next)
     }
 
+    /// The segment the roll shows after the end of this one: the sticky child, or else the
+    /// only child.
+    fn next_neighbour(&self) -> Option<String> {
+        let (col, id) = (self.col.as_ref()?, self.selected.as_ref()?);
+        self.sticky_child(id).or_else(|| {
+            let kids = col.children(Some(id));
+            (kids.len() == 1).then(|| kids[0].to_string())
+        })
+    }
+
+    /// List mode, at the end of a segment: go on to the next segment in tree order (within
+    /// the focused branch, if the tree is focused), straight on into it when it is a child of
+    /// this one, otherwise from its parent's end state.
+    fn list_next(&mut self) {
+        let (Some(col), Some(pb)) = (&self.col, &self.pb) else { return };
+        let order: Vec<&str> = col.tree_order().into_iter().map(|(id, _)| id).collect();
+        let scope: Vec<&str> = match self.hoist.as_deref().filter(|h| col.replays.contains_key(*h)) {
+            Some(h) => order.iter().copied().filter(|id| col.chain(id).is_ok_and(|c| c.contains(&h))).collect(),
+            None => order,
+        };
+        let next = scope.iter().position(|id| *id == pb.id).and_then(|i| scope.get(i + 1)).map(|s| s.to_string());
+        let Some(next) = next else {
+            self.playing = false;
+            self.info(if self.hoist.is_some() { "List: reached the end of the focused branch" } else { "List: reached the end of the segment list" });
+            return;
+        };
+        let is_child = col.replays[&next].parent() == Some(pb.id.as_str());
+        if is_child {
+            if let Err(e) = self.continue_into(&next) {
+                self.playing = false;
+                self.error(e);
+            }
+        } else {
+            // A sibling of this segment or of an ancestor: select it (from its parent's
+            // stored end state, or by playing the chain) and keep playing once it is ready.
+            self.select(&next);
+            self.playing = self.pb.is_some() || self.job.is_some();
+            self.clock = 0.0;
+        }
+    }
+
     /// The sticky tip, if it still exists.
     fn tip(&self) -> Option<&str> {
         let t = self.sticky_tip.as_deref()?;
@@ -1073,7 +1195,8 @@ impl App {
         let r = &col.replays[child];
         let frames = r.frames().unwrap_or(0);
         let checkpoints = r.checkpoints().unwrap_or_default().into_iter().collect();
-        self.pb = Some(Playback { id: child.to_string(), start_frame, frames, ran: 0, snapshots: BTreeMap::from([(0, snap)]), checkpoints, checkpoint_miss: None, end_hash: None, start_hash, stored: vec![] });
+        self.pb = Some(Playback { id: child.to_string(), start_frame, frames, ran: 0, snapshots: BTreeMap::from([(0, snap)]), checkpoints, checkpoint_miss: None, end_hash: None, start_hash, stored: vec![], stale_from: None, picture_stale: false });
+        self.edit_from = None;
         self.selected = Some(child.to_string());
         self.roll.follow_to(0);
         self.coverage_restart_live();
@@ -1120,13 +1243,38 @@ impl App {
                 let cur = pb.shown();
                 // Live coverage starts again: the frames after the edit run differently now.
                 self.coverage_restart_live();
-                if let Some(cur) = cur {
-                    // Redraw the current frame from before the edit.
-                    if let Some(pb) = &mut self.pb {
-                        pb.ran = 0;
-                    }
-                    self.seek(cur);
-                }
+                self.show_after_edit(from, cur);
+            }
+        }
+    }
+
+    /// After the current segment changed from frame `from` on (its snapshots past `from`
+    /// already dropped), with `cur` the frame shown before the change: marks what is out of
+    /// date, then either returns to the edit (pauses, shows the earliest frame edited since
+    /// playback last ran) or redraws `cur`.
+    fn show_after_edit(&mut self, from: u64, cur: Option<u64>) {
+        let Some(pb) = &mut self.pb else { return };
+        pb.stale_from = Some(pb.stale_from.map_or(from, |s| s.min(from))).filter(|s| *s < pb.frames);
+        if cur.is_some_and(|c| c >= from) {
+            pb.picture_stale = true;
+        }
+        let last = pb.frames.saturating_sub(1);
+        let target = if self.return_to_edit {
+            self.playing = false;
+            let e = self.edit_from.map_or(from, |e| e.min(from));
+            self.edit_from = Some(e);
+            Some(e.min(last))
+        } else {
+            cur
+        };
+        if let Some(t) = target {
+            // Run again from a snapshot at or before the edit.
+            if let Some(pb) = &mut self.pb {
+                pb.ran = 0;
+            }
+            self.seek(t);
+            if self.return_to_edit {
+                self.roll.follow_to(t);
             }
         }
     }
@@ -1248,10 +1396,8 @@ impl App {
                 pb.checkpoints = checkpoints;
                 pb.checkpoint_miss = None;
                 pb.end_hash = None;
-                pb.ran = 0;
-                let f = here.unwrap_or(0);
-                self.seek(f);
             }
+            self.show_after_edit(from, here);
         }
         self.refresh_frame_dialog();
         reverse
@@ -1941,6 +2087,7 @@ impl App {
                     self.roll.zoom(1.0 / 1.5);
                 }
                 ui.checkbox(&mut self.roll.follow, "Follow playhead");
+                ui.checkbox(&mut self.return_to_edit, "Return to the edit").on_hover_text("Any edit pauses playback and shows the earliest frame edited since playback last ran. Off: the frame you were on is redrawn.");
                 ui.checkbox(&mut self.roll.all_buttons, "Show every joypad button");
                 ui.add_enabled(false, egui::Checkbox::new(&mut false, "Second core side by side")).on_disabled_hover_text("Coming later");
             });
@@ -2615,14 +2762,20 @@ impl App {
             if let Some(k) = pick {
                 self.segment_forward(&k);
             }
-            let tip = if self.auto_continue {
-                "Continue is on: at the end of a segment, playback carries on into the next one (the only child, or the child you came back up from), as long as neither has unsaved changes. Click to stop at the end of each segment instead."
-            } else {
-                "Continue is off: playback stops at the end of each segment. Click to carry on into the next one (the only child, or the child you came back up from) automatically."
-            };
-            if ui.add(egui::Button::selectable(self.auto_continue, "↪").min_size(egui::vec2(24.0, icon.y))).on_hover_text(tip).clicked() {
-                self.auto_continue = !self.auto_continue;
-            }
+            // What happens at the end of a segment.
+            ui.allocate_ui_with_layout(egui::vec2(64.0, icon.y), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let cur = self.end_mode;
+                egui::ComboBox::from_id_salt("end_mode")
+                    .selected_text(cur.label())
+                    .width(60.0)
+                    .show_ui(ui, |ui| {
+                        for m in EndMode::ALL {
+                            ui.selectable_value(&mut self.end_mode, m, m.label()).on_hover_text(m.tip());
+                        }
+                    })
+                    .response
+                    .on_hover_text("Behavior at the end of the segment");
+            });
             ui.separator();
 
             // Speed.
@@ -2735,6 +2888,11 @@ impl App {
         }
         let rect = egui::Rect::from_center_size(avail.center(), size * scale);
         ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        // A frame from before the latest edit, while the new one is worked out.
+        if self.pb.as_ref().is_some_and(|p| p.picture_stale) {
+            ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(150));
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "recomputing after the edit…", egui::FontId::proportional(14.0), Color32::from_gray(220));
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -2919,12 +3077,23 @@ impl eframe::App for App {
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::bottom("status").exact_size(24.0).show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("tree").resizable(true).default_size(300.0).size_range(180.0..=600.0).show(ui, |ui| self.tree(ui));
+        egui::Panel::left("tree").resizable(true).default_size(300.0).size_range(180.0..=600.0).show(ui, |ui| {
+            // The coverage map stays at the bottom of the sidebar, whatever the tab.
+            if self.col.is_some() && self.session.is_some() {
+                egui::Panel::bottom("cov_map").resizable(true).default_size(170.0).size_range(60.0..=600.0).show(ui, |ui| self.coverage_map(ui));
+            }
+            self.tree(ui)
+        });
         let mut action = None;
         egui::Panel::bottom("roll").resizable(true).default_size(300.0).size_range(120.0..=900.0).show(ui, |ui| {
             if let (Some(col), Some(id)) = (&self.col, &self.selected) {
                 let shown = self.pb.as_ref().and_then(|p| p.shown());
-                action = self.roll.show(ui, col, id, shown, self.playing);
+                let nb = roll::Neighbours {
+                    prev: col.replays.get(id).and_then(|r| r.parent()).map(String::from),
+                    next: self.next_neighbour(),
+                    stale_from: self.pb.as_ref().filter(|p| &p.id == id).and_then(|p| p.stale_from),
+                };
+                action = self.roll.show(ui, col, id, shown, self.playing, &nb);
             } else {
                 ui.label("Select a segment to see its inputs.");
             }

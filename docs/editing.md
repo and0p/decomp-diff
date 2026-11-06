@@ -1,0 +1,133 @@
+# Editing
+
+How the tree and a segment's inputs change. The tree edits are normative: any tool that
+makes the same edit must write the same files. The GUI is the only tool that makes them
+today. `dj new <dir> [--parent ID] [--title TEXT] [--frames N]` adds a segment from the
+command line and prints its path.
+
+## Tree edits
+**New child.** A new segment with `parent` set to the segment, a fresh id, no
+hashes, and a length chosen by the author. It starts where the segment ends.
+
+**Split at frame `f`** (`0 < f < frames`). One segment becomes two:
+
+- The **second part** keeps the segment's id, title, tags, children and
+  `end-hash`. Its body is the segment's lines from frame `f` on, renumbered from 0,
+  and its `frames` is the old length minus `f`. Its `parent` becomes the first
+  part. Checkpoints after `f` move to it, renumbered. It loses `snapshot` and
+  `sram`, because only a root segment may name blobs.
+- The **first part** gets a new id and takes the segment's old place under its
+  parent. It keeps frames `0..f`, the earlier checkpoints, and any `snapshot` or
+  `sram`. By default its title is the old title plus "(first f frames)".
+- The state hash at the cut (at the start of frame `f`, after the first part
+  has run) becomes the first part's `end-hash` and the second part's
+  `start-hash`. Because the same frames still run with the same inputs, the
+  second part and everything below it stay clean.
+- Every segment starts with all inputs released ([frames](segments.md#frames)). So for each
+  input held across the cut, the second part gets a line at frame 0 that sets
+  it again.
+
+Keeping the id on the second part means children and outside references to the
+segment stay valid. Coverage is stored by content key ([database.md](database.md)), so both parts
+get new keys and their coverage is recorded again the next time they are played.
+
+**Branch at frame `f`.** A split at `f`, plus a new empty child of the first
+part, so that a second path starts at the cut.
+
+**Join with parent** (only for a segment that is its parent's only child), the
+inverse of a split. The parent keeps its id, title and place, and grows by the
+child's `frames`. The child's lines follow the parent's, shifted by the parent's old
+length, with a release at the join for any input the parent still held (as a segment
+start would do). The child's children become the parent's, the parent takes the
+child's `end-hash` and later checkpoints, and the child's `start-hash` becomes a
+checkpoint at the join frame. The same frames run with the same inputs, so every hash
+below stays valid. Tools may add an `[EVENT]` at the join frame, by default named
+after the child, to keep the moment the split marked.
+
+**Delete.** Removes a segment and everything below it.
+
+**Properties.** Changing `title` changes no state. Changing `frames` drops the
+`end-hash` and any checkpoints past the new end. A segment cannot be shortened
+past its last body line.
+
+## What an edit does to hashes
+
+Changing an input or a `[WRITE]` drops the segment's `end-hash` and every checkpoint after
+the first edited frame, because those states are no longer known. The segment turns
+unverified and everything below it dirty, until it is played and the new hashes are
+accepted ([playback.md](playback.md#clean-dirty-and-unverified)). Editing only `[EVENT]`
+lines changes no state, so it keeps every hash.
+
+## In the GUI
+
+Edits stay in memory until File > Save (Ctrl/Cmd+S). Edited segments show in yellow
+italics in the tree until then. There is no warning yet before unsaved edits are lost on
+Open, Reload or Quit.
+
+### Segment menu
+
+The Segment menu, and right-click in the tree, offer:
+
+- **Play to here** (right-click only): plays through to the end of that segment, on from the playhead if the current segment is on the way, otherwise from the first segment below where the two paths meet.
+- **New child at end**.
+- **Branch at playhead**: splits the segment right after the playhead and starts an empty second path beside the rest.
+- **Split at playhead**: just the split. The first part becomes "(first N frames)" in the old place.
+- **Properties**: title and length.
+- **Join with parent** (only for a segment with no siblings): the confirmation has "Leave a marker", on by default, with an editable text that starts as the child's title. An event at the join frame keeps whatever moment made the author split there ("menu fully open", "victory pose finished").
+- **Delete…**: removes the segment and everything below it, after a confirmation that names the segment, says how many segments go with it and gives the total frames. The files are removed on Save. If the segment being shown was deleted, its parent is shown.
+
+In the tree, Enter (or F2) renames the selected segment in place; Enter or clicking away
+keeps the new name, Escape cancels. Segments can't be moved to another parent from the GUI
+yet.
+
+### Piano roll
+
+The bottom of the window. Time runs left to right, with one row per button, grouped by
+controller. Groups the segment uses are tinted and open, unused ones dimmed and closed;
+click a group name to open or close it. A closed group still shows when any of its buttons
+are held. Only button inputs get rows; analog, lightgun and pointer inputs show as ticks on
+their controller's header.
+
+- Wheel or trackpad over the timeline scrolls time; Ctrl/Cmd+wheel zooms at the pointer; wheel over the names scrolls rows; "fit" shows the whole segment.
+- Click or drag on the ruler to seek.
+- **Neighbours.** Left of frame 0 the roll shows the end of the parent segment, and past the last frame the start of the next one (the sticky segment, or the only child), faded and read-only, with their titles in the marker lane and their own frame numbers on the ruler. Clicking or dragging there does nothing. Only stepping (the arrow keys or the step buttons), playing on, or the start and end buttons cross the boundary, and that switches over fully: the other segment becomes the selected one, so it can be edited. The view stays put as you cross. No edit ever spans two segments.
+- There is one editing mode (hover the ⓘ in the roll's toolbar for a summary):
+    - Click an empty cell to add a press as long as the last press made or resized (4 frames to begin with).
+    - Drag a press to move it in time, and drag either edge to lengthen or shorten it (only while at most one press is selected; the grab zone is a thin strip on the edge). Plain drags never change rows.
+    - Transpose (move presses to another button row of the same controller) only on purpose: hold Alt (Option on a Mac) while dragging, or press Alt+Up / Alt+Down with presses selected.
+    - Click selects a press; Shift+click adds or removes it. Drag on empty space to select an area (with Shift it adds, with Shift+Alt it removes).
+    - Right-click a press, or press Delete, to remove it. Escape clears the selection. Presses that end up overlapping merge into one. Holding a drag near either end of the roll scrolls it.
+
+### Return to the edit
+
+With View > **Return to the edit** on (the default), any edit pauses playback and shows the
+earliest frame edited since playback last ran, worked out again with the change. Several
+edits in a row keep the playhead on the earliest of them. Turned off, an edit redraws the
+frame you were on instead.
+
+Either way, frames that haven't run since the last edit get an amber band on the ruler,
+which shrinks as playback runs through them. While the picture still shows a frame from
+before the edit and the new one is being worked out, it is dimmed.
+
+### Markers
+
+The marker lane, above the button rows, shows events, RAM writes, `[DEVICE]` and
+`[RESET]` lines, screenshots and checkpoints. Click "markers" in the label column to open
+or close it, like a controller.
+
+- Closed, it is one row: markers on one frame share a box, and markers too close together hide behind the most important one (events first), which shows "+N" for the rest.
+- Open, every marker gets its own box with its whole label: events in the top rows, writes and everything else below. Labels run until the next marker in their row.
+- Hover for all markers at that spot; click one to edit, delete or add lines on that frame. **E** adds an event at the playhead.
+
+### Undo, cut, copy and paste
+
+Edit > **Undo** / **Redo** (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z or Ctrl+Y) cover every edit: note
+edits, cut and paste, frame lines, renames, segment properties, accepting an end hash, new
+segments, splits, branches, joins and deletes. The history holds 200 steps and is cleared
+when a project is opened or reloaded. A segment removed by undo has its file deleted on the
+next Save.
+
+**Cut**, **Copy** and **Paste** (Ctrl/Cmd+X/C/V) work on the notes selected in the piano
+roll. The copy is kept inside the app, and the notes also go on the system clipboard as
+input lines with frames relative to the first note. Paste puts the leftmost copied note at
+the play cursor and selects what it pasted.

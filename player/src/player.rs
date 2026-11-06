@@ -1,4 +1,4 @@
-//! Plays replays on a loaded core (.agents/SPEC.md sections 5 and 6).
+//! Plays replays on a loaded core (docs/playback.md).
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap};

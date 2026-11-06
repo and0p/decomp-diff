@@ -545,6 +545,7 @@ dependencies = [
  "blake3",
  "clap",
  "libloading",
+ "object",
  "png 0.17.16",
  "rusqlite",
  "serde",
@@ -1850,6 +1851,15 @@ dependencies = [
  "objc2 0.5.3",
  "objc2-core-location",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "object"
+version = "0.36.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

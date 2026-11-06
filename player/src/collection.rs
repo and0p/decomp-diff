@@ -1,4 +1,4 @@
-//! A project on disk: config.toml, segments/, blobs/ (.agents/SPEC.md sections 1, 2, 4, 8).
+//! A project on disk: config.toml, segments/, blobs/ (docs/segments.md, docs/config.md).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -63,10 +63,21 @@ pub struct TickConfig {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SymbolsConfig {
     pub file: String,
+    /// `ca65-dbg`, `csv`, `splat`, `mesen-mlb`, `ld-map` or `elf` (docs/coverage.md).
     pub format: String,
-    /// Bytes before PRG data in the ROM file (16 for iNES).
-    #[serde(default)]
+    /// Bytes before the region's data in the ROM file: 16 for an iNES header. By default 16
+    /// for an iNES ROM and 0 otherwise. Subtracted from file offsets (`ca65-dbg`, `splat`,
+    /// `ld-map`, `elf`), and skipped when disassembling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rom_header: Option<u64>,
+    /// Coverage region the offsets belong to, as the connector names it (default PRG).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// CPU address of region offset 0, for formats that give no CPU addresses
+    /// (`mesen-mlb`, `csv` without one), so branch targets resolve. For example
+    /// 0x8000 for a 32 KB NROM game.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_base: Option<u64>,
 }
 
 /// Local, uncommitted settings: where the ROM and core live on this machine.
@@ -264,7 +275,7 @@ impl Collection {
         out
     }
 
-    /// Status worked out from hashes alone (.agents/SPEC.md section 8).
+    /// Status worked out from hashes alone (docs/playback.md, "Clean, dirty and unverified").
     pub fn status(&self, id: &str) -> Status {
         let r = &self.replays[id];
         if let (Some(p), Some(start)) = (r.parent(), r.get("start-hash")) {

@@ -1,5 +1,5 @@
 //! Symbol maps and static analysis used to roll byte coverage up into
-//! instructions, basic blocks and functions (.agents/SPEC.md section 9).
+//! instructions, basic blocks and functions (docs/coverage.md).
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeSet, HashMap};
@@ -235,6 +235,240 @@ pub fn load_csv(path: &Path) -> Result<Vec<Function>> {
     Ok(out)
 }
 
+// ---- loading by format ----------------------------------------------------------
+
+/// The format `dj init` assumes from a symbol file's name.
+pub fn guess_format(path: &Path) -> &'static str {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "dbg" => "ca65-dbg",
+        "mlb" => "mesen-mlb",
+        "map" => "ld-map",
+        "elf" | "o" => "elf",
+        _ if name.contains("symbol_addrs") => "splat",
+        _ => "csv",
+    }
+}
+
+/// Bytes before the region's data in `rom` when the config doesn't say: an iNES header is 16.
+pub fn default_rom_header(format: &str, rom: Option<&[u8]>) -> u64 {
+    match rom {
+        Some(r) if r.starts_with(b"NES\x1a") => 16,
+        Some(_) => 0,
+        // No ROM to look at: cc65 projects are NES projects.
+        None => if format == "ca65-dbg" { 16 } else { 0 },
+    }
+}
+
+/// Loads one `[[symbols]]` entry. `rom` is used only to tell whether it has an iNES header.
+pub fn load_symbols(root: &Path, cfg: &crate::collection::SymbolsConfig, rom: Option<&[u8]>) -> Result<Vec<Function>> {
+    let path = root.join(&cfg.file);
+    let header = cfg.rom_header.unwrap_or_else(|| default_rom_header(&cfg.format, rom));
+    let region = cfg.region.clone().unwrap_or_else(|| "PRG".into()).to_ascii_uppercase();
+    let mut funcs = match cfg.format.as_str() {
+        "ca65-dbg" => load_ca65_dbg(&path, header)?,
+        "csv" => load_csv(&path)?,
+        "splat" => load_splat(&path, header, &region)?,
+        "mesen-mlb" => load_mesen_mlb(&path, &region)?,
+        "ld-map" => load_ld_map(&path, header, &region)?,
+        "elf" => load_elf(&path, header, &region)?,
+        other => bail!("unknown symbols format {other} (expected ca65-dbg, csv, splat, mesen-mlb, ld-map or elf)"),
+    };
+    if let Some(base) = cfg.cpu_base {
+        for f in &mut funcs {
+            if f.cpu_addr.is_none() {
+                f.cpu_addr = Some(base + f.offset);
+            }
+        }
+    }
+    if funcs.is_empty() {
+        bail!("{} has no function symbols", path.display());
+    }
+    Ok(funcs)
+}
+
+/// Largest size given to a function whose size isn't known and that has no next symbol.
+const LAST_FUNCTION_MAX: u64 = 0x1000;
+
+/// Sorts by offset, drops repeats of an offset (the first one wins), and gives every
+/// function without a size (0) the bytes up to the next function, capped by `limit(f)`.
+fn finish(mut funcs: Vec<Function>, limit: impl Fn(&Function) -> Option<u64>) -> Vec<Function> {
+    funcs.sort_by_key(|f| f.offset);
+    funcs.dedup_by_key(|f| (f.region.clone(), f.offset));
+    let starts: Vec<u64> = funcs.iter().map(|f| f.offset).collect();
+    for (i, f) in funcs.iter_mut().enumerate() {
+        if f.size == 0 {
+            let next = starts.get(i + 1).copied().unwrap_or(f.offset + LAST_FUNCTION_MAX);
+            let end = limit(f).map_or(next, |l| next.min(l));
+            f.size = end.saturating_sub(f.offset);
+        }
+    }
+    funcs.retain(|f| f.size > 0);
+    funcs
+}
+
+fn hex_u64(s: &str) -> Option<u64> {
+    let t = s.trim();
+    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    u64::from_str_radix(t, 16).ok()
+}
+
+/// splat's `symbol_addrs.txt`: `name = 0x80001234; // type:func rom:0x1234 size:0x40`.
+/// Every entry with a `rom:` offset counts, unless it has a `type:` other than `func`
+/// or says `ignore:true`. Entries without `size:` run to the next symbol.
+pub fn load_splat(path: &Path, rom_header: u64, region: &str) -> Result<Vec<Function>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut out = vec![];
+    for line in text.lines() {
+        let (code, attrs) = match line.split_once("//") {
+            Some((c, a)) => (c, a),
+            None => (line, ""),
+        };
+        let Some((name, val)) = code.split_once('=') else { continue };
+        let name = name.trim();
+        let Some(vram) = hex_u64(val.trim().trim_end_matches(';')) else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        let mut rom = None;
+        let mut size = 0;
+        let mut skip = false;
+        for kv in attrs.split_whitespace() {
+            let Some((k, v)) = kv.split_once(':') else { continue };
+            match k {
+                "rom" => rom = hex_u64(v),
+                "size" => size = hex_u64(v).unwrap_or(0),
+                "type" => skip |= v != "func",
+                "ignore" => skip |= v == "true",
+                _ => {}
+            }
+        }
+        let (Some(rom), false) = (rom, skip) else { continue };
+        let Some(offset) = rom.checked_sub(rom_header) else { continue };
+        out.push(Function { name: name.to_string(), region: region.to_string(), offset, size, cpu_addr: Some(vram) });
+    }
+    Ok(finish(out, |_| None))
+}
+
+/// Mesen label file (`.mlb`): `P:1F3A:name` or `P:1F3A:name:comment`, offsets in hex
+/// relative to the start of PRG ROM. Mesen 2 writes `NesPrgRom:1F3A:name` (and
+/// `SnesPrgRom`, `GbPrgRom`, ...). Only single-address PRG labels count; ranges
+/// (`P:1F3A-1F40:table`) are data. Each runs to the next label.
+pub fn load_mesen_mlb(path: &Path, region: &str) -> Result<Vec<Function>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut out = vec![];
+    for line in text.lines() {
+        let mut parts = line.splitn(4, ':');
+        let (Some(kind), Some(addr), Some(name)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        let is_prg = kind == "P" || kind.ends_with("PrgRom");
+        let name = name.trim();
+        if !is_prg || name.is_empty() || addr.contains('-') {
+            continue;
+        }
+        let Some(offset) = hex_u64(addr) else { continue };
+        out.push(Function { name: name.to_string(), region: region.to_string(), offset, size: 0, cpu_addr: None });
+    }
+    Ok(finish(out, |_| None))
+}
+
+/// A GNU ld map file (`-Map=out.map`). Symbols in input sections whose names start
+/// with `.text` count as functions. A symbol's ROM offset is its address moved from
+/// the output section's address to its load address (`load address 0x...`, which
+/// N64 and other decomp linker scripts use for ROM offsets), less `rom_header`.
+/// Each runs to the next symbol, within its input section.
+pub fn load_ld_map(path: &Path, rom_header: u64, region: &str) -> Result<Vec<Function>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // Output section: (address, load address).
+    let mut out_sec: Option<(u64, u64)> = None;
+    // Input section: is code, start and end address.
+    let mut in_sec: Option<(bool, u64, u64)> = None;
+    let mut pending_name: Option<(bool, String)> = None;
+    let mut syms: Vec<(Function, u64)> = vec![];
+    let in_map = text.find("Linker script and memory map").map_or(0, |i| i);
+    for line in text[in_map..].lines() {
+        let indented = line.starts_with(' ');
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.is_empty() {
+            continue;
+        }
+        // A section name too long for its column puts the numbers on the next line.
+        let (words, top, name): (Vec<&str>, bool, Option<String>) = match pending_name.take() {
+            Some((top, name)) if words[0].starts_with("0x") => (words, top, Some(name)),
+            _ if words.len() == 1 && words[0].starts_with('.') => {
+                pending_name = Some((!indented, words[0].to_string()));
+                continue;
+            }
+            _ if words[0].starts_with('.') || (!indented && !words[0].starts_with("0x")) => {
+                let n = words[0].to_string();
+                (words[1..].to_vec(), !indented, Some(n))
+            }
+            _ => (words, false, None),
+        };
+        match name {
+            Some(name) if !words.is_empty() => {
+                let (Some(addr), Some(size)) = (words.first().and_then(|w| hex_u64(w)), words.get(1).and_then(|w| hex_u64(w))) else { continue };
+                if top {
+                    let lma = words.iter().position(|w| *w == "address").and_then(|i| words.get(i + 1)).and_then(|w| hex_u64(w)).unwrap_or(addr);
+                    out_sec = Some((addr, lma));
+                    in_sec = None;
+                } else {
+                    in_sec = Some((name.starts_with(".text"), addr, addr + size));
+                }
+            }
+            Some(_) => {}
+            None => {
+                // `0x80001234  name`: a symbol, unless it is an assignment.
+                if words.len() != 2 || words[1].contains('=') || words[1].contains('(') {
+                    continue;
+                }
+                let (Some(addr), Some((true, _, end)), Some((vma, lma))) = (hex_u64(words[0]), in_sec, out_sec) else { continue };
+                let Some(offset) = (addr.wrapping_sub(vma).wrapping_add(lma)).checked_sub(rom_header) else { continue };
+                let end_off = end.wrapping_sub(vma).wrapping_add(lma).saturating_sub(rom_header);
+                syms.push((Function { name: words[1].to_string(), region: region.to_string(), offset, size: 0, cpu_addr: Some(addr) }, end_off));
+            }
+        }
+    }
+    let ends: HashMap<u64, u64> = syms.iter().map(|(f, e)| (f.offset, *e)).collect();
+    Ok(finish(syms.into_iter().map(|(f, _)| f).collect(), |f| ends.get(&f.offset).copied()))
+}
+
+/// An ELF file built from the decomp: its function symbols (`STT_FUNC`), with their sizes.
+/// A symbol's ROM offset is its address moved from the program segment's virtual address
+/// to its physical (load) address, less `rom_header`; without program headers, its address.
+pub fn load_elf(path: &Path, rom_header: u64, region: &str) -> Result<Vec<Function>> {
+    use object::read::elf::{ElfFile, FileHeader, ProgramHeader};
+    use object::{Object, ObjectSymbol, SymbolKind};
+    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    fn read<H: FileHeader>(data: &[u8], rom_header: u64, region: &str) -> Result<Vec<Function>> {
+        let file = ElfFile::<H>::parse(data)?;
+        let e = file.endian();
+        let segs: Vec<(u64, u64, u64)> = file
+            .elf_program_headers()
+            .iter()
+            .filter(|p| p.p_memsz(e).into() > 0)
+            .map(|p| (p.p_vaddr(e).into(), p.p_paddr(e).into(), p.p_memsz(e).into()))
+            .collect();
+        let mut out = vec![];
+        for sym in file.symbols() {
+            if sym.kind() != SymbolKind::Text || !sym.is_definition() {
+                continue;
+            }
+            let Ok(name) = sym.name() else { continue };
+            let addr = sym.address();
+            let load = segs.iter().find(|(v, _, n)| addr >= *v && addr < v + n).map_or(addr, |(v, p, _)| addr - v + p);
+            let Some(offset) = load.checked_sub(rom_header) else { continue };
+            out.push(Function { name: name.to_string(), region: region.to_string(), offset, size: sym.size(), cpu_addr: Some(addr) });
+        }
+        Ok(finish(out, |_| None))
+    }
+    match object::FileKind::parse(&*data)? {
+        object::FileKind::Elf32 => read::<object::elf::FileHeader32<object::Endianness>>(&data, rom_header, region),
+        object::FileKind::Elf64 => read::<object::elf::FileHeader64<object::Endianness>>(&data, rom_header, region),
+        k => bail!("{} is not an ELF file ({k:?})", path.display()),
+    }
+}
+
 // ---- 6502 ---------------------------------------------------------------------
 
 /// Instruction length for each 6502 opcode, including the stable undocumented ones.
@@ -384,5 +618,92 @@ mod tests {
         let a = &analyze_6502(&[f], &rom)[0];
         let starts: Vec<u64> = a.blocks.iter().map(|b| b.offset).collect();
         assert_eq!(starts, vec![0, 6, 9, 10]);
+    }
+
+    fn temp(name: &str, text: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("dj-sym-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    fn summary(f: &[Function]) -> Vec<(String, u64, u64, Option<u64>)> {
+        f.iter().map(|f| (f.name.clone(), f.offset, f.size, f.cpu_addr)).collect()
+    }
+
+    #[test]
+    fn splat_symbol_addrs() {
+        let p = temp(
+            "symbol_addrs.txt",
+            "// comment line\n\
+             func_80000400 = 0x80000400; // type:func rom:0x1000 size:0x20\n\
+             main_loop = 0x80000420; // rom:0x1020\n\
+             D_80002000 = 0x80002000; // type:data rom:0x3000\n\
+             no_rom = 0x80000500; // type:func\n\
+             skipped = 0x80000460; // type:func rom:0x1060 ignore:true\n\
+             caller = 0x80000480; // type:func rom:0x1080 size:0x10\n",
+        );
+        let f = load_splat(&p, 0, "ROM").unwrap();
+        assert_eq!(
+            summary(&f),
+            vec![("func_80000400".into(), 0x1000, 0x20, Some(0x80000400)), ("main_loop".into(), 0x1020, 0x60, Some(0x80000420)), ("caller".into(), 0x1080, 0x10, Some(0x80000480))]
+        );
+        assert_eq!(f[0].region, "ROM");
+    }
+
+    #[test]
+    fn mesen_labels() {
+        let p = temp("game.mlb", "P:0197:doStateAction\nP:0100:reset:Power-on\\nentry\nR:0021:frameCount\nP:0200-020F:table\nNesPrgRom:0300:nmi\nP:0250:\n");
+        let f = load_mesen_mlb(&p, "PRG").unwrap();
+        assert_eq!(summary(&f), vec![("reset".into(), 0x100, 0x97, None), ("doStateAction".into(), 0x197, 0x169, None), ("nmi".into(), 0x300, LAST_FUNCTION_MAX, None)]);
+    }
+
+    #[test]
+    fn ld_map() {
+        // As GNU ld 2.42 writes it, including a name too long for its column.
+        let map = r#"Memory Configuration
+
+Name             Origin             Length             Attributes
+*default*        0x0000000000000000 0xffffffffffffffff
+
+Linker script and memory map
+
+
+.main           0x0000000080000400       0x3c load address 0x0000000000001000
+ *(.text)
+ .text          0x0000000080000400        0x0 a.o
+ *(.text.*)
+ .text.helper   0x0000000080000400        0x9 a.o
+                0x0000000080000400                helper
+ .text.main_loop
+                0x0000000080000409       0x29 a.o
+                0x0000000080000409                main_loop
+ .text.caller   0x0000000080000432        0xa a.o
+                0x0000000080000432                caller
+                0x0000000080000440                . = ALIGN (0x10)
+
+.data           0x0000000080002000        0x8 load address 0x0000000000003000
+ .data          0x0000000080002000        0x8 a.o
+                0x0000000080002000                some_table
+
+/DISCARD/
+ *(*)
+LOAD a.o
+OUTPUT(a.elf elf64-x86-64)
+"#;
+        let p = temp("a.map", map);
+        let f = load_ld_map(&p, 0, "ROM").unwrap();
+        assert_eq!(summary(&f), vec![("helper".into(), 0x1000, 9, Some(0x80000400)), ("main_loop".into(), 0x1009, 0x29, Some(0x80000409)), ("caller".into(), 0x1032, 0xa, Some(0x80000432))]);
+    }
+
+    #[test]
+    fn formats_from_names() {
+        assert_eq!(guess_format(Path::new("x/thwaite.dbg")), "ca65-dbg");
+        assert_eq!(guess_format(Path::new("symbol_addrs.txt")), "splat");
+        assert_eq!(guess_format(Path::new("game.mlb")), "mesen-mlb");
+        assert_eq!(guess_format(Path::new("build/us.map")), "ld-map");
+        assert_eq!(guess_format(Path::new("build/us.elf")), "elf");
+        assert_eq!(guess_format(Path::new("funcs.csv")), "csv");
     }
 }

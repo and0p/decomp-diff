@@ -1,4 +1,4 @@
-//! Local coverage database and reports (.agents/SPEC.md section 9).
+//! Local coverage database and reports (docs/coverage.md).
 
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
@@ -115,7 +115,7 @@ fn opcode_set(flags: &[u8]) -> Vec<bool> {
 }
 
 /// Coverage of the collection as it is now, from the local database: every segment that
-/// isn't dirty and has been played with its current content counts (.agents/SPEC.md, "Coverage").
+/// isn't dirty and has been played with its current content counts (docs/coverage.md).
 /// `setup` picks the setup (ROM, core and options) to report on; by default, the one played last.
 pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>, setup: Option<&str>) -> Result<Report> {
     let setup: String = match setup {
@@ -152,20 +152,23 @@ pub fn build_report(col: &Collection, conn: &Connection, rom: Option<&[u8]>, set
     let unreachable = cache::load_unreachable(col)?;
     let is_unreachable = |off: u64| unreachable.iter().any(|u| u.region == "PRG" && off >= u.start && off <= u.end);
 
-    // Symbols -> analyzed functions (PRG only for now, 6502).
+    // Symbols -> analyzed functions (PRG only for now, 6502). With several symbol maps, the
+    // first one listed wins where two describe the same bytes.
     let mut analyzed: Vec<AnalyzedFunction> = vec![];
+    let mut taken: Vec<(u64, u64)> = vec![];
     for s in &col.config.symbols {
-        let path = col.root.join(&s.file);
-        let funcs = match s.format.as_str() {
-            "ca65-dbg" => analysis::load_ca65_dbg(&path, s.rom_header.unwrap_or(16))?,
-            "csv" => analysis::load_csv(&path)?,
-            other => bail!("unknown symbols format {other}"),
-        };
+        let funcs = analysis::load_symbols(&col.root, s, rom)?;
+        let funcs: Vec<_> = funcs.into_iter().filter(|f| f.region == "PRG" && !taken.iter().any(|(a, b)| f.offset < *b && f.offset + f.size > *a)).collect();
+        if funcs.is_empty() {
+            continue;
+        }
+        taken.extend(funcs.iter().map(|f| (f.offset, f.offset + f.size)));
         let Some(rom) = rom else { bail!("symbols need the ROM to disassemble") };
-        let header = s.rom_header.unwrap_or(16) as usize;
+        let header = s.rom_header.unwrap_or_else(|| analysis::default_rom_header(&s.format, Some(rom))) as usize;
         let prg = &rom[header.min(rom.len())..];
         analyzed.extend(analysis::analyze_6502(&funcs, prg));
     }
+    analyzed.sort_by_key(|f| f.func.offset);
     let symbols = !analyzed.is_empty();
     let mut unreachable_instructions = 0;
     let mut unreachable_per_function = vec![];

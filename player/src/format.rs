@@ -1,4 +1,4 @@
-//! Parser and writer for `.segment` files (.agents/SPEC.md section 3).
+//! Parser and writer for `.segment` files (docs/segments.md).
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
@@ -9,7 +9,7 @@ pub const MAGIC: &str = "dj-replay 1";
 /// The first line before the rename to decomp-dj. Still read; files are written with MAGIC.
 const OLD_MAGIC: &str = "emucov-replay 1";
 
-/// Hashes are the first 32 hex digits of a BLAKE3 digest (.agents/SPEC.md section 6).
+/// Hashes are the first 32 hex digits of a BLAKE3 digest (docs/playback.md, "State hashes").
 pub const HASH_HEX: usize = 32;
 
 /// A BLAKE3 digest as the format writes it.

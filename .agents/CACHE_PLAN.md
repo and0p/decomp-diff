@@ -1,8 +1,9 @@
 # Plan: the local database
 
 Status: mostly implemented (see "What's built" at the end). This file covers the local database: a local store for everything derived from playing a
-project. It uses the words defined in SPEC.md's "Terminology" section:
-segment, snapshot, diff, child segment, save and macro.
+project. It uses the words defined in [concepts.md](../docs/concepts.md#terms):
+segment, snapshot, diff, child segment, save and macro. How to use the database is in
+[database.md](../docs/database.md), and its settings in [config.md](../docs/config.md#cache-optional).
 
 ## What it holds
 
@@ -20,7 +21,7 @@ version control. Each author or collaborator fills it on their own machine
   snapshot before it?", then load that snapshot and trace from there.
 
 Saves (SRAM, memory cards, cartridge saves) that a root segment starts from stay
-in `blobs/` (SPEC section 4), which is in version control. A save at the end of a
+in `blobs/` ([segments.md](../docs/segments.md#blobs)), which is in version control. A save at the end of a
 segment is derived, so it goes in the database. A tool can export it to `blobs/` when
 someone wants to start a new root segment from it.
 
@@ -287,7 +288,7 @@ to.
 
 ## Coverage
 
-Coverage uses the terms in SPEC.md: covered, uncovered, unreachable, parity and no
+Coverage uses the terms in [concepts.md](../docs/concepts.md): covered, uncovered, unreachable, parity and no
 parity.
 
 **Stored per content key, never per project.** When a segment is played, the
