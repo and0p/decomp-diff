@@ -26,6 +26,28 @@ When one ships, its user-facing description moves into `docs/` and the entry her
   and at MAX speed it is hydration you can watch. A later step could make it record as
   it plays (snapshots, coverage and first hits for each segment it finishes cleanly), so
   watching the coverage map light up and filling the database are the same run.
+- **Recording live inputs.** Play the game from the keyboard and record what is held into
+  the piano roll.
+  - **Bindings.** A bindings dialog (Input > Keyboard mapping…) maps keys to each port's
+    buttons, saved per machine in `.local/local.toml` with a sensible default for a joypad.
+    Gamepads come later: device discovery, hot-plugging, analog dead zones and per-OS
+    differences make them a larger job.
+  - **Record button.** A ● Record toggle in the transport that is unmistakable while on:
+    red, and tinting part of the window (the transport bar and the roll's ruler, or a red
+    frame around the picture) so nobody records by accident.
+  - **Keys while recording.** Game bindings win over the GUI's shortcuts. Only a short list
+    stays live: Escape (or the Record button) stops recording, Space and Backspace drive
+    frame-by-frame recording below, and Ctrl/Cmd shortcuts such as undo and save.
+  - **Real time.** With Play on, each frame records whatever is held, at the selected speed.
+  - **Frame by frame.** Paused, the held keys form a chord. Space commits the chord to the
+    current frame and moves to the next: it **overwrites** all input on that frame, so
+    buttons not held are released there, even if the frame had them before. Holding Space
+    keeps committing, one frame per tick at the selected playback speed. Backspace moves
+    back one frame without changing anything (held, it keeps moving back);
+    Shift+Backspace moves back and clears the input on each frame it leaves.
+  - **Undo.** One recording pass (from Record on to off, or one held Space) is one undo
+    step, and recording drops later hashes like any other edit (return to the edit applies).
+  - **A 0.1× speed** for precise inputs in near real time, alongside 0.25× and the rest.
 - **Audio playback (GUI).** Play the core's audio while a segment plays, with a volume
   slider and a mute button in the playback toolbar. When more than one core is running
   (side-by-side comparison), an A|B toggle picks which core you hear.
@@ -104,6 +126,23 @@ When one ships, its user-facing description moves into `docs/` and the entry her
   the new id against every id in the project when generating one, and try again on
   a collision. A tool that finds two files with the same id refuses to load the
   project. Existing UUIDs stay valid, and the CLI already accepts unique prefixes.
+- **Pinned memory (cheats) in segments (maybe).** A command that holds RAM at a value for
+  the rest of the segment, like a Game Genie or GameShark code: for example
+  `0 [PIN] RAM 0x0451 63` keeps a player's health full, and `[UNPIN] RAM 0x0451` (or the
+  end of the segment) stops it. The player writes pinned bytes before every frame, or
+  before every logic tick when the project defines `[tick]`, so the game never sees
+  another value for long. Pins don't carry into child segments; a child that wants one
+  adds its own `[PIN]` at frame 0, so a segment's file still says everything that affects
+  it.
+  - **Why:** fuzzing and long runs that would otherwise end early. Two CPU players fighting
+    with full health forever, or a run that can't die, can keep reaching new code while the
+    fuzzer explores.
+  - **Costs:** a segment with a pin is poked (its coverage is counted apart from play
+    alone, as for `[WRITE]`). Adding a command to the format needs care: players must
+    reject commands they don't know, so older tools would refuse these segments.
+  - **Open:** whether ROM patches (true Game Genie codes, which change what the CPU reads
+    from ROM rather than RAM) are worth supporting too; they need the core's help. And
+    whether a fuzzing job could apply pins on its own without writing them into a segment.
 - **Macros and Lua scripts** for active RNG manipulation and pokes, instead of long
   runs of `[WRITE]` lines. They would be stored locally, and segments would refer to
   them by name, as `[RNG]` ([reserved commands](../docs/segments.md#reserved-commands)) already reserves.
