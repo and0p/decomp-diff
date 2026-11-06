@@ -460,10 +460,11 @@ past its last body line.
     tree such as 5>28>14) replaces the path with the new selection's chain, because it
     no longer leads to the old tip. Deleting the tip moves it to its nearest surviving
     ancestor.
-  - The transport's **child** button is a split button: its main part goes into the
-    sticky segment below (or an only child), and the arrow at its side opens the list
-    of all children to pick another one. With several children and no sticky segment
-    below, the main part opens the list too.
+  - The transport's **end** button is a split button. At the end of the segment, its
+    main part goes into the sticky segment below (or an only child, or opens the list
+    when there are several); elsewhere it goes to the last frame. The arrow at its
+    side always opens the list of all children. The **start** button likewise goes to
+    frame 0, and from frame 0 to the end of the parent.
   - **Rewinding up the chain.** Stepping or seeking back past frame 0 goes into the
     parent's last frames (loading a snapshot of the parent, from memory or the local
     database), and playing forward from there follows the sticky segments back down. A
@@ -473,7 +474,7 @@ past its last body line.
     0, and the start of the next (sticky or only) segment to the right of the last frame,
     faded and read-only, with the boundary marked on the ruler. Clicking or dragging
     in the faded part does nothing, so a misclick can't switch segments. Only an arrow
-    key or a playback control (stepping, playing, the segment back and forward
+    key or a playback control (stepping, playing, the start and end
     buttons) moves across the boundary, and that switches over fully: the other
     segment becomes the selected one, the playhead moves with it even when paused, and
     only then can it be edited. No edit ever spans two segments.

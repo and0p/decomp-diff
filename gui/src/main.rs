@@ -2478,18 +2478,26 @@ impl App {
             };
             let icon = egui::vec2(30.0, ui.spacing().interact_size.y);
 
-            // Parent, previous marker.
-            let r = ui
-                .add_enabled(idle && parent.is_some(), egui::Button::new("").min_size(icon))
-                .on_hover_text(match &parent {
-                    Some(p) => format!("Back to the end of the parent segment, \"{}\"", col_title(self.col.as_ref(), p)),
-                    None => String::new(),
-                })
-                .on_disabled_hover_text("A root segment has no parent");
-            paint_skip(ui, &r, false, false);
-            if r.clicked() {
-                if let Some(p) = parent {
-                    self.segment_back(&p);
+            let at = self.pb.as_ref().and_then(|pb| pb.shown());
+            let at_start = at.is_some_and(|f| f == 0);
+            let at_end = self.pb.as_ref().is_some_and(|pb| at.is_some_and(|f| f + 1 >= pb.frames));
+
+            // Start: to frame 0, or from frame 0 to the end of the parent.
+            let start_ok = has && idle && (!at_start || parent.is_some());
+            let tip = match (&parent, at_start) {
+                (Some(p), true) => format!("Back to the end of the parent segment, \"{}\" (Home goes to frame 0)", col_title(self.col.as_ref(), p)),
+                (_, false) => "Go to start (Home). At the start, this goes back to the end of the parent segment".to_string(),
+                (None, true) => String::new(),
+            };
+            if ui.add_enabled(start_ok, egui::Button::new("⏮").min_size(icon)).on_hover_text(tip).on_disabled_hover_text("At the start of a root segment").clicked() {
+                if at_start {
+                    if let Some(p) = parent.clone() {
+                        self.segment_back(&p);
+                    }
+                } else {
+                    self.playing = false;
+                    self.seek(0);
+                    self.roll.follow_to(0);
                 }
             }
             let r = ui.add_enabled(has && prev_mk.is_some(), egui::Button::new("").min_size(icon)).on_hover_text("Previous marker in this segment").on_disabled_hover_text("No marker before the playhead in this segment");
@@ -2501,33 +2509,20 @@ impl App {
                     self.roll.follow_to(f);
                 }
             }
-            ui.separator();
 
             ui.add_enabled_ui(has, |ui| {
-                if ui.button("⏮").on_hover_text("Go to start (Home)").clicked() {
-                    self.playing = false;
-                    self.seek(0);
-                    self.roll.follow_to(0);
-                }
                 if ui.button("⏴").on_hover_text("Step back (left arrow)").clicked() {
                     self.step_by(-1);
                 }
-                if ui.button(if self.playing { "⏸" } else { "▶" }).on_hover_text("Play / pause (Space)").clicked() {
+                if ui.add(egui::Button::new(if self.playing { "⏸" } else { "▶" }).min_size(egui::vec2(34.0, icon.y))).on_hover_text("Play / pause (Space)").clicked() {
                     self.toggle_play();
                 }
                 if ui.button("⏵").on_hover_text("Step forward (right arrow)").clicked() {
                     self.step_by(1);
                 }
-                if ui.button("⏭").on_hover_text("Go to end (End)").clicked() {
-                    self.playing = false;
-                    let e = self.pb.as_ref().map_or(0, |p| p.frames.saturating_sub(1));
-                    self.seek(e);
-                    self.roll.follow_to(e);
-                }
             });
-            ui.separator();
 
-            // Next marker, child (split button), continue.
+            // Next marker; end (split button), continue.
             let r = ui.add_enabled(has && next_mk.is_some(), egui::Button::new("").min_size(icon)).on_hover_text("Next marker in this segment").on_disabled_hover_text("No marker after the playhead in this segment");
             paint_skip(ui, &r, true, true);
             if r.clicked() {
@@ -2538,49 +2533,56 @@ impl App {
                 }
             }
             let sticky = self.selected.as_deref().and_then(|id| self.sticky_child(id));
-            // The main part goes to the sticky child, else the only child, else opens the list.
-            let main_target = sticky.clone().or_else(|| (kids.len() == 1).then(|| kids[0].0.clone()));
+            // At the end, the main part goes to the sticky segment, else the only child, else opens the list.
+            let child_target = sticky.clone().or_else(|| (kids.len() == 1).then(|| kids[0].0.clone()));
             let title_of = |k: &str| kids.iter().find(|(c, _)| c == k).map(|(_, t)| t.clone()).unwrap_or_default();
             let mut pick = None;
-            let on = idle && !kids.is_empty();
+            let mut to_end = false;
             ui.scope(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let cr = ui.visuals().widgets.inactive.corner_radius;
                 let left = egui::CornerRadius { nw: cr.nw, sw: cr.sw, ne: 0, se: 0 };
                 let right = egui::CornerRadius { nw: 0, sw: 0, ne: cr.ne, se: cr.se };
-                let main = egui::Button::new("").min_size(icon).corner_radius(left);
-                let tip = match &main_target {
-                    Some(c) if sticky.is_some() => format!("Forward into \"{}\", where you were before", title_of(c)),
-                    Some(c) => format!("Forward into the child segment, \"{}\"", title_of(c)),
-                    None => format!("Forward into a child segment ({} children)", kids.len()),
-                };
-                let open_list;
-                if main_target.is_some() || !on {
-                    let r = ui.add_enabled(on, main).on_hover_text(tip).on_disabled_hover_text("This segment has no children");
-                    paint_skip(ui, &r, true, false);
-                    if r.clicked() {
-                        pick = main_target.clone();
-                    }
-                    open_list = None;
+                let main = egui::Button::new("⏭").min_size(icon).corner_radius(left);
+                let main_ok = has && idle && (!at_end || !kids.is_empty());
+                if at_end && main_ok && child_target.is_none() {
+                    // At the end with several children and none to follow: the main part opens the list.
+                    let resp = egui::containers::menu::MenuButton::from_button(main).ui(ui, |ui| child_list(ui, &kids, None, &mut pick)).0;
+                    resp.on_hover_text(format!("Forward into a child segment ({} children)", kids.len()));
                 } else {
-                    // Several children and none sticky: the main part opens the list too.
-                    let resp = ui.add_enabled_ui(on, |ui| egui::containers::menu::MenuButton::from_button(main).ui(ui, |ui| child_list(ui, &kids, None, &mut pick))).inner.0;
-                    let resp = resp.on_hover_text(tip);
-                    paint_skip(ui, &resp, true, false);
-                    open_list = Some(());
+                    let tip = match (&child_target, at_end) {
+                        (_, false) => "Go to end (End). At the end, this goes forward into the child segment".to_string(),
+                        (Some(c), true) if sticky.is_some() => format!("Forward into \"{}\", where you were before", title_of(c)),
+                        (Some(c), true) => format!("Forward into the child segment, \"{}\"", title_of(c)),
+                        (None, true) => String::new(),
+                    };
+                    let r = ui.add_enabled(main_ok, main).on_hover_text(tip).on_disabled_hover_text("At the end of a segment with no children");
+                    if r.clicked() {
+                        if at_end {
+                            pick = child_target.clone();
+                        } else {
+                            to_end = true;
+                        }
+                    }
                 }
-                let _ = open_list;
-                // The arrow: always there, so nothing moves; faint with a single child.
+                // The side arrow: always there, so nothing moves; faint with a single child.
                 let arrow = egui::Button::new("").min_size(egui::vec2(16.0, icon.y)).corner_radius(right);
                 ui.add_space(1.0);
-                ui.add_enabled_ui(on, |ui| {
-                    let r = egui::containers::menu::MenuButton::from_button(arrow).ui(ui, |ui| child_list(ui, &kids, sticky.as_ref(), &mut pick)).0.on_hover_text("Pick a child segment");
+                ui.add_enabled_ui(idle && !kids.is_empty(), |ui| {
+                    let r = egui::containers::menu::MenuButton::from_button(arrow).ui(ui, |ui| child_list(ui, &kids, sticky.as_ref(), &mut pick)).0;
+                    let r = r.on_hover_text("Pick a child segment").on_disabled_hover_text("This segment has no children");
                     let c = icon_color(ui, &r);
                     let c = if kids.len() > 1 { c } else { c.gamma_multiply(0.4) };
                     let m = r.rect.center();
                     ui.painter().add(egui::Shape::convex_polygon(vec![egui::pos2(m.x - 3.5, m.y - 2.0), egui::pos2(m.x + 3.5, m.y - 2.0), egui::pos2(m.x, m.y + 2.5)], c, egui::Stroke::NONE));
                 });
             });
+            if to_end {
+                self.playing = false;
+                let e = self.pb.as_ref().map_or(0, |p| p.frames.saturating_sub(1));
+                self.seek(e);
+                self.roll.follow_to(e);
+            }
             if let Some(k) = pick {
                 self.segment_forward(&k);
             }
