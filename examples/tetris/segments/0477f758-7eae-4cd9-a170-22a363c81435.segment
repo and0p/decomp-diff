@@ -5,6 +5,7 @@ title: Select A-Type
 frames: 120
 start-frame: 640
 start-hash: 62de0f1ee7eb843745094bc7858e00a1
+end-hash: 3312cd70db0448b81a2625b488c91d6e
 ---
 0 [EVENT] Game type: START (A-type)
 0 P1 JOYPAD START 1

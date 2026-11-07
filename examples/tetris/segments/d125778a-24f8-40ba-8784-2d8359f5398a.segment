@@ -3,6 +3,9 @@ id: d125778a-24f8-40ba-8784-2d8359f5398a
 parent: 0477f758-7eae-4cd9-a170-22a363c81435
 title: Start A-Type Game at Level 0
 frames: 60
+start-hash: 3312cd70db0448b81a2625b488c91d6e
+end-hash: 297d729e9733d8536441f4529689dd77
+start-frame: 760
 ---
 0 P1 JOYPAD START 1
 7 P1 JOYPAD START 0

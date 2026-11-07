@@ -91,6 +91,12 @@ When one ships, its user-facing description moves into `docs/` and the entry her
   per function or larger block, sum it in a cache (`coverage_sum`, [CACHE_PLAN.md](CACHE_PLAN.md)), and
   update only the sums for segments whose clean or dirty status changed. Parity colors
   (purple and red) join the map once comparison cores exist.
+- **Tracking coverage lost.** When an edit, a delete or a re-recorded segment means code
+  that used to be covered no longer is, nothing says so: the totals just drop. Keep the
+  previous coverage per segment (or per report), and show what a change cost: in the GUI
+  after a save or Verify ("−14 instructions in `doStateNewLevel`"), and in `dj report`
+  against the last committed report. Pairs with the committed report above, whose diff
+  would show it in review.
 - **"First runs in" needs its own view.** The function details in the Coverage tab list
   every segment where the function first runs (capped at six today). For code that runs
   every tick (the NMI handler, the main loop) that is every segment in the project, so

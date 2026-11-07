@@ -68,8 +68,8 @@ Below the picture, left to right:
 | File | Open project…, Save (Ctrl/Cmd+S), Reload from disk (discards unsaved edits), Quit |
 | Edit | Undo, Redo, Cut, Copy, Paste at play cursor ([editing.md](editing.md#undo-cut-copy-and-paste)) |
 | MCP | Enable MCP (off by default), Show agent drafts, follow an agent session, Stop following, Share my view with agents ([mcp.md](mcp.md#the-gui)) |
-| Emulation | Play/pause, step, go to start or end, Use new end hash, Hydrate all, Verify all, Use the local database, Snapshot memory, Set ROM…, Set core… ([database.md](database.md#in-the-gui)) |
-| Segment | Tree edits and Add event at playhead (E) ([editing.md](editing.md#segment-menu)) |
+| Emulation | Play/pause, step, go to start or end, Use new end hash, Use the local database, Snapshot memory, Set ROM…, Set core… ([database.md](database.md#in-the-gui)) |
+| Segment | Tree edits and Add event at playhead (E) ([editing.md](editing.md#segment-menu)); at the end, Hydrate all and Clean all segments ([database.md](database.md#in-the-gui)) |
 | Input | Keyboard mapping (coming later) |
 | View | Zoom in, Zoom out, Follow playhead, Return to the edit ([editing.md](editing.md#return-to-the-edit)), Show every joypad button, Second core side by side (coming later) |
 

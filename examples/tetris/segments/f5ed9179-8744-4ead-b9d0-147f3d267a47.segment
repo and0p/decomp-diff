@@ -4,6 +4,9 @@ parent: d125778a-24f8-40ba-8784-2d8359f5398a
 title: Lose Game immediately and return to menu
 frames: 1141
 checkpoint: 961 f88738efb5718a7c1ba9dab32f5eed87
+start-hash: 297d729e9733d8536441f4529689dd77
+end-hash: 32831fb6f96f0ae980f9f0f2274ec5fc
+start-frame: 820
 ---
 1 P1 JOYPAD DOWN 1
 46 P1 JOYPAD DOWN 0

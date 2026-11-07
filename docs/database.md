@@ -37,11 +37,11 @@ dj sql <dir> "SELECT ..."                                    # query it directly
 
 ## In the GUI
 
-The Emulation menu has **Hydrate all** and **Verify all**. Verify all plays only the
+The end of the Segment menu has **Hydrate all** and **Clean all segments**. Cleaning plays only the
 segments that aren't clean, top down, and [records their hashes](playback.md#recording-hashes)
 where that overwrites nothing, as unsaved changes (so it works with edits open, and Save
 keeps the result). Segments whose ending changed are listed, and those below them skipped.
-Right-click in the tree for **Hydrate this segment**, **Hydrate this and below** and **Verify this and below**. Hydration shows every 4th frame in the picture,
+Right-click in the tree for **Hydrate this segment**, **Hydrate this and below** and **Clean this and below**. Hydration shows every 4th frame in the picture,
 with a progress bar and **Pause** and **Stop** in the status bar. Selecting, seeking and
 playing wait until it ends. Segments finished before a stop stay stored.
 

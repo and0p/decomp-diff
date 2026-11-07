@@ -2110,19 +2110,7 @@ impl App {
                     self.accept_end_hash();
                 }
                 ui.separator();
-                let db_on = self.session.as_ref().is_some_and(|s| s.cache.is_some());
                 let idle = self.hydrating.is_none();
-                if ui.add_enabled(db_on && idle, egui::Button::new("Hydrate all")).on_hover_text("Play every segment whose current content isn't in the local database yet").clicked() {
-                    self.start_hydrate(None, false);
-                }
-                if ui
-                    .add_enabled(db_on && idle, egui::Button::new("Verify all"))
-                    .on_hover_text("Play every segment that isn't clean, top down, and record its hashes where that overwrites nothing (as reaching a segment's end does). Segments whose ending changed are listed for you to check. Results are unsaved changes.")
-                    .on_disabled_hover_text("Needs the local database")
-                    .clicked()
-                {
-                    self.start_verify(None);
-                }
                 let mut use_db = self.col.as_ref().and_then(|c| c.load_local().ok()).and_then(|l| l.database).unwrap_or(true);
                 if ui.add_enabled(self.col.is_some() && idle, egui::Checkbox::new(&mut use_db, "Use the local database")).keep_open().on_hover_text("Off: play from power-on and keep snapshots only in memory, as before the database existed").changed() {
                     self.set_database(use_db);
@@ -2178,6 +2166,20 @@ impl App {
                 if ui.add_enabled(sel.is_some(), egui::Button::new("Delete…")).on_hover_text("Delete this segment and everything below it").clicked() {
                     self.delete_dialog = sel.clone();
                 }
+                ui.separator();
+                let db_on = self.session.as_ref().is_some_and(|s| s.cache.is_some());
+                let idle = self.hydrating.is_none();
+                if ui.add_enabled(db_on && idle, egui::Button::new("Hydrate all")).on_hover_text("Play every segment whose current content isn't in the local database yet").on_disabled_hover_text("Needs the local database").clicked() {
+                    self.start_hydrate(None, false);
+                }
+                if ui
+                    .add_enabled(db_on && idle, egui::Button::new("Clean all segments"))
+                    .on_hover_text("Play every segment that isn't clean, top down, and record its hashes where that overwrites nothing (as reaching a segment's end does). Segments whose ending changed are listed for you to check. Results are unsaved changes.")
+                    .on_disabled_hover_text("Needs the local database")
+                    .clicked()
+                {
+                    self.start_verify(None);
+                }
             }));
             bar.push(ui.menu_button("MCP", |ui| self.agent_menu(ui)));
             bar.push(ui.menu_button("Input", |ui| {
@@ -2232,7 +2234,7 @@ impl App {
             let hint = if parent_clean {
                 "Dirty: its parent's end state changed. Play it to the end to re-check it; if it still ends the same, the new start hash is recorded."
             } else {
-                "Dirty: a segment above it changed and isn't clean yet. Verify that one first (or use Emulation > Verify all)."
+                "Dirty: a segment above it changed and isn't clean yet. Clean that one first (or use Segment > Clean all segments)."
             };
             return Some(roll::Unverified { from: 0, color, hint: hint.to_string() });
         }
@@ -2241,7 +2243,7 @@ impl App {
         let hint = if parent_clean {
             format!("Not verified from frame {from} on. Play to the end to record its hashes.")
         } else {
-            format!("Not verified from frame {from} on, and its parent isn't clean: verify that first, or use Emulation > Verify all.")
+            format!("Not verified from frame {from} on, and its parent isn't clean: clean that first, or use Segment > Clean all segments.")
         };
         Some(roll::Unverified { from, color, hint })
     }
@@ -2574,7 +2576,7 @@ impl App {
                                     context = Some((id.to_string(), "follow"));
                                 }
                             }
-                            if ui.button("Save as segment").on_hover_text("Move it into segments/. Play it to the end (or use Verify all) to record its hashes.").clicked() {
+                            if ui.button("Save as segment").on_hover_text("Move it into segments/. Play it to the end (or use Clean all segments) to record its hashes.").clicked() {
                                 context = Some((id.to_string(), "draft_save"));
                             }
                             if ui.button("Discard draft").on_hover_text("Delete its file in .local/drafts/").clicked() {
@@ -2606,7 +2608,7 @@ impl App {
                             context = Some((id.to_string(), "hydrate"));
                         }
                         if ui
-                            .add_enabled(db_on, egui::Button::new("Verify this and below"))
+                            .add_enabled(db_on, egui::Button::new("Clean this and below"))
                             .on_hover_text("Play what isn't clean here and below, and record hashes where that overwrites nothing")
                             .on_disabled_hover_text("Needs the local database")
                             .clicked()
@@ -3079,7 +3081,7 @@ impl App {
                 self.drafts_fp = agent::drafts_fingerprint(&col.root);
                 self.segments_fp = agent::segments_fingerprint(&col.root);
                 self.coverage_stale();
-                self.info("Saved the draft as a segment. Play it to the end (or use Verify all) to record its hashes.");
+                self.info("Saved the draft as a segment. Play it to the end (or use Clean all segments) to record its hashes.");
             }
             Err(e) => self.error(e),
         }
@@ -3156,7 +3158,7 @@ impl App {
     fn start_verify(&mut self, scope: Option<String>) {
         let Some(col) = &self.col else { return };
         if self.session.as_ref().is_none_or(|s| s.cache.is_none()) {
-            self.error("Verifying needs the local database (Emulation > Use the local database).");
+            self.error("Cleaning needs the local database (Emulation > Use the local database).");
             return;
         }
         let what = match &scope {
@@ -3164,7 +3166,7 @@ impl App {
             Some(id) => format!("\"{}\" and below", col_title(Some(col), id)),
         };
         match Hydrator::verify(col, scope.as_deref().map(|id| (id, true))) {
-            Ok(h) if h.targets.is_empty() => self.info(format!("Nothing to verify: {what} are clean.")),
+            Ok(h) if h.targets.is_empty() => self.info(format!("Nothing to clean: {what} are clean already.")),
             Ok(h) => {
                 self.playing = false;
                 self.job = None;
@@ -3254,7 +3256,7 @@ impl App {
         let names = |v: &str| ev.iter().filter(|e| e.verdict == v).map(|e| format!("\"{}\"", col_title(self.col.as_ref(), &e.id))).collect::<Vec<_>>();
         let mismatch = names("mismatch");
         let blocked = n("blocked");
-        let mut msg = format!("{} {}: {recorded} recorded, {cleaned} cleaned", if stopped { "Stopped verifying" } else { "Verified" }, hy.what);
+        let mut msg = format!("{} {}: {recorded} recorded, {cleaned} cleaned", if stopped { "Stopped cleaning" } else { "Cleaned" }, hy.what);
         if recorded + cleaned > 0 {
             msg += " (unsaved: save to keep them)";
         }
@@ -3596,11 +3598,11 @@ impl App {
                         Some((id, f, frames)) => ((hy.h.i as f32 + f as f32 / frames.max(1) as f32) / n as f32, col_title(self.col.as_ref(), id)),
                         None => (hy.h.i as f32 / n as f32, String::new()),
                     };
-                    let text = format!("{} {}/{}{}", if hy.paused { "Paused" } else if hy.h.verify { "Verifying" } else { "Hydrating" }, (hy.h.i + 1).min(n), n, if name.is_empty() { String::new() } else { format!(": \"{name}\"") });
+                    let text = format!("{} {}/{}{}", if hy.paused { "Paused" } else if hy.h.verify { "Cleaning" } else { "Hydrating" }, (hy.h.i + 1).min(n), n, if name.is_empty() { String::new() } else { format!(": \"{name}\"") });
                     ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).desired_width(slot.x).desired_height(slot.y).text(RichText::new(text).small()).corner_radius(3.0));
                     let mut stop = false;
                     let mut toggle = false;
-                    if ui.small_button("Stop").on_hover_text(if hy.h.verify { "Stop verifying; hashes recorded so far stay (unsaved)" } else { "Stop hydrating; finished segments stay stored" }).clicked() {
+                    if ui.small_button("Stop").on_hover_text(if hy.h.verify { "Stop cleaning; hashes recorded so far stay (unsaved)" } else { "Stop hydrating; finished segments stay stored" }).clicked() {
                         stop = true;
                     }
                     if ui.small_button(if hy.paused { "Resume" } else { "Pause" }).clicked() {
