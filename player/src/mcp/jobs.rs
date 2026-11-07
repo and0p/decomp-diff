@@ -53,7 +53,11 @@ pub struct Job {
 #[derive(Default)]
 struct JobState {
     status: String,
+    /// The first worker's failure, if any.
     error: Option<String>,
+    workers_failed: usize,
+    /// How long the job ran, once it has ended.
+    seconds: Option<u64>,
     /// Offsets found by this job, shared between its workers.
     found: HashSet<u64>,
     /// Drafts made, with what they reached.
@@ -138,7 +142,7 @@ impl Server {
                 let job = self.jobs.map.get(&j).cloned().ok_or_else(|| anyhow!("no job {j}"))?;
                 job.stop.store(true, Ordering::Relaxed);
                 let mut st = job.st.lock().unwrap();
-                if st.status == "running" {
+                if st.status == "running" || st.status == "starting" {
                     st.status = "stopping".into();
                 }
                 Reply::Json(json!({"stopping": j}))
@@ -210,14 +214,10 @@ impl Server {
         let job = Arc::new(Job { id: id.clone(), kind, stop: AtomicBool::new(false), frames: AtomicU64::new(0), attempts: AtomicU64::new(0), started: Instant::now(), st: Mutex::new(JobState { status: "starting".into(), ..Default::default() }) });
         self.jobs.map.insert(id.clone(), job.clone());
         let h = std::thread::spawn(move || {
-            let r = run_job(&cfg, &job);
+            run_job(&cfg, &job);
             let mut st = job.st.lock().unwrap();
-            if let Err(e) = r {
-                st.error = Some(format!("{e:#}"));
-            }
-            if st.status == "running" || st.status == "stopping" {
-                st.status = if st.status == "stopping" { "stopped".into() } else { "finished: budget used".into() };
-            }
+            st.status = final_status(&st.status, st.workers_failed, cfg.starts.len());
+            st.seconds = Some(job.started.elapsed().as_secs());
             // The workers' own tapes go; drafts made from them stay.
             for d in &cfg.starts {
                 let _ = std::fs::remove_file(drafts_dir(&cfg.dir).join(format!("{d}.segment")));
@@ -228,13 +228,31 @@ impl Server {
     }
 }
 
+/// What a job that has ended reports. A status a worker set (a goal reached, `max_drafts`)
+/// stands. Otherwise: with no worker left it failed; with some left it ran on them, and says so.
+fn final_status(current: &str, failed: usize, workers: usize) -> String {
+    match current {
+        "running" | "starting" | "stopping" => {}
+        done => return done.to_string(),
+    }
+    if failed >= workers {
+        format!("failed: {failed} of {workers} workers died")
+    } else if current == "stopping" {
+        "stopped".to_string()
+    } else if failed > 0 {
+        format!("finished: budget used, on the workers left ({failed} of {workers} died)")
+    } else {
+        "finished: budget used".to_string()
+    }
+}
+
 fn status(j: &Job) -> Value {
     let st = j.st.lock().unwrap();
     let mut drafts = st.drafts.clone();
     drafts.sort_by(|a, b| b["new_instructions"].as_u64().cmp(&a["new_instructions"].as_u64()));
     json!({
-        "job": j.id, "kind": j.kind, "status": st.status, "error": st.error,
-        "seconds": j.started.elapsed().as_secs(), "frames": j.frames.load(Ordering::Relaxed), "attempts": j.attempts.load(Ordering::Relaxed),
+        "job": j.id, "kind": j.kind, "status": st.status, "error": st.error, "workers_failed": st.workers_failed,
+        "seconds": st.seconds.unwrap_or_else(|| j.started.elapsed().as_secs()), "frames": j.frames.load(Ordering::Relaxed), "attempts": j.attempts.load(Ordering::Relaxed),
         "new_instructions": st.found.len(), "drafts": drafts, "closest_distance": st.best_distance, "goal_draft": st.goal_draft,
     })
 }
@@ -296,26 +314,42 @@ fn random_chunk(rng: &mut Rng, frames: u64, buttons: &[String]) -> String {
     s
 }
 
-fn run_job(cfg: &Cfg, job: &Arc<Job>) -> Result<()> {
-    job.st.lock().unwrap().status = "running".into();
+/// Runs the job's workers until each has ended. A worker's search doesn't depend on the
+/// others', so when one dies the rest carry on, and the job says so in its status.
+fn run_job(cfg: &Cfg, job: &Arc<Job>) {
+    {
+        let mut st = job.st.lock().unwrap();
+        if st.status == "starting" {
+            st.status = "running".into();
+        }
+    }
     let deadline = job.started + Duration::from_secs(cfg.seconds);
-    std::thread::scope(|scope| -> Result<()> {
-        let mut hs = vec![];
-        for (i, start) in cfg.starts.iter().enumerate() {
-            let job = job.clone();
-            hs.push(scope.spawn(move || {
-                if let Err(e) = worker_loop(cfg, &job, start, cfg.seed.wrapping_add(i as u64 * 0x9E37_79B9_7F4A_7C15) | 1, deadline) {
-                    let mut st = job.st.lock().unwrap();
-                    st.error.get_or_insert(format!("worker {}: {e:#}", i + 1));
-                    job.stop.store(true, Ordering::Relaxed);
-                }
-            }));
+    std::thread::scope(|scope| {
+        let hs: Vec<_> = cfg
+            .starts
+            .iter()
+            .enumerate()
+            .map(|(i, start)| {
+                let job = job.clone();
+                let run = move || -> Result<()> {
+                    worker_loop(cfg, &job, start, cfg.seed.wrapping_add(i as u64 * 0x9E37_79B9_7F4A_7C15) | 1, deadline).inspect_err(|e| {
+                        // Reported as it happens, so job_status shows it while the others run.
+                        let mut st = job.st.lock().unwrap();
+                        st.workers_failed += 1;
+                        st.error.get_or_insert(format!("worker {}: {e:#}", i + 1));
+                    })
+                };
+                scope.spawn(run)
+            })
+            .collect();
+        for (i, h) in hs.into_iter().enumerate() {
+            if h.join().is_err() {
+                let mut st = job.st.lock().unwrap();
+                st.workers_failed += 1;
+                st.error.get_or_insert(format!("worker {}: panicked", i + 1));
+            }
         }
-        for h in hs {
-            let _ = h.join();
-        }
-        Ok(())
-    })
+    });
 }
 
 fn worker_loop(cfg: &Cfg, job: &Job, start: &str, seed: u64, deadline: Instant) -> Result<()> {
@@ -349,7 +383,8 @@ fn worker_loop(cfg: &Cfg, job: &Job, start: &str, seed: u64, deadline: Instant) 
         }
         let chunk = cfg.chunk.min(cfg.max_frames.saturating_sub(job.frames.load(Ordering::Relaxed))).max(1);
         let text = random_chunk(&mut rng, chunk, &cfg.buttons);
-        let v = w.call("text", json!({"text": text, "frames": chunk, "until": cfg.condition}))?;
+        let left = deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+        let v = w.call("text", json!({"text": text, "frames": chunk, "until": cfg.condition, "seconds": left}))?;
         job.attempts.fetch_add(1, Ordering::Relaxed);
         job.frames.fetch_add(v["frames_run"].as_u64().unwrap_or(0), Ordering::Relaxed);
         let new: Vec<u64> = v["new_prg"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default();
@@ -432,4 +467,29 @@ fn save_copy(cfg: &Cfg, tape: &str, title: &str, goal: bool, new: usize, job: &s
     r.set("draft-created", &t.to_string());
     std::fs::write(dd.join(format!("{id}.segment")), r.to_text())?;
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::final_status;
+
+    #[test]
+    fn a_job_with_no_workers_left_failed() {
+        assert_eq!(final_status("running", 4, 4), "failed: 4 of 4 workers died");
+        assert_eq!(final_status("stopping", 1, 1), "failed: 1 of 1 workers died");
+    }
+
+    #[test]
+    fn a_job_that_lost_some_workers_says_so() {
+        assert_eq!(final_status("running", 1, 4), "finished: budget used, on the workers left (1 of 4 died)");
+        assert_eq!(final_status("stopping", 1, 4), "stopped");
+    }
+
+    #[test]
+    fn a_clean_job_used_its_budget_or_reached_its_goal() {
+        assert_eq!(final_status("running", 0, 4), "finished: budget used");
+        assert_eq!(final_status("stopping", 0, 4), "stopped");
+        assert_eq!(final_status("goal reached", 1, 4), "goal reached");
+        assert_eq!(final_status("finished: max_drafts reached", 0, 4), "finished: max_drafts reached");
+    }
 }

@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use decomp_dj::cache;
 use decomp_dj::collection::Collection;
@@ -52,6 +53,8 @@ struct Worker {
     /// PRG opcode flags already known: the project's coverage plus what this worker ran.
     known: Vec<u8>,
     prg: Option<usize>,
+    /// Stop running frames at this time (for job chunks).
+    deadline: Option<Instant>,
 }
 
 pub fn run(dir: PathBuf) -> Result<()> {
@@ -61,7 +64,7 @@ pub fn run(dir: PathBuf) -> Result<()> {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
     }
     let col = load_with_drafts(&dir)?;
-    let mut w = Worker { dir, col, s: None, tape: None, known: vec![], prg: None };
+    let mut w = Worker { dir, col, s: None, tape: None, known: vec![], prg: None, deadline: None };
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -282,7 +285,11 @@ impl Worker {
         let col = &self.col;
         let t = self.tape.as_mut().unwrap();
         let start_cursor = t.cursor;
+        let deadline = self.deadline;
         while t.cursor < end {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
             let f = t.cursor;
             if f % SNAP_EVERY == 0 && !t.snaps.contains_key(&f) {
                 t.snaps.insert(f, s.snapshot()?);
@@ -318,7 +325,7 @@ impl Worker {
                 sl[off as usize] |= b;
             }
         }
-        // Cut the tape back if a condition stopped it early.
+        // Cut the tape back if a condition or the deadline stopped it early.
         if t.cursor < end && end > frames {
             let keep = t.cursor.max(frames);
             let r = self.col.replays.get_mut(&id).unwrap();
@@ -392,7 +399,8 @@ impl Worker {
         self.summary(r, until.is_some())
     }
 
-    /// `text`: writes a chunk at the cursor (cutting the tape there) and plays it.
+    /// `text`: writes a chunk at the cursor (cutting the tape there) and plays it. With
+    /// `seconds`, stops early when they run out, keeping what played.
     fn text(&mut self, a: &Value) -> Result<Value> {
         let text = arg_str(a, "text")?.to_string();
         let frames = arg_u64(a, "frames").ok_or_else(|| anyhow!("missing frames"))?;
@@ -409,7 +417,10 @@ impl Worker {
             return Err(e);
         }
         let until = a.get("until").and_then(|u| u.as_str()).map(Expr::parse).transpose()?;
-        let r = self.run(frames, until.as_ref(), shot)?;
+        self.deadline = a.get("seconds").and_then(|s| s.as_f64()).map(|s| Instant::now() + Duration::from_secs_f64(s.max(0.0)));
+        let r = self.run(frames, until.as_ref(), shot);
+        self.deadline = None;
+        let r = r?;
         self.save_tape()?;
         self.summary(r, until.is_some())
     }

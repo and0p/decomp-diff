@@ -1,0 +1,10 @@
+dj-replay 1
+id: ed6a9b9f-0f6b-4f00-9f9c-3b4620c15d3c
+parent: none
+title: Boot, credits and legal
+frames: 534
+start-frame: 0
+start-hash: ca66ab9fe2af9439a6e36932460d42c6
+end-hash: ece561e84426c148f78a0d82ac2a06d6
+---
+523 [EVENT] Legal screen ending, turning into title screen

@@ -94,7 +94,7 @@ dj snapshot <dir> SEGMENT FRAME --out FILE        # the core state there, to sta
 - `report` reads the local database, not the files: it counts only clean segments that have been hydrated, and lists how many were dirty or not played yet. Run `dj hydrate` first ([database.md](database.md)).
 - `--gaps` writes the gap list as CSV.
 - `xref` (also `where`) takes an address (`PRG:0x1234`, `0x1234` for a PRG offset, `$C123` for a CPU address, or a symbol, optionally `name+0x10`) and lists the segments where that code first runs, best first, with the frame and the nearest snapshot. `snapshot` then writes the core state at that frame, to start a trace from.
-- `gaps --sort nearness` puts first the functions whose uncovered code a covered branch skips: the cheapest to reach. `frontier` lists those branches with the segments and frames that run them; given an uncovered address, it lists the ways into its block.
+- `gaps --sort nearness` puts first the functions whose uncovered code a covered branch skips: the cheapest to reach. `frontier` lists those branches with the segments and frames that run them; given an uncovered address, it lists the ways into its block. With no symbol map, on a NES ROM, they work from the instructions that ran instead ([mcp.md](mcp.md#without-a-symbol-map)).
 - Every query takes `--json`, `--limit` and `--cursor`. An agent gets the same queries, and can trace and play too, through [`dj mcp`](mcp.md).
 
 ## In the GUI

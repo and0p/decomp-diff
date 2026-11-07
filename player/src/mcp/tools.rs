@@ -11,7 +11,9 @@ pub const INSTRUCTIONS: &str = "decomp-dj: input segments that drive a libretro 
 Addresses can be PRG:0x1F3A (a ROM offset), 0x1F3A (a PRG offset), $C123 (a CPU address) or a symbol name (name+0x10). \
 Query tools (where_runs, function, gaps, frontier, coverage_summary) read the local database and are fast. \
 Play tools work on sessions: open_session parks a core at a segment and frame, then step, play_text, screenshot and read_memory drive it; \
-everything a session plays is written to its draft, a segment that lives in .local/drafts/ until save_draft writes it to segments/. \
+everything a session plays is written to its draft, a segment that lives in .local/drafts/. \
+save_draft writes a draft to segments/, but needs allow = \"save\" (--allow save, or [mcp] allow in .local/local.toml); without it the tool isn't offered, and the person saves drafts in dj-gui. \
+With no symbol map, gaps lists uncovered PRG byte ranges, and function and frontier sweep linearly from covered code; bytes they call code may be data. \
 Calls that run until a condition always take max_frames; reaching it is a normal result. \
 Segment text is the .segment body format: `<frame> P1 JOYPAD A 1` presses A, `... A 0` releases it (see docs/segments.md).";
 
@@ -176,7 +178,12 @@ impl Server {
             "gaps" => {
                 let sort: GapSort = a.opt_str("sort")?.unwrap_or_else(|| "size".into()).parse()?;
                 let only: GapFilter = a.opt_str("only")?.unwrap_or_else(|| "all".into()).parse()?;
-                serde_json::to_value(self.project()?.gaps(sort, only, limit, cursor)?)?
+                let p = self.project()?;
+                if p.has_symbols()? {
+                    serde_json::to_value(p.gaps(sort, only, limit, cursor)?)?
+                } else {
+                    serde_json::to_value(p.uncovered_ranges(sort, limit, cursor)?)?
+                }
             }
             "function" => {
                 let addr = a.str("addr")?;
@@ -394,19 +401,19 @@ pub fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "gaps",
-            description: "Functions with uncovered code. sort=size puts the most uncovered instructions first; sort=nearness puts first the code that a covered branch skips (the easiest to reach). only=never|partial|all.",
+            description: "Functions with uncovered code. sort=size puts the most uncovered instructions first; sort=nearness puts first the code that a covered branch skips (the easiest to reach). only=never|partial|all. With no symbol map: uncovered PRG byte ranges (which include data), biggest first or, for nearness, those covered code leads into; only is ignored.",
             schema: props(merge(json!({"sort": {"type": "string", "enum": ["size", "nearness"]}, "only": {"type": "string", "enum": ["all", "never", "partial"]}}), page()), &[]),
             allow: Query,
         },
         ToolDef {
             name: "function",
-            description: "One function: every basic block with whether it runs, the first segment and frame that runs it and where control goes next; its callers (JSR/JMP sites) and whether they run; the segments that enter it.",
+            description: "One function: every basic block with whether it runs, the first segment and frame that runs it and where control goes next; its callers (JSR/JMP sites) and whether they run; the segments that enter it. With no symbol map, a linear sweep of the code around a PRG address, and only callers that run.",
             schema: props(json!({"addr": addr.clone(), "limit": {"type": "integer", "description": "Segments to list (default 10)"}}), &["addr"]),
             allow: Query,
         },
         ToolDef {
             name: "frontier",
-            description: "Where to start exploring toward uncovered code: covered branches (or calls) that lead into it, with the segments and frames that run that branch. Give an address in uncovered code or a function, or nothing for the largest frontiers in the ROM.",
+            description: "Where to start exploring toward uncovered code: covered branches (or calls) that lead into it, with the segments and frames that run that branch. Give an address in uncovered code or a function, or nothing for the largest frontiers in the ROM. Works with no symbol map too, from the covered instructions.",
             schema: props(merge(json!({"addr": addr.clone()}), page()), &[]),
             allow: Query,
         },
@@ -517,4 +524,20 @@ fn play_defs() -> Vec<ToolDef> {
     .into_iter()
     .chain(super::jobs::defs())
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instructions_say_what_save_draft_needs() {
+        assert!(INSTRUCTIONS.contains("save_draft") && INSTRUCTIONS.contains("allow = \"save\""));
+    }
+
+    #[test]
+    fn save_draft_is_only_offered_with_allow_save() {
+        let save = tool_defs().into_iter().find(|t| t.name == "save_draft").unwrap();
+        assert_eq!(save.allow, Allow::Save);
+    }
 }

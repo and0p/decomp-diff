@@ -21,7 +21,8 @@ const MAX_SESSIONS: usize = 6;
 /// A `dj worker` child process. Dropping it closes its stdin, and the worker exits.
 pub struct WorkerProc {
     child: Child,
-    stdin: ChildStdin,
+    /// None only while dropping: closing it is what tells the worker to exit.
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next: u64,
 }
@@ -34,14 +35,15 @@ impl WorkerProc {
         let mut child = cmd.spawn().context("starting a dj worker")?;
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Ok(WorkerProc { child, stdin, stdout, next: 1 })
+        Ok(WorkerProc { child, stdin: Some(stdin), stdout, next: 1 })
     }
 
     pub fn call(&mut self, cmd: &str, args: Value) -> Result<Value> {
         let id = self.next;
         self.next += 1;
-        writeln!(self.stdin, "{}", serde_json::to_string(&json!({"id": id, "cmd": cmd, "args": args}))?)?;
-        self.stdin.flush()?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| anyhow!("the worker is closing"))?;
+        writeln!(stdin, "{}", serde_json::to_string(&json!({"id": id, "cmd": cmd, "args": args}))?)?;
+        stdin.flush()?;
         let mut line = String::new();
         if self.stdout.read_line(&mut line)? == 0 {
             bail!("the worker process ended (see its stderr)");
@@ -58,7 +60,7 @@ impl WorkerProc {
 impl Drop for WorkerProc {
     fn drop(&mut self) {
         // Closing stdin is enough; reap it so no zombie stays.
-        let _ = self.child.try_wait();
+        self.stdin = None;
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
             match self.child.try_wait() {

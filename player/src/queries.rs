@@ -22,6 +22,12 @@ fn more<T>(p: &Page<T>) {
     }
 }
 
+fn note<T>(p: &Page<T>) {
+    if let Some(n) = &p.note {
+        println!("{n}");
+    }
+}
+
 fn hit_line(h: &SegmentHit) -> String {
     let snap = h.nearest_snapshot.map(|n| format!("snapshot at {n}")).unwrap_or_else(|| "no snapshot".into());
     let dirty = if h.counts { "" } else { "  (dirty: doesn't count)" };
@@ -75,6 +81,20 @@ pub fn summary(dir: &Path, q: &QueryArgs) -> Result<()> {
 
 pub fn gaps(dir: &Path, sort: GapSort, only: GapFilter, q: &QueryArgs) -> Result<()> {
     let mut p = open(dir, q)?;
+    if !p.has_symbols()? {
+        let g = p.uncovered_ranges(sort, q.limit, q.cursor)?;
+        if q.json {
+            return json(&g);
+        }
+        note(&g);
+        println!("  {:<24} {:>7} {:>8}  {}", "range", "bytes", "ways in", "best way in");
+        for r in &g.items {
+            let range = format!("{}-{}", r.at, r.end.trim_start_matches("PRG:"));
+            println!("  {:<24} {:>7} {:>8}  {}", range, r.bytes, r.ways_in, r.best_way_in.clone().unwrap_or_default());
+        }
+        more(&g);
+        return Ok(());
+    }
     let g = p.gaps(sort, only, q.limit, q.cursor)?;
     if q.json {
         return json(&g);
@@ -94,6 +114,9 @@ pub fn function(dir: &Path, what: &str, q: &QueryArgs) -> Result<()> {
     let f = p.function(what, q.limit)?;
     if q.json {
         return json(&f);
+    }
+    if let Some(n) = &f.note {
+        println!("{n}");
     }
     println!("{} {} ({}, {} bytes): {} of {} instructions run", f.cpu.clone().unwrap_or_default(), f.name, f.at, f.size, f.instructions_covered, f.instructions);
     for b in &f.blocks {
@@ -124,6 +147,7 @@ pub fn frontier(dir: &Path, what: Option<&str>, q: &QueryArgs) -> Result<()> {
     if q.json {
         return json(&e);
     }
+    note(&e);
     for x in &e.items {
         println!("{} {} -> {} in {} ({} uncovered instructions beyond it)", x.kind, x.branch, x.uncovered, x.function, x.uncovered_instructions);
         for h in &x.reached_by {

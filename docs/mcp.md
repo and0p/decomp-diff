@@ -52,8 +52,10 @@ they are also killed with it (`PR_SET_PDEATHSIG`).
 - Traces, `snapshot_at` and `save_draft` share one more worker.
 - A job runs its own workers, 4 by default.
 
-Several `dj mcp` servers and the GUI can use one project at once: the database is in WAL
-mode and is only written when segments are played with recording on. Queries reopen the
+Several `dj mcp` servers and the GUI can use one project at once. The database is in WAL
+mode, and writers wait for each other for up to 10 seconds: a worker writes when it starts
+(the setup and the current segments) and when a segment plays with recording on, such as
+an ancestor that has no stored end state yet. Queries reopen the
 project when a segment, symbol map, `config.toml` or the database changed on disk, so an
 agent (or you) may edit those files directly between calls.
 
@@ -65,7 +67,7 @@ Every tool that takes an address accepts:
 | --- | --- |
 | `PRG:0x1F3A` | An offset in a ROM region |
 | `0x1F3A` | An offset in PRG |
-| `$C123` or `cpu:0xC123` | A CPU address, found through the symbol maps (the first bank that has it; the result notes others) |
+| `$C123` or `cpu:0xC123` | A CPU address, found through the symbol maps (the first bank that has it; the result notes others). Outside them, a NES ROM with at most 32 KB of PRG maps it directly, since that is too little to bank |
 | `practiceDoClick`, `practiceDoClick+0x2b` | A symbol, optionally plus an offset |
 
 Results are short by default: lists take `limit` (default 10) and return `next_cursor` when
@@ -82,6 +84,22 @@ there is more.
 | `frontier(addr?)` | Covered branches and calls that lead into uncovered code, with the segments and frames that run that branch. For an address in uncovered code, the ways into its block; for a function never entered, its covered callers; with none, the largest across the ROM |
 | `segments(filter?)` | The tree: id, title, parent, frames, status, poked, children |
 | `gui_view()` | What the person is looking at in `dj-gui`, when they share it ([below](#the-gui)) |
+
+### Without a symbol map
+
+`where_runs`, `coverage_summary` and the play tools need no symbols. `gaps`, `function` and
+`frontier` work from coverage instead, on NES ROMs (they read the bytes as 6502), and say so
+in a `note` field; on other ROMs they report that they need `[[symbols]]`.
+
+| Tool | Returns |
+| --- | --- |
+| `gaps(sort)` | The runs of PRG bytes that no instruction that ran occupies, with their size, `ways_in` (covered branches and calls that lead into them) and `best_way_in`. `sort=size` puts the largest first; `sort=nearness` puts first those with a way in. `only` doesn't apply. These include data, such as tables and padding |
+| `function(addr)` | The routine a linear sweep finds around the address, named `sweep_XXXX`: back through instructions that ran and lead to it, forward to the first place control can't pass, up to 1 KB each way. Blocks and first runs as usual; callers are only those that ran, since code that hasn't can't be told from data |
+| `frontier(addr?)` | Branches and calls that ran and lead into code that hasn't. With an address, those into the uncovered range that holds it. Its `uncovered_instructions` counts straight on from the target, to the first place control can't pass |
+
+A sweep can read data as code when it starts in uncovered bytes. Targets of covered branches
+and calls are real code, so start there. With more than 32 KB of PRG, CPU addresses are
+unknown without the bank: results use `PRG:` offsets, and calls aren't followed.
 
 Agents can also read the project directly: segment files, `config.toml`, symbol maps and
 `report/` are plain text, and `dj sql` or `sqlite3` read `.local/cache.db`. Writing the
@@ -194,11 +212,22 @@ Jobs search in the background, across several workers, and leave their results a
 | --- | --- |
 | `fuzz(from, frame?, max_frames, seconds=120, workers, chunk=120, buttons?, max_drafts=20, seed?)` | Random joypad input from a segment or frame. A chunk that runs code nothing had run is kept and saved as a draft titled by what it reached (`fuzz: +25 in practiceDoClick (20), doStateNewLevel (3)`); other chunks are undone and tried again. A worker that keeps failing sometimes keeps a chunk anyway to get somewhere new, and starts over when its draft grows too long |
 | `seek_goal(from, condition, frame?, max_frames, ...)` | The same search, climbing toward the condition: a chunk is kept when it brings a comparison closer, or reaches new code when closeness can't be measured. The input that gets there becomes a draft titled `goal: ...` |
-| `job_status(job?)` | Frames played, attempts, new instructions, drafts made (most new code first), the closest a goal got, and the status: running, goal reached, finished, stopped |
+| `job_status(job?)` | Frames played, attempts, seconds it has run (they stop counting when it ends), new instructions, drafts made (most new code first), the closest a goal got, `error` and `workers_failed`, and the status: running, goal reached, finished, stopped, failed |
 | `job_stop(job)` | Stops it; its drafts stay |
 
 `max_frames` (frames across all workers) is required, and `seconds` caps the wall-clock
-time at most an hour. START and SELECT are pressed rarely, since they pause and leave menus;
+time, at most an hour. The search stops within a frame of that time, even inside a chunk,
+and keeps what the chunk played. Getting a worker to the starting point comes first and
+isn't interrupted, so a start far from any stored snapshot can take longer than `seconds`.
+`job_stop` takes effect between chunks.
+
+A worker that dies doesn't stop the others, since each searches on its own. `job_status`
+shows `error` (the first failure) and `workers_failed` straight away, and the job ends as
+`finished: budget used, on the workers left (1 of 4 died)`. A goal reached or `max_drafts`
+stays the status even if a worker died along the way. With no worker left, the job is
+`failed: 4 of 4 workers died`.
+
+START and SELECT are pressed rarely, since they pause and leave menus;
 pass `buttons` to choose others. A `seed` makes a run repeatable on one worker.
 
 ## The GUI

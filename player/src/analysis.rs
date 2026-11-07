@@ -631,6 +631,182 @@ pub fn block_successors_6502(f: &AnalyzedFunction, prg: &[u8]) -> Vec<Vec<u64>> 
         .collect()
 }
 
+// ---- 6502 code with no symbol map --------------------------------------------
+
+/// Where PRG sits in CPU space, for a NES ROM with too little PRG to bank: 16 KB (mirrored at
+/// $8000 and $C000) or 32 KB at $8000. Larger ROMs give None: an address there means nothing
+/// without knowing the bank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedPrg {
+    size: u64,
+}
+
+impl FixedPrg {
+    pub fn of_rom(rom: &[u8]) -> Option<FixedPrg> {
+        if !rom.starts_with(b"NES\x1a") || rom.len() < 16 {
+            return None;
+        }
+        let size = rom[4] as u64 * 0x4000;
+        matches!(size, 0x4000 | 0x8000).then_some(FixedPrg { size })
+    }
+
+    pub fn cpu_of(&self, offset: u64) -> Option<u64> {
+        (offset < self.size).then(|| 0x10000 - self.size + offset)
+    }
+
+    pub fn offset_of(&self, cpu: u64) -> Option<u64> {
+        (0x8000..0x10000).contains(&cpu).then(|| (cpu - 0x8000) % self.size)
+    }
+}
+
+fn ran(flags: &[u8], off: u64) -> bool {
+    flags.get(off as usize).is_some_and(|b| b & crate::coverage::FLAG_OPCODE != 0)
+}
+
+/// Offset a relative branch at `off` goes to, if that is inside `0..limit`.
+fn branch_target(prg: &[u8], off: u64, limit: u64) -> Option<u64> {
+    let rel = *prg.get(off as usize + 1)? as i8 as i64;
+    let to = off as i64 + 2 + rel;
+    (to >= 0 && (to as u64) < limit).then_some(to as u64)
+}
+
+/// Whether control can go on to the next instruction after this one.
+fn falls_through(op: u8) -> bool {
+    !matches!(flow_6502(op, &[op, 0, 0], 0), Flow::Stop) && !matches!(op, 0x4C | 0x6C)
+}
+
+/// The bytes of every instruction that ran, operands included.
+pub fn executed_bytes_6502(prg: &[u8], flags: &[u8]) -> Vec<bool> {
+    let n = flags.len().min(prg.len());
+    let mut out = vec![false; n];
+    for off in 0..n {
+        if ran(flags, off as u64) {
+            let len = op_len_6502(prg[off]) as usize;
+            out[off..(off + len).min(n)].fill(true);
+        }
+    }
+    out
+}
+
+/// The maximal runs (`start..end`) of bytes that are not part of any instruction that ran.
+pub fn uncovered_ranges(executed: &[bool]) -> Vec<(u64, u64)> {
+    let mut out = vec![];
+    let mut start = None;
+    for (i, e) in executed.iter().enumerate() {
+        match (*e, start) {
+            (false, None) => start = Some(i),
+            (true, Some(s)) => {
+                out.push((s as u64, i as u64));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((s as u64, executed.len() as u64));
+    }
+    out
+}
+
+/// A way from an instruction that ran to code that hasn't.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeEdge {
+    pub from: u64,
+    pub to: u64,
+    /// "branch" (either side of a branch, or the return from a call), "jsr" or "jmp".
+    pub kind: &'static str,
+}
+
+/// Every edge out of code that ran into code that hasn't. JSR and JMP targets need `map`.
+pub fn covered_edges_6502(prg: &[u8], flags: &[u8], map: Option<FixedPrg>) -> Vec<CodeEdge> {
+    let n = flags.len().min(prg.len()) as u64;
+    let mut out = vec![];
+    for from in (0..n).filter(|o| ran(flags, *o)) {
+        let op = prg[from as usize];
+        let next = from + op_len_6502(op) as u64;
+        let mut push = |to: u64, kind| {
+            if to < n && !ran(flags, to) && !out.iter().any(|e: &CodeEdge| e.from == from && e.to == to) {
+                out.push(CodeEdge { from, to, kind });
+            }
+        };
+        let bytes = &prg[from as usize..(next as usize).min(prg.len())];
+        match flow_6502(op, bytes, 0) {
+            Flow::Branch(_) => {
+                push(next, "branch");
+                if let Some(to) = branch_target(prg, from, n) {
+                    push(to, "branch");
+                }
+            }
+            Flow::Next | Flow::Jump(_) | Flow::Stop => {}
+        }
+        if let Some((cpu, call)) = call_target_6502(bytes) {
+            if let Some(to) = map.and_then(|m| m.offset_of(cpu)) {
+                push(to, if call { "jsr" } else { "jmp" });
+            }
+            if call {
+                push(next, "branch");
+            }
+        }
+    }
+    out
+}
+
+/// The span (`start..end`) to read as one routine around `at`: back through the instructions
+/// that ran and lead into it, then forward to the first place control can't pass, past any
+/// forward branch seen on the way. At most `max` bytes each way.
+pub fn sweep_bounds_6502(prg: &[u8], flags: &[u8], at: u64, max: u64) -> (u64, u64) {
+    let n = flags.len().min(prg.len()) as u64;
+    // Inside an instruction that ran: from its opcode.
+    let holder = (at.saturating_sub(2)..=at).rev().find(|o| ran(flags, *o) && *o + op_len_6502(prg[*o as usize]) as u64 > at);
+    let at = holder.unwrap_or(at);
+    let mut start = at;
+    'back: while at - start < max {
+        for c in start.saturating_sub(3)..start {
+            if ran(flags, c) && c + op_len_6502(prg[c as usize]) as u64 == start && falls_through(prg[c as usize]) {
+                start = c;
+                continue 'back;
+            }
+        }
+        break;
+    }
+    let limit = n.min(at + max);
+    let (mut off, mut far) = (start, at);
+    while off < limit {
+        let op = prg[off as usize];
+        let next = off + op_len_6502(op) as u64;
+        // An instruction known to run starts inside this one: the bytes here aren't code.
+        if next > limit || (off + 1..next).any(|o| ran(flags, o)) {
+            break;
+        }
+        if matches!(flow_6502(op, &[op, 0, 0], 0), Flow::Branch(_)) {
+            if let Some(to) = branch_target(prg, off, limit) {
+                far = far.max(to);
+            }
+        }
+        off = next;
+        if !falls_through(op) && off > far {
+            break;
+        }
+    }
+    (start, off.max(start + 1).min(n.max(start + 1)))
+}
+
+/// How many instructions run straight on from `start`, up to the first place control can't
+/// pass or code that already ran: the size of what an edge into `start` would open up.
+pub fn sweep_len_6502(prg: &[u8], flags: &[u8], start: u64) -> usize {
+    let n = flags.len().min(prg.len()) as u64;
+    let (mut off, mut count) = (start, 0);
+    while off < n && !ran(flags, off) {
+        let op = prg[off as usize];
+        count += 1;
+        off += op_len_6502(op) as u64;
+        if !falls_through(op) {
+            break;
+        }
+    }
+    count
+}
+
 /// The CPU address a `JSR abs` or `JMP abs` at the start of `bytes` targets.
 pub fn call_target_6502(bytes: &[u8]) -> Option<(u64, bool)> {
     match bytes {
@@ -659,6 +835,66 @@ mod tests {
         assert_eq!(op_len_6502(0xA2), 2); // LDX #
         assert_eq!(op_len_6502(0x96), 2); // STX zp,Y
         assert_eq!(op_len_6502(0xBE), 3); // LDX abs,Y
+    }
+
+    /// $8000: LDA #1; BNE $8006; INC $10; $8006 RTS; data; $8008 DEC $11; RTS; data; $800C JSR $8008; RTS
+    const SWEEP: [u8; 16] = [0xA9, 0x01, 0xD0, 0x02, 0xE6, 0x10, 0x60, 0xFF, 0xC6, 0x11, 0x60, 0xFF, 0x20, 0x08, 0x80, 0x60];
+
+    fn ran_at(offsets: &[usize]) -> Vec<u8> {
+        let mut f = vec![0; SWEEP.len()];
+        for o in offsets {
+            f[*o] = crate::coverage::FLAG_OPCODE;
+        }
+        f
+    }
+
+    #[test]
+    fn fixed_prg_needs_an_unbankable_nes_rom() {
+        let rom = |banks: u8| {
+            let mut r = b"NES\x1a".to_vec();
+            r.extend([banks, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            r
+        };
+        let m32 = FixedPrg::of_rom(&rom(2)).unwrap();
+        assert_eq!((m32.cpu_of(0x10), m32.offset_of(0x8010), m32.offset_of(0x7FFF)), (Some(0x8010), Some(0x10), None));
+        let m16 = FixedPrg::of_rom(&rom(1)).unwrap();
+        assert_eq!((m16.cpu_of(0x10), m16.offset_of(0x8010), m16.offset_of(0xC010)), (Some(0xC010), Some(0x10), Some(0x10)));
+        assert_eq!(FixedPrg::of_rom(&rom(4)), None);
+        assert_eq!(FixedPrg::of_rom(&[0; 32]), None);
+    }
+
+    #[test]
+    fn executed_bytes_include_operands_and_leave_ranges() {
+        let f = ran_at(&[0, 2, 6]);
+        let e = executed_bytes_6502(&SWEEP, &f);
+        assert_eq!(&e[..5], &[true, true, true, true, false]);
+        assert_eq!(uncovered_ranges(&e), vec![(4, 6), (7, 16)]);
+        assert_eq!(uncovered_ranges(&[true, true]), vec![]);
+    }
+
+    #[test]
+    fn edges_go_from_covered_code_into_uncovered_code() {
+        // Ran: the LDA and BNE, so both of its sides are uncovered.
+        let e = covered_edges_6502(&SWEEP, &ran_at(&[0, 2]), None);
+        assert_eq!(e, vec![CodeEdge { from: 2, to: 4, kind: "branch" }, CodeEdge { from: 2, to: 6, kind: "branch" }]);
+        // A JSR that ran: its target needs the map; its return doesn't.
+        let f = ran_at(&[12]);
+        assert_eq!(covered_edges_6502(&SWEEP, &f, None), vec![CodeEdge { from: 12, to: 15, kind: "branch" }]);
+        let m = FixedPrg { size: 0x8000 };
+        assert_eq!(covered_edges_6502(&SWEEP, &f, Some(m)), vec![CodeEdge { from: 12, to: 8, kind: "jsr" }, CodeEdge { from: 12, to: 15, kind: "branch" }]);
+    }
+
+    #[test]
+    fn sweep_reads_one_routine() {
+        let f = ran_at(&[0, 2, 4, 6]);
+        // From the middle of covered code: back to the start, on past the branch to its RTS.
+        assert_eq!(sweep_bounds_6502(&SWEEP, &f, 4, 0x100), (0, 7));
+        // An operand of an instruction that ran resolves to that instruction.
+        assert_eq!(sweep_bounds_6502(&SWEEP, &f, 5, 0x100), (0, 7));
+        // Uncovered code stands on its own, ending at its RTS.
+        assert_eq!(sweep_bounds_6502(&SWEEP, &f, 8, 0x100), (8, 11));
+        assert_eq!(sweep_len_6502(&SWEEP, &f, 8), 2);
+        assert_eq!(sweep_len_6502(&SWEEP, &f, 4), 0);
     }
 
     #[test]

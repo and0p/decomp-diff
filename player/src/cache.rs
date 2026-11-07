@@ -3,7 +3,7 @@
 //! Everything here is derived by playing the collection and can be deleted at any time.
 
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -316,6 +316,15 @@ impl Cache {
         &self.conn
     }
 
+    /// A transaction that holds the write lock from its start. A deferred one that reads
+    /// first has to upgrade to write later, and SQLite fails that at once with "database is
+    /// locked" when another connection is writing or has written since: it can't wait,
+    /// because the read has pinned an old view of the database, so `busy_timeout` doesn't
+    /// apply. Taking the lock first means waiting at BEGIN, where the timeout does apply.
+    fn write_tx(&mut self) -> rusqlite::Result<Transaction<'_>> {
+        self.conn.transaction_with_behavior(TransactionBehavior::Immediate)
+    }
+
     fn refresh_unreachable(&self, col: &Collection) -> Result<()> {
         let list = load_unreachable(col)?;
         self.conn.execute("DELETE FROM unreachable", [])?;
@@ -355,8 +364,9 @@ impl Cache {
     }
 
     pub fn put_snapshot(&mut self, state_hash: &str, data: &[u8]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        Self::put_snapshot_tx(&tx, &self.setup, self.settings.page_bytes, state_hash, data)?;
+        let (setup, page_bytes) = (self.setup.clone(), self.settings.page_bytes);
+        let tx = self.write_tx()?;
+        Self::put_snapshot_tx(&tx, &setup, page_bytes, state_hash, data)?;
         tx.commit()?;
         Ok(())
     }
@@ -416,9 +426,10 @@ impl Cache {
     /// Writes one played segment: its row, snapshots, previews, coverage and first hits.
     pub fn record(&mut self, row: &ContentRow, rec: &Recording) -> Result<()> {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
-        let tx = self.conn.transaction()?;
+        let (setup, page_bytes) = (self.setup.clone(), self.settings.page_bytes);
+        let tx = self.write_tx()?;
         for (frame, hash, data) in &rec.snapshots {
-            Self::put_snapshot_tx(&tx, &self.setup, self.settings.page_bytes, hash, data)?;
+            Self::put_snapshot_tx(&tx, &setup, page_bytes, hash, data)?;
             tx.execute("INSERT OR REPLACE INTO frames(content, frame, state_hash) VALUES (?1,?2,?3)", params![row.key, *frame as i64, hash])?;
         }
         for (frame, role, png) in &rec.images {
@@ -438,7 +449,7 @@ impl Cache {
         }
         tx.execute(
             "INSERT OR REPLACE INTO contents(key, setup, segment_id, start_hash, end_hash, body, frames, ticks, played_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![row.key, self.setup, row.segment_id, row.start_hash, row.end_hash, row.body, row.frames as i64, row.ticks.map(|t| t as i64), now],
+            params![row.key, setup, row.segment_id, row.start_hash, row.end_hash, row.body, row.frames as i64, row.ticks.map(|t| t as i64), now],
         )?;
         tx.execute("INSERT OR REPLACE INTO segment_runs(segment_id, content, played_at) VALUES (?1,?2,?3)", params![row.segment_id, row.key, now])?;
         tx.commit()?;
@@ -459,7 +470,7 @@ impl Cache {
     /// Rebuilds `segments_now`: the content key of each segment as the collection is now.
     pub fn refresh_now(&mut self, col: &Collection) -> Result<()> {
         let keys = current_keys(&self.conn, col, &self.setup)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM segments_now", [])?;
         for (id, (key, status)) in &keys {
             tx.execute("INSERT INTO segments_now(segment_id, content, status) VALUES (?1,?2,?3)", params![id, key, status.label()])?;
@@ -491,7 +502,7 @@ impl Cache {
     /// pages no snapshot uses. Returns (contents, snapshots, pages) removed.
     pub fn gc(&mut self, col: &Collection) -> Result<(usize, usize, usize)> {
         self.refresh_now(col)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.write_tx()?;
         let dead: Vec<String> = {
             let mut st = tx.prepare("SELECT key FROM contents WHERE key NOT IN (SELECT content FROM segments_now WHERE content IS NOT NULL)")?;
             let rows = st.query_map([], |r| r.get(0))?;
@@ -623,4 +634,68 @@ pub fn encode_png(frame: &crate::libretro::Frame, previews: Previews) -> Result<
 
 pub fn exists(col: &Collection) -> bool {
     cache_path(col).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project(name: &str) -> (PathBuf, Collection) {
+        let dir = std::env::temp_dir().join(format!("dj-cache-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("segments")).unwrap();
+        std::fs::write(dir.join("config.toml"), "format = 1\nname = \"t\"\n[rom]\nsha256 = \"\"\nfile = \"t.nes\"\n[core]\nname = \"c\"\nbuild = \"c\"\nsha256 = \"\"\n[[ports]]\nport = 1\ndevice = \"JOYPAD\"\n[hash]\nalgorithm = \"blake3\"\nregions = [\"RAM\"]\n").unwrap();
+        let col = Collection::open(&dir).unwrap();
+        (dir, col)
+    }
+
+    fn open(col: &Collection) -> Cache {
+        Cache::open(col, "setup", &[], CacheSettings::resolve(None, None).unwrap()).unwrap()
+    }
+
+    /// `record` and `put_snapshot` read before they write. While another connection holds the
+    /// write lock they must wait for it (busy_timeout), not fail with "database is locked".
+    #[test]
+    fn writers_wait_for_each_other() {
+        let (dir, col) = project("wait");
+        let mut c = open(&col);
+        let blocker = Connection::open(cache_path(&col)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+        let row = ContentRow { key: "k".into(), segment_id: "s".into(), start_hash: "a".into(), end_hash: "b".into(), body: "x".into(), frames: 1, ticks: None };
+        let rec = Recording { snapshots: vec![(0, "h".into(), vec![1, 2, 3])], ..Default::default() };
+        c.record(&row, &rec).unwrap();
+        release.join().unwrap();
+        assert_eq!(c.get_snapshot("h").unwrap(), Some(vec![1, 2, 3]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Several connections writing the same rows at once, as a job's workers do.
+    #[test]
+    fn concurrent_records_all_succeed() {
+        let (dir, col) = project("many");
+        drop(open(&col));
+        let col = std::sync::Arc::new(col);
+        let threads: Vec<_> = (0..8u8)
+            .map(|i| {
+                let col = col.clone();
+                std::thread::spawn(move || {
+                    let mut c = open(&col);
+                    for n in 0..20u8 {
+                        let row = ContentRow { key: format!("k{n}"), segment_id: "s".into(), start_hash: "a".into(), end_hash: "b".into(), body: "x".into(), frames: 1, ticks: None };
+                        let rec = Recording { snapshots: vec![(0, format!("h{i}{n}"), vec![i, n, 3])], ..Default::default() };
+                        c.record(&row, &rec).unwrap();
+                        c.put_snapshot(&format!("e{i}{n}"), &[i, n]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
