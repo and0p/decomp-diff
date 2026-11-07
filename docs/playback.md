@@ -100,8 +100,22 @@ then become dirty in turn, and so on down the tree.
 When a segment is edited, tools remove its `end-hash` and every `checkpoint`
 after the first edited frame, because those states are no longer known. The
 segment becomes unverified and everything below it dirty, until it is played
-and the new hashes are accepted. Editing only `[EVENT]` lines changes no
+and the new hashes are recorded. Editing only `[EVENT]` lines changes no
 state, so it keeps every hash.
+
+## Recording hashes
+
+Playing a segment to its end records its hashes when that overwrites nothing:
+
+- Its start is trusted: it played from where its parent ends, and the parent is clean (for
+  a root segment, from its recorded `start-hash`, if it has one).
+- It is **unverified**: its `start-hash`, `end-hash` and `start-frame` are recorded, so it is clean.
+- It is **dirty** but still ends with its recorded `end-hash` and checkpoints: its new
+  `start-hash` is recorded, so it is clean again.
+
+When the end hash or a checkpoint differs from the recorded one, nothing is recorded:
+whether the new ending is intended is a person's call (the GUI's **Use new end hash**,
+`--accept` on the command line). A segment below one that isn't clean waits for it.
 
 ## Checking hashes
 
@@ -113,4 +127,4 @@ From the command line:
 - `dj status <dir>` prints the tree with clean, dirty and unverified marks.
 - `dj hydrate <dir> --clean` re-checks dirty segments: one that still ends with its recorded end hash and checkpoints gets its new start hash written to its file (it is clean again); the others are listed as mismatches.
 
-In the GUI, the segment tree shows clean (green), dirty (orange) and unverified (gray) dots. Reaching a segment's last frame checks its end hash. After an input or RAM write edit, play to the end and use Emulation > Accept end hash to record the new hashes, then File > Save (Ctrl/Cmd+S).
+In the GUI, the segment tree shows clean (green), dirty (orange) and unverified (gray) dots. Reaching a segment's last frame checks its end hash and [records hashes](#recording-hashes) where that is safe, as an unsaved change: File > Save (Ctrl/Cmd+S) keeps them. **Emulation > Verify all** does the same for every segment that isn't clean, top down, and lists the ones whose ending changed. For those, play to the end and use **Emulation > Use new end hash** if the change is intended.

@@ -25,7 +25,9 @@ The ROM and core come from the project's `.local/local.toml` (written by the CLI
 
 The segment tree. Dots show clean (green), dirty (orange) and unverified (gray); anything
 under a dirty segment is dirty too ([playback.md](playback.md#clean-dirty-and-unverified)).
-Edited segments are yellow italics until saved. A blue **db** after a segment's length
+Edited segments are yellow italics until saved. Segment files changed by other tools (an
+agent saving a draft, `dj hydrate --clean`, an editor) are picked up within a second; one
+with unsaved edits here keeps them, with a warning, since saving would overwrite the file. A blue **db** after a segment's length
 means its current content is in the local database, and "+N" is how many instructions
 only that segment runs.
 
@@ -66,7 +68,7 @@ Below the picture, left to right:
 | File | Open project…, Save (Ctrl/Cmd+S), Reload from disk (discards unsaved edits), Quit |
 | Edit | Undo, Redo, Cut, Copy, Paste at play cursor ([editing.md](editing.md#undo-cut-copy-and-paste)) |
 | MCP | Enable MCP (off by default), Show agent drafts, follow an agent session, Stop following, Share my view with agents ([mcp.md](mcp.md#the-gui)) |
-| Emulation | Play/pause, step, go to start or end, Accept end hash, hydration, Use the local database, Snapshot memory, Set ROM…, Set core… ([database.md](database.md#in-the-gui)) |
+| Emulation | Play/pause, step, go to start or end, Use new end hash, Hydrate all, Verify all, Use the local database, Snapshot memory, Set ROM…, Set core… ([database.md](database.md#in-the-gui)) |
 | Segment | Tree edits and Add event at playhead (E) ([editing.md](editing.md#segment-menu)) |
 | Input | Keyboard mapping (coming later) |
 | View | Zoom in, Zoom out, Follow playhead, Return to the edit ([editing.md](editing.md#return-to-the-edit)), Show every joypad button, Second core side by side (coming later) |

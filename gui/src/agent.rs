@@ -22,8 +22,17 @@ fn now() -> u64 {
 
 /// Modification times and sizes of the draft files, to notice changes cheaply.
 pub fn drafts_fingerprint(root: &Path) -> u128 {
+    dir_fingerprint(&root.join(".local").join("drafts"))
+}
+
+/// The same for segments/, to notice segment files that other tools changed.
+pub fn segments_fingerprint(root: &Path) -> u128 {
+    dir_fingerprint(&root.join("segments"))
+}
+
+fn dir_fingerprint(dir: &Path) -> u128 {
     let mut h: u128 = 0;
-    if let Ok(rd) = std::fs::read_dir(root.join(".local").join("drafts")) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
         let mut v: Vec<(String, u128)> = rd
             .flatten()
             .filter_map(|e| {

@@ -24,11 +24,19 @@ const JOYPAD_BASIC: usize = 8;
 
 /// What the roll shows around the segment, read-only: the end of the parent to the left of
 /// frame 0 and the start of the next segment past the last frame; and from which frame
-/// the segment hasn't been played since the last edit.
+/// on the segment's hashes aren't known, as a band on the ruler in its status colour.
 pub struct Neighbours {
     pub prev: Option<String>,
     pub next: Option<String>,
-    pub stale_from: Option<u64>,
+    pub unverified: Option<Unverified>,
+}
+
+/// The ruler band: frames from `from` on aren't verified. `hint` is the hover text.
+#[derive(Clone)]
+pub struct Unverified {
+    pub from: u64,
+    pub color: Color32,
+    pub hint: String,
 }
 
 pub enum Action {
@@ -427,7 +435,7 @@ impl RollState {
             self.model = Some(m);
         }
         let model = self.model.take().unwrap();
-        let action = self.draw(ui, &model, playhead, playing, nb.stale_from);
+        let action = self.draw(ui, &model, playhead, playing, nb.unverified.as_ref());
         self.model = Some(model);
         action
     }
@@ -436,7 +444,7 @@ impl RollState {
         *self.open.get(&(g.port, g.device)).unwrap_or(&g.used())
     }
 
-    fn draw(&mut self, ui: &mut egui::Ui, m: &Model, playhead: Option<u64>, playing: bool, stale_from: Option<u64>) -> Option<Action> {
+    fn draw(&mut self, ui: &mut egui::Ui, m: &Model, playhead: Option<u64>, playing: bool, unverified: Option<&Unverified>) -> Option<Action> {
         let mut action = None;
         // Toolbar.
         ui.horizontal(|ui| {
@@ -1171,14 +1179,14 @@ impl RollState {
                 t += step;
             }
         }
-        // Frames not played since the last edit: an amber band on the ruler.
+        // Frames whose hashes aren't known: a band on the ruler in the tree dot's colour.
         let mut stale_rect = None;
-        if let Some(sf) = stale_from.filter(|s| *s < m.frames) {
-            let (x0, x1) = (x_of(sf as f32).max(tl_left), end_x);
+        if let Some(u) = unverified.filter(|u| u.from < m.frames) {
+            let (x0, x1) = (x_of(u.from as f32).max(tl_left), end_x);
             if x1 > x0 {
                 let r = Rect::from_min_max(Pos2::new(x0, rect.top() + RULER_H - 5.0), Pos2::new(x1, rect.top() + RULER_H));
-                grid.rect_filled(r, 0.0, Color32::from_rgb(230, 150, 50).gamma_multiply(0.7));
-                stale_rect = Some((Rect::from_min_max(Pos2::new(x0, rect.top()), Pos2::new(x1, rect.top() + RULER_H)), sf));
+                grid.rect_filled(r, 0.0, u.color.gamma_multiply(0.7));
+                stale_rect = Some((Rect::from_min_max(Pos2::new(x0, rect.top()), Pos2::new(x1, rect.top() + RULER_H)), u.hint.clone()));
             }
         }
         // Outside the segment: dimmed, with the boundary marked.
@@ -1245,8 +1253,8 @@ impl RollState {
                 let side = if ff < 0.0 { m.prev.as_ref().map(|s| (s, ff + s.frames as f32)) } else if ff >= m.frames as f32 { m.next.as_ref().map(|s| (s, ff - m.frames as f32)) } else { None };
                 if let Some((s, f)) = side.filter(|(s, f)| *f >= 0.0 && *f < s.frames as f32) {
                     hover_text = Some(format!("\"{}\", frame {} (step or play across to edit it)", s.title, f.floor() as u64));
-                } else if let Some((_, sf)) = stale_rect.filter(|(r, _)| r.contains(p)) {
-                    hover_text = Some(format!("Frames from {sf} on haven't been played since the last edit"));
+                } else if let Some((_, hint)) = stale_rect.filter(|(r, _)| r.contains(p)) {
+                    hover_text = Some(hint);
                 }
             }
             if rect.contains(p) && p.x >= tl_left && self.drag.is_none() && ff_at(p.x) >= 0.0 {

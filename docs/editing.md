@@ -54,8 +54,8 @@ past its last body line.
 
 Changing an input or a `[WRITE]` drops the segment's `end-hash` and every checkpoint after
 the first edited frame, because those states are no longer known. The segment turns
-unverified and everything below it dirty, until it is played and the new hashes are
-accepted ([playback.md](playback.md#clean-dirty-and-unverified)). Editing only `[EVENT]`
+unverified and everything below it dirty, until it is played to its end and the new hashes
+are recorded ([playback.md](playback.md#recording-hashes)). Editing only `[EVENT]`
 lines changes no state, so it keeps every hash.
 
 ## In the GUI
@@ -105,9 +105,13 @@ earliest frame edited since playback last ran, worked out again with the change.
 edits in a row keep the playhead on the earliest of them. Turned off, an edit redraws the
 frame you were on instead.
 
-Either way, frames that haven't run since the last edit get an amber band on the ruler,
-which shrinks as playback runs through them. While the picture still shows a frame from
-before the edit and the new one is being worked out, it is dimmed.
+Either way, the ruler shows a band over the frames whose hashes aren't known, in the colour
+of the segment's tree dot: gray from the first edited frame of an unverified segment,
+orange over the whole of a dirty one. It shrinks as playback runs through frames not played
+since the edit, and goes when the segment is clean again, which reaching its end does when
+it can ([playback.md](playback.md#recording-hashes)). Hover it for what is missing. While
+the picture still shows a frame from before the edit and the new one is being worked out,
+it is dimmed.
 
 ### Markers
 
@@ -122,7 +126,7 @@ or close it, like a controller.
 ### Undo, cut, copy and paste
 
 Edit > **Undo** / **Redo** (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z or Ctrl+Y) cover every edit: note
-edits, cut and paste, frame lines, renames, segment properties, accepting an end hash, new
+edits, cut and paste, frame lines, renames, segment properties, using a new end hash, new
 segments, splits, branches, joins and deletes. The history holds 200 steps and is cleared
 when a project is opened or reloaded. A segment removed by undo has its file deleted on the
 next Save.

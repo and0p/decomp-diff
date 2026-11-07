@@ -10,7 +10,7 @@ use decomp_dj::collection::{Collection, LocalConfig, Status};
 use decomp_dj::format::{Command, InputKey};
 use decomp_dj::hydrate::Hydrator;
 use decomp_dj::player::{trunk_start_frame, Session};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 mod agent;
@@ -101,6 +101,11 @@ struct App {
     /// Indent every level of the tree, instead of keeping only children in their parent's column.
     indent_all: bool,
     edited: BTreeSet<String>,
+    /// The first frame edited in segments that turned unverified this run of the program,
+    /// so the ruler band starts there even after leaving the segment.
+    unverified_from: HashMap<String, u64>,
+    /// Modification times of segments/, to pick up files changed by other tools.
+    segments_fp: u128,
     roll: roll::RollState,
     message: Option<(String, bool)>,
     /// Frames per tick multiplier; 0 means as fast as possible.
@@ -270,6 +275,8 @@ impl Default for App {
             hoist: None,
             indent_all: false,
             edited: BTreeSet::new(),
+            unverified_from: HashMap::new(),
+            segments_fp: 0,
             roll: roll::RollState::default(),
             message: None,
             speed: 2,
@@ -612,6 +619,8 @@ impl App {
                     let _ = col.load_drafts();
                 }
                 self.drafts_fp = agent::drafts_fingerprint(dir);
+                self.segments_fp = agent::segments_fingerprint(dir);
+                self.unverified_from.clear();
                 self.follow = None;
                 // Only one libretro core can be loaded per process, so drop the old one first.
                 self.session = None;
@@ -699,6 +708,7 @@ impl App {
             }
         }
         self.edited.clear();
+        self.segments_fp = agent::segments_fingerprint(&col.root);
         self.coverage_stale();
         self.info(format!("Saved {} segment(s)", ids.len()));
     }
@@ -883,6 +893,7 @@ impl App {
         }
         let frame = s.step(col, &pb.id, k, capture || k + 1 == pb.frames)?;
         pb.ran += 1;
+        let reached_end = pb.ran == pb.frames;
         // Frames run since the edit are up to date again.
         if let Some(st) = pb.stale_from {
             pb.stale_from = (pb.ran < pb.frames).then_some(st.max(pb.ran));
@@ -908,10 +919,38 @@ impl App {
                 None => self.texture = Some(egui_ctx().load_texture("preview", img, egui::TextureOptions::NEAREST)),
             }
         }
+        if reached_end {
+            self.auto_record();
+        }
         Ok(())
     }
 
-    /// Shows frame `target` (0-based) of the selected replay.
+    /// At the last frame: records the hashes this playback reached where that overwrites
+    /// nothing (`try_record`: an unverified segment, or a dirty one that still ends the same,
+    /// played from where its clean parent ends). An unsaved change, like an edit.
+    fn auto_record(&mut self) {
+        let (Some(col), Some(pb)) = (&mut self.col, &self.pb) else { return };
+        if pb.checkpoint_miss.is_some() {
+            return;
+        }
+        let (Some(end), Some(start)) = (pb.end_hash.clone(), pb.start_hash.clone()) else { return };
+        let id = pb.id.clone();
+        // An agent may still be writing a draft; it gets its hashes when it is saved.
+        if col.is_draft(&id) {
+            return;
+        }
+        let verdict = decomp_dj::hydrate::try_record(col, &id, &start, pb.start_frame, &end, None);
+        if matches!(verdict, "recorded" | "cleaned") {
+            let title = col_title(Some(col), &id);
+            self.edited.insert(id.clone());
+            self.unverified_from.remove(&id);
+            self.info(if verdict == "recorded" {
+                format!("Recorded the hashes of \"{title}\". Save to keep them.")
+            } else {
+                format!("\"{title}\" still ends the same: recorded its new start hash. Save to keep it.")
+            });
+        }
+    }
     fn seek(&mut self, target: u64) {
         if let Some(Job::Enter { then_seek, .. }) = &mut self.job {
             *then_seek = Some(target);
@@ -1283,6 +1322,8 @@ impl App {
             r.add("checkpoint", &format!("{f} {h}"));
         }
         self.edited.insert(id.clone());
+        let e = self.unverified_from.entry(id.clone()).or_insert(from);
+        *e = (*e).min(from);
         self.roll.invalidate();
         if let Some(pb) = &mut self.pb {
             if pb.id == id {
@@ -1332,7 +1373,7 @@ impl App {
     /// Records the state hash playback reached at the end as the replay's end-hash.
     fn accept_end_hash(&mut self) {
         if let Some(id) = self.pb.as_ref().filter(|p| p.end_hash.is_some()).map(|p| p.id.clone()) {
-            self.remember("Accept end hash", &[&id]);
+            self.remember("Use new end hash", &[&id]);
         }
         let (Some(col), Some(pb)) = (&mut self.col, &self.pb) else { return };
         let Some(h) = pb.end_hash.clone() else { return };
@@ -1343,7 +1384,8 @@ impl App {
             r.set("start-hash", sh);
         }
         self.edited.insert(pb.id.clone());
-        self.info("Accepted the new end hash. Save to keep it; child segments will check against it.");
+        self.unverified_from.remove(&pb.id);
+        self.info("Using the new end hash. Save to keep it; child segments will check against it.");
     }
 
     // ---- undo, redo and clipboard ----
@@ -2059,8 +2101,12 @@ impl App {
                     self.roll.follow_to(end);
                 }
                 ui.separator();
-                let can_accept = self.pb.as_ref().is_some_and(|p| p.end_hash.is_some()) && self.end_matches() != Some(true);
-                if ui.add_enabled(can_accept, egui::Button::new("Accept end hash")).on_hover_text("Play to the last frame first").clicked() {
+                if ui
+                    .add_enabled(self.can_use_new_hash(), egui::Button::new("Use new end hash"))
+                    .on_hover_text("Replace the recorded hashes with the ones this playback reached. Only needed when the ending changed: hashes that overwrite nothing are recorded when playback reaches the last frame.")
+                    .on_disabled_hover_text("Play to the last frame first. Enabled when the playback ended somewhere other than the recorded end hash.")
+                    .clicked()
+                {
                     self.accept_end_hash();
                 }
                 ui.separator();
@@ -2070,12 +2116,12 @@ impl App {
                     self.start_hydrate(None, false);
                 }
                 if ui
-                    .add_enabled(db_on && idle && self.edited.is_empty(), egui::Button::new("Hydrate and clean all"))
-                    .on_hover_text("Also re-check dirty segments: one that still ends with its recorded hashes gets its new start hash (written to its file); the others are listed")
-                    .on_disabled_hover_text("Save first: cleaning writes replay files")
+                    .add_enabled(db_on && idle, egui::Button::new("Verify all"))
+                    .on_hover_text("Play every segment that isn't clean, top down, and record its hashes where that overwrites nothing (as reaching a segment's end does). Segments whose ending changed are listed for you to check. Results are unsaved changes.")
+                    .on_disabled_hover_text("Needs the local database")
                     .clicked()
                 {
-                    self.start_hydrate(None, true);
+                    self.start_verify(None);
                 }
                 let mut use_db = self.col.as_ref().and_then(|c| c.load_local().ok()).and_then(|l| l.database).unwrap_or(true);
                 if ui.add_enabled(self.col.is_some() && idle, egui::Checkbox::new(&mut use_db, "Use the local database")).keep_open().on_hover_text("Off: play from power-on and keep snapshots only in memory, as before the database existed").changed() {
@@ -2157,6 +2203,47 @@ impl App {
         if open && clicked && !on_bar && !keep {
             egui::Popup::close_all(ui.ctx());
         }
+    }
+
+    /// "Use new end hash": the playback is at the end, and its hashes aren't the recorded ones.
+    fn can_use_new_hash(&self) -> bool {
+        let (Some(col), Some(pb)) = (self.col.as_ref(), self.pb.as_ref()) else { return false };
+        let Some(end) = &pb.end_hash else { return false };
+        let r = &col.replays[&pb.id];
+        r.get("end-hash") != Some(end.as_str()) || pb.start_hash.as_deref().is_some_and(|s| r.get("start-hash") != Some(s))
+    }
+
+    /// The ruler band for `id`: from which frame on its hashes aren't known, in the colour of
+    /// its tree dot. None when it is clean.
+    fn unverified_band(&self, id: &str) -> Option<roll::Unverified> {
+        let col = self.col.as_ref()?;
+        let r = col.replays.get(id)?;
+        let status = col.tree_status(id);
+        if status == Status::Clean {
+            return None;
+        }
+        let color = status_color(status);
+        // While playing after an edit: what hasn't been run again yet.
+        if let Some(sf) = self.pb.as_ref().filter(|p| p.id == id).and_then(|p| p.stale_from) {
+            return Some(roll::Unverified { from: sf, color, hint: format!("Frames from {sf} on haven't been played since the last edit. Play to the end to record the new hashes.") });
+        }
+        let parent_clean = r.parent().is_none_or(|p| col.tree_status(p) == Status::Clean);
+        if status == Status::Dirty {
+            let hint = if parent_clean {
+                "Dirty: its parent's end state changed. Play it to the end to re-check it; if it still ends the same, the new start hash is recorded."
+            } else {
+                "Dirty: a segment above it changed and isn't clean yet. Verify that one first (or use Emulation > Verify all)."
+            };
+            return Some(roll::Unverified { from: 0, color, hint: hint.to_string() });
+        }
+        let last_cp = r.checkpoints().unwrap_or_default().into_iter().map(|(f, _)| f).max().unwrap_or(0);
+        let from = self.unverified_from.get(id).copied().unwrap_or(last_cp);
+        let hint = if parent_clean {
+            format!("Not verified from frame {from} on. Play to the end to record its hashes.")
+        } else {
+            format!("Not verified from frame {from} on, and its parent isn't clean: verify that first, or use Emulation > Verify all.")
+        };
+        Some(roll::Unverified { from, color, hint })
     }
 
     fn end_matches(&self) -> Option<bool> {
@@ -2487,7 +2574,7 @@ impl App {
                                     context = Some((id.to_string(), "follow"));
                                 }
                             }
-                            if ui.button("Save as segment").on_hover_text("Move it into segments/. Play it to the end and accept its end hash to make it clean.").clicked() {
+                            if ui.button("Save as segment").on_hover_text("Move it into segments/. Play it to the end (or use Verify all) to record its hashes.").clicked() {
                                 context = Some((id.to_string(), "draft_save"));
                             }
                             if ui.button("Discard draft").on_hover_text("Delete its file in .local/drafts/").clicked() {
@@ -2517,6 +2604,14 @@ impl App {
                         }
                         if ui.add_enabled(db_on, egui::Button::new("Hydrate this and below")).on_disabled_hover_text("Needs the local database").clicked() {
                             context = Some((id.to_string(), "hydrate"));
+                        }
+                        if ui
+                            .add_enabled(db_on, egui::Button::new("Verify this and below"))
+                            .on_hover_text("Play what isn't clean here and below, and record hashes where that overwrites nothing")
+                            .on_disabled_hover_text("Needs the local database")
+                            .clicked()
+                        {
+                            context = Some((id.to_string(), "verify"));
                         }
                         ui.separator();
                         if ui.add_enabled(hoist != Some(id), egui::Button::new("Focus here")).on_hover_text("Show only this segment and what is below it").clicked() {
@@ -2591,6 +2686,7 @@ impl App {
             Some((id, "join")) => self.join_with_parent(&id),
             Some((id, "hydrate1")) => self.start_hydrate(Some((id, false)), false),
             Some((id, "hydrate")) => self.start_hydrate(Some((id, true)), false),
+            Some((id, "verify")) => self.start_verify(Some(id)),
             Some((id, "follow")) => {
                 if let Some(s) = self.agent_sessions.iter().find(|s| s.draft == id) {
                     self.follow = Some((s.pid, s.session.clone()));
@@ -2781,6 +2877,117 @@ impl App {
         }
     }
 
+    /// Picks up segment files that other tools changed, added or removed (an agent's
+    /// `save_draft`, `dj hydrate --clean`, `dj play --accept`, an editor). A segment with
+    /// unsaved edits here keeps them, with a warning, since saving would overwrite the file.
+    fn poll_segments(&mut self) {
+        if self.hydrating.is_some() {
+            return;
+        }
+        let Some(col) = &mut self.col else { return };
+        let fp = agent::segments_fingerprint(&col.root);
+        if fp == self.segments_fp {
+            return;
+        }
+        let dir = col.root.join("segments");
+        let mut on_disk: BTreeMap<String, (PathBuf, decomp_dj::format::Replay)> = BTreeMap::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("segment") {
+                    continue;
+                }
+                match decomp_dj::format::Replay::load(&p) {
+                    Ok(r) => {
+                        if let Ok(id) = r.id().map(String::from) {
+                            on_disk.insert(id, (p, r));
+                        }
+                    }
+                    // Possibly half written: look again at the next poll.
+                    Err(_) => return,
+                }
+            }
+        }
+        self.segments_fp = fp;
+        let mut changed: Vec<String> = vec![];
+        let mut conflicts: Vec<String> = vec![];
+        // New or changed files, parents first so a new child finds its parent.
+        let mut pending: Vec<(String, (PathBuf, decomp_dj::format::Replay))> = on_disk.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        loop {
+            let before = pending.len();
+            pending.retain(|(id, (p, r))| {
+                let same = col.replays.get(id).is_some_and(|m| m.to_text() == r.to_text());
+                if same {
+                    if col.is_draft(id) {
+                        // A draft saved by an agent: now a segment.
+                        col.drafts.remove(id);
+                        col.paths.insert(id.clone(), p.clone());
+                    }
+                    return false;
+                }
+                if self.edited.contains(id) {
+                    // Edited here (or deleted here and not saved yet): ours wins on save.
+                    if col.replays.contains_key(id) {
+                        conflicts.push(id.clone());
+                    }
+                    return false;
+                }
+                if r.parent().is_some_and(|par| !col.replays.contains_key(par)) {
+                    return true; // wait for its parent
+                }
+                col.drafts.remove(id);
+                col.replays.insert(id.clone(), r.clone());
+                col.paths.insert(id.clone(), p.clone());
+                changed.push(id.clone());
+                false
+            });
+            if pending.is_empty() || pending.len() == before {
+                break;
+            }
+        }
+        // Files gone: remove those segments, leaves first, unless edited here.
+        loop {
+            let gone: Vec<String> = col
+                .replays
+                .keys()
+                .filter(|id| !col.is_draft(id) && !on_disk.contains_key(*id) && !self.edited.contains(*id))
+                .filter(|id| !col.replays.values().any(|r| r.parent() == Some(id.as_str())))
+                .cloned()
+                .collect();
+            if gone.is_empty() {
+                break;
+            }
+            for id in gone {
+                col.replays.remove(&id);
+                col.paths.remove(&id);
+                changed.push(id);
+            }
+        }
+        if changed.is_empty() && conflicts.is_empty() {
+            return;
+        }
+        self.roll.invalidate();
+        self.coverage_stale();
+        if !conflicts.is_empty() {
+            let names: Vec<String> = conflicts.iter().map(|id| format!("\"{}\"", col_title(self.col.as_ref(), id))).collect();
+            self.error(format!("Changed on disk while you have unsaved edits: {}. Saving overwrites those files; File > Reload from disk takes the disk's version.", names.join(", ")));
+        } else {
+            self.info(format!("Picked up {} segment file(s) changed on disk", changed.len()));
+        }
+        if let Some(sel) = self.selected.clone().filter(|s| changed.contains(s)) {
+            if self.col.as_ref().is_some_and(|c| c.replays.contains_key(&sel)) {
+                let frame = self.pb.as_ref().and_then(|p| p.shown());
+                self.select(&sel);
+                if let Some(f) = frame {
+                    self.seek(f);
+                }
+            } else {
+                self.selected = None;
+                self.pb = None;
+            }
+        }
+    }
+
     fn reload_drafts(&mut self) {
         let Some(col) = &mut self.col else { return };
         // Drafts edited here and not saved yet keep the edits.
@@ -2870,8 +3077,9 @@ impl App {
         match col.draft_to_segment(id) {
             Ok(()) => {
                 self.drafts_fp = agent::drafts_fingerprint(&col.root);
+                self.segments_fp = agent::segments_fingerprint(&col.root);
                 self.coverage_stale();
-                self.info("Saved the draft as a segment. Play it to the end and accept its end hash to make it clean.");
+                self.info("Saved the draft as a segment. Play it to the end (or use Verify all) to record its hashes.");
             }
             Err(e) => self.error(e),
         }
@@ -2943,6 +3151,30 @@ impl App {
         }
     }
 
+    /// Verify all (`scope` None) or a subtree: plays the segments that aren't clean and
+    /// records their hashes in memory where that overwrites nothing.
+    fn start_verify(&mut self, scope: Option<String>) {
+        let Some(col) = &self.col else { return };
+        if self.session.as_ref().is_none_or(|s| s.cache.is_none()) {
+            self.error("Verifying needs the local database (Emulation > Use the local database).");
+            return;
+        }
+        let what = match &scope {
+            None => "all segments".to_string(),
+            Some(id) => format!("\"{}\" and below", col_title(Some(col), id)),
+        };
+        match Hydrator::verify(col, scope.as_deref().map(|id| (id, true))) {
+            Ok(h) if h.targets.is_empty() => self.info(format!("Nothing to verify: {what} are clean.")),
+            Ok(h) => {
+                self.playing = false;
+                self.job = None;
+                self.pb = None;
+                self.hydrating = Some(Hydrating { h, paused: false, what });
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
     /// One slice of hydration; shows every 4th frame in the emulator view.
     fn hydrate_work(&mut self) {
         let Some(hy) = &mut self.hydrating else { return };
@@ -2960,6 +3192,11 @@ impl App {
                     }
                 }
                 if !events.is_empty() {
+                    // Verifying records hashes in memory: unsaved changes.
+                    for e in events.iter().filter(|e| matches!(e.verdict, "recorded" | "cleaned")) {
+                        self.edited.insert(e.id.clone());
+                        self.unverified_from.remove(&e.id);
+                    }
                     self.refresh_stored();
                 }
                 if self.hydrating.as_ref().is_some_and(|h| h.h.done()) {
@@ -2975,6 +3212,10 @@ impl App {
     }
 
     fn end_hydrate(&mut self, stopped: bool) {
+        if self.hydrating.as_ref().is_some_and(|h| h.h.verify) {
+            self.end_verify(stopped);
+            return;
+        }
         let Some(hy) = self.hydrating.take() else { return };
         let played = hy.h.events.iter().filter(|e| e.action == "played").count();
         let stored = hy.h.events.len() - played;
@@ -3001,6 +3242,33 @@ impl App {
                     }
                 }
             }
+        }
+        self.reselect();
+    }
+
+    fn end_verify(&mut self, stopped: bool) {
+        let Some(hy) = self.hydrating.take() else { return };
+        let ev = &hy.h.events;
+        let n = |v: &str| ev.iter().filter(|e| e.verdict == v).count();
+        let (recorded, cleaned) = (n("recorded"), n("cleaned"));
+        let names = |v: &str| ev.iter().filter(|e| e.verdict == v).map(|e| format!("\"{}\"", col_title(self.col.as_ref(), &e.id))).collect::<Vec<_>>();
+        let mismatch = names("mismatch");
+        let blocked = n("blocked");
+        let mut msg = format!("{} {}: {recorded} recorded, {cleaned} cleaned", if stopped { "Stopped verifying" } else { "Verified" }, hy.what);
+        if recorded + cleaned > 0 {
+            msg += " (unsaved: save to keep them)";
+        }
+        self.refresh_stored();
+        if mismatch.is_empty() && blocked == 0 {
+            self.info(msg);
+        } else {
+            if !mismatch.is_empty() {
+                msg += &format!(". The ending changed in {}: play each to the end and use Emulation > Use new end hash if that's intended", mismatch.join(", "));
+            }
+            if blocked > 0 {
+                msg += &format!(". {blocked} below those were skipped");
+            }
+            self.error(msg);
         }
         self.reselect();
     }
@@ -3229,12 +3497,20 @@ impl App {
                     if let Some(m) = pb.checkpoint_miss {
                         ui.label(RichText::new(format!("checkpoint {m} differs")).color(Color32::from_rgb(230, 90, 80)));
                     }
-                    match self.end_matches() {
-                        Some(true) => ui.label(RichText::new("✔ end hash matches").color(Color32::from_rgb(92, 184, 92))),
-                        Some(false) if col.replays[&pb.id].get("end-hash").is_none() => ui.label(RichText::new("end hash not recorded yet").color(Color32::from_gray(160))),
-                        Some(false) => ui.label(RichText::new("✖ end hash differs").color(Color32::from_rgb(230, 90, 80))),
-                        None => ui.label(RichText::new("play to the end to check the hash").weak()),
+                    // The segment's status, as the tree dot shows it. Only a playback that ended
+                    // somewhere other than the recorded end needs saying apart.
+                    let red = Color32::from_rgb(230, 90, 80);
+                    let status = col.tree_status(&pb.id);
+                    let parent_clean = col.replays[&pb.id].parent().is_none_or(|p| col.tree_status(p) == Status::Clean);
+                    let (text, color) = match (self.end_matches(), status) {
+                        (Some(false), _) if pb.checkpoint_miss.is_some() => ("✖ a checkpoint differs (Use new end hash if intended)", red),
+                        (Some(false), _) if col.replays[&pb.id].get("end-hash").is_some() => ("✖ ended differently (Use new end hash if intended)", red),
+                        (_, Status::Clean) => ("● clean", status_color(status)),
+                        (_, _) if !parent_clean => ("● waiting on a segment above", status_color(status)),
+                        (_, Status::Dirty) => ("● dirty: play to the end to re-check", status_color(status)),
+                        (_, Status::Unverified) => ("● unverified: play to the end to record", status_color(status)),
                     };
+                    ui.label(RichText::new(text).color(color));
                 });
             }
         });
@@ -3320,11 +3596,11 @@ impl App {
                         Some((id, f, frames)) => ((hy.h.i as f32 + f as f32 / frames.max(1) as f32) / n as f32, col_title(self.col.as_ref(), id)),
                         None => (hy.h.i as f32 / n as f32, String::new()),
                     };
-                    let text = format!("{} {}/{}{}", if hy.paused { "Paused" } else { "Hydrating" }, (hy.h.i + 1).min(n), n, if name.is_empty() { String::new() } else { format!(": \"{name}\"") });
+                    let text = format!("{} {}/{}{}", if hy.paused { "Paused" } else if hy.h.verify { "Verifying" } else { "Hydrating" }, (hy.h.i + 1).min(n), n, if name.is_empty() { String::new() } else { format!(": \"{name}\"") });
                     ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).desired_width(slot.x).desired_height(slot.y).text(RichText::new(text).small()).corner_radius(3.0));
                     let mut stop = false;
                     let mut toggle = false;
-                    if ui.small_button("Stop").on_hover_text("Stop hydrating; finished segments stay stored").clicked() {
+                    if ui.small_button("Stop").on_hover_text(if hy.h.verify { "Stop verifying; hashes recorded so far stay (unsaved)" } else { "Stop hydrating; finished segments stay stored" }).clicked() {
                         stop = true;
                     }
                     if ui.small_button(if hy.paused { "Resume" } else { "Pause" }).clicked() {
@@ -3474,6 +3750,7 @@ impl eframe::App for App {
         let now = ctx.input(|i| i.time);
         if now - self.agent_polled > 0.5 {
             self.agent_polled = now;
+            self.poll_segments();
             self.poll_agents();
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(600));
@@ -3509,7 +3786,7 @@ impl eframe::App for App {
                 let nb = roll::Neighbours {
                     prev: col.replays.get(id).and_then(|r| r.parent()).map(String::from),
                     next: self.next_neighbour(),
-                    stale_from: self.pb.as_ref().filter(|p| &p.id == id).and_then(|p| p.stale_from),
+                    unverified: self.unverified_band(id),
                 };
                 action = self.roll.show(ui, col, id, shown, self.playing, &nb);
             } else {
